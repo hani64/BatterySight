@@ -41,8 +41,10 @@ pub struct HidInterface {
 
 /// Lists the present HID interfaces in the order Configuration Manager returns them.
 ///
-/// Each interface gets a fresh `CollectionId`. An interface whose attributes or capabilities
-/// cannot be read is skipped; one without a readable product string gets an empty product.
+/// Each interface gets a fresh `CollectionId`. Only attributes and capabilities are read; both
+/// come from the HID class driver without a request to the device. An interface whose
+/// attributes or capabilities cannot be read is skipped. `collection.product` is left empty:
+/// see [`product_string`].
 pub fn enumerate() -> Vec<HidInterface> {
     interface_list()
         .split(|&unit| unit == 0)
@@ -119,10 +121,11 @@ fn path_string(path: &[u16]) -> String {
     String::from_utf16_lossy(&path[..end])
 }
 
-/// `col` followed by decimal digits, as in the `&col01` collection suffix.
+/// `col` followed by exactly two hex digits, the `&colNN` top-level collection suffix
+/// (`Colb(2)`, 0x00-0xFF, in Microsoft's HIDClass hardware IDs).
 fn is_collection_part(part: &str) -> bool {
     part.strip_prefix("col")
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(|digits| digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The present HID interface paths as a NUL-separated, double-NUL-terminated list.
@@ -161,16 +164,14 @@ fn interface_list() -> Vec<u16> {
     Vec::new()
 }
 
-/// Opens one interface without access rights and reads its identity.
-fn query(path: &[u16]) -> Option<HidInterface> {
-    let mut wide = Vec::with_capacity(path.len() + 1);
-    wide.extend_from_slice(path);
-    wide.push(0);
-
-    // SAFETY: `wide` is NUL-terminated and outlives the call.
+/// Opens one interface without access rights, shared read/write, for queries only.
+///
+/// `path` must be NUL-terminated.
+fn open_for_query(path: &[u16]) -> Option<OwnedHandle> {
+    // SAFETY: `path` is NUL-terminated and outlives the call.
     let handle = unsafe {
         CreateFileW(
-            PCWSTR(wide.as_ptr()),
+            PCWSTR(path.as_ptr()),
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
@@ -180,7 +181,15 @@ fn query(path: &[u16]) -> Option<HidInterface> {
         )
     }
     .ok()?;
-    let handle = OwnedHandle(handle);
+    Some(OwnedHandle(handle))
+}
+
+/// Reads one interface's identity from the HID class driver.
+fn query(path: &[u16]) -> Option<HidInterface> {
+    let mut wide = Vec::with_capacity(path.len() + 1);
+    wide.extend_from_slice(path);
+    wide.push(0);
+    let handle = open_for_query(&wide)?;
 
     let mut attributes = HIDD_ATTRIBUTES {
         Size: size_of::<HIDD_ATTRIBUTES>() as u32,
@@ -203,7 +212,6 @@ fn query(path: &[u16]) -> Option<HidInterface> {
         return None;
     }
 
-    let product = product_string(&handle);
     Some(HidInterface {
         path: wide,
         collection: Collection {
@@ -215,13 +223,27 @@ fn query(path: &[u16]) -> Option<HidInterface> {
             input_len: caps.InputReportByteLength,
             output_len: caps.OutputReportByteLength,
             feature_len: caps.FeatureReportByteLength,
-            product,
+            product: String::new(),
         },
     })
 }
 
-/// The product string, or an empty string when the device does not provide one.
-fn product_string(handle: &OwnedHandle) -> String {
+/// The product string of the interface at `path`, or an empty string on any failure.
+///
+/// `HidD_GetProductString` is a request to the device and can block for seconds, for example
+/// on a paired but disconnected Bluetooth device. Call it only for interfaces in groups an
+/// engine accepts, once per path. `path` may include the trailing NUL.
+pub fn product_string(path: &[u16]) -> String {
+    let terminated;
+    let path = if path.last() == Some(&0) {
+        path
+    } else {
+        terminated = [path, &[0]].concat();
+        &terminated
+    };
+    let Some(handle) = open_for_query(path) else {
+        return String::new();
+    };
     let mut buffer = [0u16; PRODUCT_LEN];
     // SAFETY: the handle is open and the buffer is writable for the byte length passed.
     let ok = unsafe {
@@ -297,6 +319,12 @@ mod tests {
         let expected = "vid_046d&pid_c547&mi_02#8&2a2b3c4d&0";
         assert_eq!(physical_key(C547_COL01), expected);
         assert_eq!(physical_key(C547_COL02), expected);
+    }
+
+    #[test]
+    fn physical_key_strips_hex_collection_suffix() {
+        let col0a = C547_COL01.replace("&col01", "&col0a");
+        assert_eq!(physical_key(&col0a), physical_key(C547_COL01));
     }
 
     #[test]
@@ -402,7 +430,7 @@ mod tests {
                     c.input_len,
                     c.output_len,
                     c.feature_len,
-                    c.product,
+                    product_string(&member.path),
                     physical_key(&path_string(&member.path)),
                 );
             }
