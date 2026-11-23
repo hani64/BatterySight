@@ -259,3 +259,26 @@ fn receiver_hidpp10_discovery() {
         },
     );
 }
+
+#[test]
+fn headset_off_at_start() {
+    let name = "0aba-headset-off-at-start.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/0aba-headset-off-at-start.txt"),
+        headset(),
+    );
+    check(
+        &hub,
+        name,
+        &Expect {
+            key: "logi:unit:FFFFFFFF",
+            name: "PRO X Wireless Gaming Headset",
+            kind: DeviceKind::Headset,
+            via: Via::Usb,
+            level: Level::Percent(68),
+            millivolts: Some(3828),
+            charge: Charge::Discharging,
+        },
+    );
+}

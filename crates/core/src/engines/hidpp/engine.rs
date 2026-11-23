@@ -326,27 +326,49 @@ impl HidppEngine {
                 c.step = step;
                 self.issue(index, c, now, actions);
             }
-            Next::Discovered(p) => self.discovered(index, c.found, p, actions),
+            Next::Discovered(p) => self.discovered(index, c.found, Some(p), actions),
             // Receiver notifications set up (or refused): discover its devices.
             Next::Done if matches!(c.step, Step::GetNotifications | Step::SetNotifications(_)) => {
                 self.discover(RECEIVER_SLOTS, c.grant, now, actions);
             }
             // A known device answered with an error: same meaning as on a read.
             Next::Done if c.known => self.read_reply(index, reply, actions),
+            // A direct device found its battery feature but the battery did not answer
+            // (owner trace 2026-11-23: headset off, dongle on → Err20 0x05). No link-up
+            // notification will bring it back, so register it asleep now.
+            Next::Done
+                if c.step == Step::Battery
+                    && self.is_direct(index)
+                    && matches!(
+                        reply,
+                        Reply::Err20(_)
+                            | Reply::Err10(
+                                ERR_CONNECT_FAIL | ERR_UNKNOWN_DEVICE | ERR_RESOURCE_ERROR
+                            )
+                    ) =>
+            {
+                self.discovered(index, c.found, None, actions);
+            }
             Next::Done => {}
         }
     }
 
-    /// Registers the device on `index` from its first battery payload `p`.
-    fn discovered(&mut self, index: u8, found: Found, p: &[u8], actions: &mut Vec<Action>) {
+    /// The device behind a direct (non-receiver) group.
+    fn is_direct(&self, index: u8) -> bool {
+        !self.receiver && index == DIRECT
+    }
+
+    /// Registers the device on `index` from its first battery payload `p`;
+    /// `None` (the first read failed) registers it asleep without a level.
+    fn discovered(&mut self, index: u8, found: Found, p: Option<&[u8]>, actions: &mut Vec<Action>) {
         let Some((decoder, battery_fi)) = found.battery else {
             return;
         };
         let key = self.device_key(index, found.unit);
-        let mut initial = match self.interpret(decoder, p) {
-            Outcome::Reading(r) => reading_update(key.clone(), &r, Source::Query),
-            Outcome::Offline => update(key.clone(), Presence::Asleep, Source::Query),
-            Outcome::Nothing => return,
+        let mut initial = match p.map(|p| self.interpret(decoder, p)) {
+            Some(Outcome::Reading(r)) => reading_update(key.clone(), &r, Source::Query),
+            Some(Outcome::Offline) | None => update(key.clone(), Presence::Asleep, Source::Query),
+            Some(Outcome::Nothing) => return,
         };
         let name = String::from_utf8_lossy(&found.name);
         let name = name.trim_end_matches('\0').trim();
@@ -595,6 +617,10 @@ impl Engine for HidppEngine {
                     }
                     // A second silence leaves presence as it is.
                 }
+                // A direct device's first battery read stayed silent: register it asleep.
+                Step::Battery if self.is_direct(index) => {
+                    self.discovered(index, f.conversation.found, None, &mut actions);
+                }
                 // Discovery: absent or asleep; its next link notification brings it back.
                 _ => {}
             }
@@ -637,10 +663,11 @@ source = "test"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 "#;
 
-    const FIXTURES: [&str; 3] = [
+    const FIXTURES: [&str; 4] = [
         include_str!("../../../tests/fixtures/hidpp/receiver_mouse_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/headset_long_only_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/receiver_hidpp10_discovery.txt"),
+        include_str!("../../../tests/fixtures/hidpp/0aba-headset-off-at-start.txt"),
     ];
 
     fn catalog() -> Catalog {
@@ -1228,6 +1255,139 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 ..update(headset_key(), Source::Push)
             })]
         );
+    }
+
+    /// Headset dongle with every feature (owner trace 2026-11-23 shape), discovered up to
+    /// the 0x1F20 read at index 6, which is in flight (sent at t = 1).
+    fn headset_off_until_read() -> HidppEngine {
+        let name = b"PRO X Wireless Gaming Headset";
+        let mut e = HidppEngine::new(&headset_group(), &catalog());
+        let gk = e.group_key();
+        e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        let get = |hi, lo| l(&[0x11, 0xFF, 0x00, 0x0B, hi, lo]);
+        let found = |fi| l(&[0x11, 0xFF, 0x00, 0x0B, fi]);
+        let script = vec![
+            (
+                l(&[0x11, 0xFF, 0x00, 0x1B, 0x04, 0x02, 0x5A]),
+                get(0x00, 0x05),
+            ),
+            (found(2), get(0x00, 0x03)),
+            (found(3), get(0x10, 0x04)),
+            (found(0), get(0x10, 0x00)),
+            (found(0), get(0x10, 0x01)),
+            (found(0), get(0x1F, 0x20)),
+            (found(6), l(&[0x11, 0xFF, 0x02, 0x0B])),
+            (
+                l(&[0x11, 0xFF, 0x02, 0x0B, 29]),
+                l(&[0x11, 0xFF, 0x02, 0x1B, 0]),
+            ),
+            (
+                l(&[&[0x11, 0xFF, 0x02, 0x1B][..], &name[..16]].concat()),
+                l(&[0x11, 0xFF, 0x02, 0x1B, 16]),
+            ),
+            (
+                l(&[&[0x11, 0xFF, 0x02, 0x1B][..], &name[16..]].concat()),
+                l(&[0x11, 0xFF, 0x02, 0x2B]),
+            ),
+            (
+                l(&[0x11, 0xFF, 0x02, 0x2B, 8]),
+                l(&[0x11, 0xFF, 0x03, 0x0B]),
+            ),
+            (
+                l(&[0x11, 0xFF, 0x03, 0x0B, 0x01, 0xFF, 0xFF, 0xFF, 0xFF]),
+                l(&[0x11, 0xFF, 0x06, 0x0B]),
+            ),
+        ];
+        run(&mut e, &script, 1);
+        e
+    }
+
+    /// The headset registered asleep, then switched on.
+    fn check_off_headset_registered_then_updated(e: &mut HidppEngine, registered: &[Action]) {
+        let key = DeviceKey("logi:unit:FFFFFFFF".into());
+        assert_eq!(
+            registered,
+            [Action::Register {
+                key: key.clone(),
+                caps: pushing(),
+                initial: DeviceUpdate {
+                    name: Some("PRO X Wireless Gaming Headset".into()),
+                    kind: Some(DeviceKind::Headset),
+                    via: Some(Via::Usb),
+                    presence: Some(Presence::Asleep),
+                    ..update(key.clone(), Source::Query)
+                },
+            }]
+        );
+        assert_eq!(e.next_deadline(), None);
+
+        let a = e.on_report(
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x06, 0x00, 0x0E, 0xF4, 0x01]),
+            5_000,
+        );
+
+        assert_eq!(
+            a,
+            vec![Action::Update(DeviceUpdate {
+                level: Some(Level::Percent(68)),
+                millivolts: Some(3828),
+                charge: Some(Charge::Discharging),
+                presence: Some(Presence::Online),
+                ..update(key, Source::Push)
+            })]
+        );
+    }
+
+    #[test]
+    fn direct_device_failed_first_read_registers_asleep() {
+        let mut e = headset_off_until_read();
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0xFF, 0x06, 0x0B, 0x05]), 2);
+        check_off_headset_registered_then_updated(&mut e, &a);
+    }
+
+    #[test]
+    fn direct_device_first_read_timeout_registers_asleep() {
+        let mut e = headset_off_until_read();
+        assert!(e.on_tick(1_000).is_empty());
+        let a = e.on_tick(1_001);
+        check_off_headset_registered_then_updated(&mut e, &a);
+    }
+
+    #[test]
+    fn direct_device_asleep_errors_on_first_read_register_asleep() {
+        for code in [0x04, 0x08, 0x09] {
+            let mut e = headset_off_until_read();
+            let a = e.on_report(LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x06, 0x0B, code]), 2);
+            assert!(
+                matches!(
+                    a.as_slice(),
+                    [Action::Register { initial, .. }] if initial.presence == Some(Presence::Asleep)
+                ),
+                "{code:#04x}: {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receiver_slot_failed_first_read_registers_nothing() {
+        for (reply, tick) in [
+            (Some(l(&[0x11, 1, 0xFF, 6, 0x1B, 0x05])), false),
+            (Some(s(&[0x10, 1, 0x8F, 6, 0x1B, 0x09])), false),
+            (None, true),
+        ] {
+            let mut e = receiver_pinging();
+            for i in 2..=6 {
+                e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            }
+            run(&mut e, &mouse_script(), 3);
+            let a = match reply {
+                Some(r) => e.on_report(LONG_C, &r, 4),
+                None => e.on_tick(3 + 1_000),
+            };
+            assert!(a.is_empty(), "tick {tick}: {a:?}");
+            assert_eq!(e.next_deadline(), None);
+        }
     }
 
     #[test]

@@ -1,0 +1,53 @@
+# PRO X Wireless Gaming Headset 046D:0ABA, headset switched off while its USB
+# dongle is plugged in (the start-with-Windows case). Long-only collection
+# FF43:0202, device index 0xFF.
+#
+# Shape from owner trace 2026-11-23: the dongle itself answers the ping, the
+# feature lookups, the name ("PRO X Wireless Gaming Headset") and the device
+# info (unit id FFFFFFFF); the 0x1F20 read (feature index 6, fn 0) fails with
+# HID++ 2.0 error 0x05 (`11 FF FF 06 0B 05`) because the headset is off.
+# Bytes the trace does not pin (protocol version, the other feature indexes,
+# name chunking, device type 8) are synthetic, laid out per Linux
+# drivers/hid/hid-logitech-hidpp.c and Solaar lib/logitech_receiver.
+#
+# Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
+# reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The
+# `out` lines after an `in` are the writes that frame causes.
+
+# Group arrival: ping index 0xFF; the dongle answers (protocol 4.2).
+out long 11 FF 00 1B 00 00 5A
+in  long 11 FF 00 1B 04 02 5A
+# Root getFeature 0x0005 (name and type) -> index 2.
+out long 11 FF 00 0B 00 05 00
+in  long 11 FF 00 0B 02
+# Root getFeature 0x0003 (device info, unit id) -> index 3.
+out long 11 FF 00 0B 00 03 00
+in  long 11 FF 00 0B 03
+# Battery features 0x1004, 0x1000, 0x1001 absent; 0x1F20 at index 6.
+out long 11 FF 00 0B 10 04 00
+in  long 11 FF 00 0B 00
+out long 11 FF 00 0B 10 00 00
+in  long 11 FF 00 0B 00
+out long 11 FF 00 0B 10 01 00
+in  long 11 FF 00 0B 00
+out long 11 FF 00 0B 1F 20 00
+in  long 11 FF 00 0B 06
+# 0x0005 fn 0: name length 29.
+out long 11 FF 02 0B 00 00 00
+in  long 11 FF 02 0B 1D
+# 0x0005 fn 1 at offsets 0 and 16: "PRO X Wireless G" + "aming Headset".
+out long 11 FF 02 1B 00 00 00
+in  long 11 FF 02 1B 50 52 4F 20 58 20 57 69 72 65 6C 65 73 73 20 47
+out long 11 FF 02 1B 10 00 00
+in  long 11 FF 02 1B 61 6D 69 6E 67 20 48 65 61 64 73 65 74
+# 0x0005 fn 2: device type 8 (headset).
+out long 11 FF 02 2B 00 00 00
+in  long 11 FF 02 2B 08
+# 0x0003 fn 0: unit id FFFFFFFF in bytes 1..5.
+out long 11 FF 03 0B 00 00 00
+in  long 11 FF 03 0B 01 FF FF FF FF
+# 0x1F20 fn 0: HID++ 2.0 error 0x05, the headset is off -> registered asleep.
+out long 11 FF 06 0B 00 00 00
+in  long 11 FF FF 06 0B 05
+# The headset is switched on: 0x1F20 broadcast, 3828 mV discharging -> 68 %, no write.
+in  long 11 FF 06 00 0E F4 01
