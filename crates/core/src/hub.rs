@@ -52,6 +52,10 @@ const GROUP_CAPS: Capabilities = Capabilities {
     min_query_gap_ms: 0,
 };
 
+/// How deep grant deliveries may nest within one `handle` call (an engine
+/// reporting `Connected` from inside `on_grant`); deeper requests are dropped.
+const MAX_NESTED_GRANTS: usize = 4;
+
 /// One arrived group and its engine.
 struct Slot {
     engine: Box<dyn Engine>,
@@ -68,6 +72,8 @@ struct Slot {
 struct Pass {
     out: Vec<HubOutput>,
     changed: bool,
+    /// Grant deliveries currently on the stack.
+    depth: usize,
 }
 
 pub struct Hub {
@@ -76,8 +82,10 @@ pub struct Hub {
     scheduler: Scheduler,
     engines: BTreeMap<GroupId, Slot>,
     routes: HashMap<CollectionId, GroupId>,
-    /// Registered devices and the group whose engine owns them.
-    owners: BTreeMap<DeviceKey, GroupId>,
+    /// Registered devices and every live group whose engine registered them;
+    /// the last one is the current owner. The same device can be served by
+    /// several groups at once (e.g. receiver and cable).
+    owners: BTreeMap<DeviceKey, Vec<GroupId>>,
     states: BTreeMap<DeviceKey, DeviceState>,
     /// Devices no engine owns any more, and when their entries expire.
     grace: BTreeMap<DeviceKey, Ms>,
@@ -117,7 +125,7 @@ impl Hub {
             HubInput::Resume => self.request_all(Trigger::Resume, now, &mut pass),
             HubInput::RefreshNow => self.request_all(Trigger::RefreshNow, now, &mut pass),
             HubInput::Activity(key) => {
-                if let Some(&gid) = self.owners.get(&key) {
+                if let Some(gid) = self.device_owner(&key) {
                     self.grant(gid, &key, Trigger::Activity, now, &mut pass);
                 }
             }
@@ -169,7 +177,7 @@ impl Hub {
         self.grant(group.id, &key, Trigger::Arrival, now, pass);
     }
 
-    /// Drops the engine; its devices go offline and enter the removal grace.
+    /// Drops the engine; devices no other group serves go offline and enter the removal grace.
     fn remove_group(&mut self, id: GroupId, now: Ms, pass: &mut Pass) {
         let Some(slot) = self.engines.remove(&id) else {
             return;
@@ -181,21 +189,30 @@ impl Hub {
         }
         // Group keys have no grace: a new arrival is a new conversation.
         self.scheduler.unregister(&slot.key);
-        let orphans: Vec<DeviceKey> = self
+        let served: Vec<DeviceKey> = self
             .owners
             .iter()
-            .filter(|&(_, &gid)| gid == id)
+            .filter(|(_, groups)| groups.contains(&id))
             .map(|(key, _)| key.clone())
             .collect();
-        for key in orphans {
-            self.release(&key, now, pass);
+        for key in served {
+            self.drop_registrant(&key, id, now, pass);
         }
     }
 
-    /// `key` loses its owner: offline, kept until the grace expires. The
-    /// scheduler keeps its history so a reconnect within grace cannot
-    /// bypass the min gap or get a second arrival.
-    fn release(&mut self, key: &DeviceKey, now: Ms, pass: &mut Pass) {
+    /// `gid` no longer serves `key`. Ownership falls back to the latest
+    /// remaining registrant, state untouched. With none left, the device goes
+    /// offline and is kept until the grace expires; the scheduler keeps its
+    /// history so a reconnect within grace cannot bypass the min gap or get a
+    /// second arrival.
+    fn drop_registrant(&mut self, key: &DeviceKey, gid: GroupId, now: Ms, pass: &mut Pass) {
+        let Some(groups) = self.owners.get_mut(key) else {
+            return;
+        };
+        groups.retain(|&g| g != gid);
+        if !groups.is_empty() {
+            return;
+        }
         self.owners.remove(key);
         if let Some(state) = self.states.get_mut(key) {
             state.presence = Presence::Offline;
@@ -231,12 +248,12 @@ impl Hub {
     fn request_all(&mut self, trigger: Trigger, now: Ms, pass: &mut Pass) {
         let devices: Vec<(DeviceKey, GroupId)> = self
             .owners
-            .iter()
-            .map(|(key, &gid)| (key.clone(), gid))
+            .keys()
+            .filter_map(|key| Some((key.clone(), self.device_owner(key)?)))
             .collect();
         for (key, gid) in devices {
             // An earlier grant's actions may have moved or released the device.
-            if self.owners.get(&key) == Some(&gid) {
+            if self.device_owner(&key) == Some(gid) {
                 self.grant(gid, &key, trigger, now, pass);
             }
         }
@@ -244,19 +261,32 @@ impl Hub {
 
     /// Requests a grant on `key` and, if the scheduler allows it, hands it to `gid`'s engine.
     fn grant(&mut self, gid: GroupId, key: &DeviceKey, trigger: Trigger, now: Ms, pass: &mut Pass) {
+        // An engine that asks again from inside `on_grant` must not recurse without end.
+        if pass.depth > MAX_NESTED_GRANTS {
+            return;
+        }
         let Some(grant) = self.scheduler.request(key, trigger, now) else {
             return;
         };
         if let Some(slot) = self.engines.get_mut(&gid) {
             let actions = slot.engine.on_grant(&grant, now);
+            pass.depth += 1;
             self.apply(gid, actions, now, pass);
+            pass.depth -= 1;
         }
+    }
+
+    /// Group whose engine currently owns device `key`: its latest live registrant.
+    fn device_owner(&self, key: &DeviceKey) -> Option<GroupId> {
+        self.owners
+            .get(key)
+            .and_then(|groups| groups.last().copied())
     }
 
     /// Group whose engine receives grants on `key`: the registrant of a
     /// device, or the engine a group key belongs to.
     fn owner(&self, key: &DeviceKey) -> Option<GroupId> {
-        self.owners.get(key).copied().or_else(|| {
+        self.device_owner(key).or_else(|| {
             self.engines
                 .iter()
                 .find(|(_, slot)| slot.key == *key)
@@ -289,12 +319,16 @@ impl Hub {
                     self.register(gid, key, caps, &initial, now, pass);
                 }
                 Action::Unregister(key) => {
-                    if self.owners.get(&key) == Some(&gid) {
-                        self.release(&key, now, pass);
+                    if self
+                        .owners
+                        .get(&key)
+                        .is_some_and(|groups| groups.contains(&gid))
+                    {
+                        self.drop_registrant(&key, gid, now, pass);
                     }
                 }
                 Action::Update(update) => {
-                    if self.owners.get(&update.key) != Some(&gid) {
+                    if self.device_owner(&update.key) != Some(gid) {
                         continue;
                     }
                     self.note_presence(&update.key, update.presence);
@@ -307,7 +341,7 @@ impl Hub {
                     }
                 }
                 Action::Asleep(key) => {
-                    if self.owners.get(&key) != Some(&gid) {
+                    if self.device_owner(&key) != Some(gid) {
                         continue;
                     }
                     self.scheduler.mark_asleep(&key);
@@ -318,15 +352,19 @@ impl Hub {
                         pass.changed = true;
                     }
                 }
-                Action::WantGrant { key, trigger } => {
+                Action::Connected(key) => {
                     if self.owner(&key) != Some(gid) {
                         continue;
                     }
-                    // A connect is a sign of life even when the min gap refuses the grant.
-                    if trigger == Trigger::Connected {
-                        self.scheduler.mark_awake(&key);
+                    // A connect is a sign of life even when the scheduler refuses the grant.
+                    self.scheduler.mark_awake(&key);
+                    if let Some(state) = self.states.get_mut(&key)
+                        && state.presence != Presence::Online
+                    {
+                        state.presence = Presence::Online;
+                        pass.changed = true;
                     }
-                    self.grant(gid, &key, trigger, now, pass);
+                    self.grant(gid, &key, Trigger::Connected, now, pass);
                 }
             }
         }
@@ -350,7 +388,9 @@ impl Hub {
         let verification = self.verification(slot.ids);
         let product = slot.product.clone();
 
-        self.owners.insert(key.clone(), gid);
+        let groups = self.owners.entry(key.clone()).or_default();
+        groups.retain(|&g| g != gid);
+        groups.push(gid);
         self.grace.remove(&key);
         self.scheduler.register(key.clone(), caps);
         self.note_presence(&key, initial.presence);
@@ -432,6 +472,8 @@ mod tests {
         on_grant: VecDeque<Vec<Action>>,
         on_report: VecDeque<Vec<Action>>,
         deadline: Option<Ms>,
+        /// Report `Connected(group key)` from every `on_grant`.
+        connected_on_grant: bool,
         calls: Vec<Call>,
     }
 
@@ -458,6 +500,9 @@ mod tests {
                 {
                     *id = grant.id;
                 }
+            }
+            if s.connected_on_grant {
+                actions.push(Action::Connected(self.key.clone()));
             }
             actions
         }
@@ -771,14 +816,13 @@ source = "test"
     }
 
     #[test]
-    fn want_grant_connected_delivers_grant() {
+    fn connected_delivers_grant() {
         let f = fake();
         let a = dev("dev-a");
         f.borrow_mut().on_grant.push_back(vec![register(&a, None)]);
-        f.borrow_mut().on_report.push_back(vec![Action::WantGrant {
-            key: a.clone(),
-            trigger: Trigger::Connected,
-        }]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Connected(a.clone())]);
         f.borrow_mut()
             .on_grant
             .push_back(vec![send(THIS_GRANT, coll(1), 0xC0)]);
@@ -975,31 +1019,43 @@ source = "test"
     }
 
     #[test]
-    fn refused_connected_still_clears_asleep() {
+    fn refused_connected_still_sets_online_and_clears_asleep() {
         let f = fake();
-        let a = dev("dev-a");
+        let (a, wakes) = (dev("dev-a"), dev("wakes"));
         let gap = Capabilities {
             min_query_gap_ms: 10_000,
             ..pushing()
         };
-        f.borrow_mut()
-            .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
-        f.borrow_mut()
-            .on_report
-            .push_back(vec![Action::Asleep(a.clone())]);
-        f.borrow_mut().on_report.push_back(vec![Action::WantGrant {
-            key: a.clone(),
-            trigger: Trigger::Connected,
-        }]);
+        let query_wakes = Capabilities {
+            query_wakes: true,
+            ..pushing()
+        };
+        f.borrow_mut().on_grant.push_back(vec![
+            register_with(&a, gap, None),
+            register_with(&wakes, query_wakes, None),
+        ]);
+        f.borrow_mut().on_report.push_back(vec![
+            Action::Asleep(a.clone()),
+            Action::Asleep(wakes.clone()),
+        ]);
+        f.borrow_mut().on_report.push_back(vec![
+            Action::Connected(a.clone()),
+            Action::Connected(wakes.clone()),
+        ]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
         hub.handle(HubInput::RefreshNow, 0);
-
         hub.handle(report(1), 1);
-        hub.handle(report(1), 2);
-        assert_eq!(grants(&f).len(), 2, "Connected inside the gap is refused");
+        assert!(hub.scheduler.is_asleep(&a) && hub.scheduler.is_asleep(&wakes));
 
+        let out = hub.handle(report(1), 2);
+
+        assert_eq!(out, vec![HubOutput::StateChanged]);
+        assert_eq!(grants(&f).len(), 2, "both Connected requests are refused");
+        for key in [&a, &wakes] {
+            assert_eq!(state(&hub, key).unwrap().presence, Presence::Online);
+            assert!(!hub.scheduler.is_asleep(key));
+        }
         hub.handle(HubInput::RefreshNow, 10_000);
         assert_eq!(
             grants(&f),
@@ -1136,10 +1192,8 @@ source = "test"
         fb.borrow_mut().on_report.push_back(vec![
             level_update(&a, 1),
             Action::Asleep(a.clone()),
-            Action::WantGrant {
-                key: a.clone(),
-                trigger: Trigger::Connected,
-            },
+            Action::Connected(a.clone()),
+            Action::Connected(group_key(1)),
             send(GrantId(1), coll(1), 0xEE),
         ]);
         let mut hub = hub(&[(1, &fa), (2, &fb)]);
@@ -1154,5 +1208,117 @@ source = "test"
         assert_eq!(s.presence, Presence::Online);
         assert_eq!(grants(&fa).len(), 1);
         assert_eq!(grants(&fb).len(), 1);
+    }
+
+    #[test]
+    fn connected_on_group_key_delivers_grant_to_owning_engine() {
+        let (fa, fb) = (fake(), fake());
+        fb.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Connected(group_key(2))]);
+        fb.borrow_mut().on_grant.push_back(Vec::new());
+        fb.borrow_mut()
+            .on_grant
+            .push_back(vec![send(THIS_GRANT, coll(2), 0xC2)]);
+        let mut hub = hub(&[(1, &fa), (2, &fb)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+
+        let out = hub.handle(report(2), 5);
+
+        assert_eq!(sends(&out), vec![vec![0xC2]]);
+        assert_eq!(
+            grants(&fb),
+            vec![
+                (group_key(2), Trigger::Arrival),
+                (group_key(2), Trigger::Connected),
+            ]
+        );
+        assert_eq!(grants(&fa), vec![(group_key(1), Trigger::Arrival)]);
+    }
+
+    #[test]
+    fn takeover_then_removal_falls_back_to_remaining_registrant() {
+        let k = dev("logi:unit:1A2B3C4D");
+        let (receiver, wired) = (fake(), fake());
+        receiver
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, Some(Level::Percent(50)))]);
+        receiver
+            .borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&k, 30)]);
+        wired
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        let mut hub = hub(&[(1, &receiver), (2, &wired)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 100);
+
+        let out = hub.handle(HubInput::GroupRemoved(GroupId(2)), 1_000);
+        assert!(out.is_empty(), "state kept as is: {out:?}");
+        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Online);
+        assert!(hub.grace.is_empty());
+        assert_eq!(hub.next_deadline(), None);
+
+        hub.handle(report(1), 2_000);
+        assert_eq!(state(&hub, &k).unwrap().level, Some(Level::Percent(30)));
+
+        hub.handle(HubInput::RefreshNow, 3_000);
+        assert_eq!(
+            grants(&receiver).last(),
+            Some(&(k.clone(), Trigger::RefreshNow))
+        );
+        assert_eq!(grants(&wired), vec![(group_key(2), Trigger::Arrival)]);
+
+        hub.handle(HubInput::Tick, 100_000);
+        assert!(state(&hub, &k).is_some());
+    }
+
+    #[test]
+    fn unregister_by_last_registrant_starts_grace() {
+        let k = dev("logi:unit:1A2B3C4D");
+        let (receiver, wired) = (fake(), fake());
+        receiver
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        receiver
+            .borrow_mut()
+            .on_report
+            .push_back(vec![Action::Unregister(k.clone())]);
+        wired
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        wired
+            .borrow_mut()
+            .on_report
+            .push_back(vec![Action::Unregister(k.clone())]);
+        let mut hub = hub(&[(1, &receiver), (2, &wired)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+
+        hub.handle(report(1), 10);
+        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Online);
+        assert!(hub.grace.is_empty());
+
+        let out = hub.handle(report(2), 20);
+        assert_eq!(out, vec![HubOutput::StateChanged]);
+        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Offline);
+        assert_eq!(hub.next_deadline(), Some(20 + REMOVAL_GRACE_MS));
+    }
+
+    #[test]
+    fn nested_connected_grants_are_capped() {
+        let f = fake();
+        f.borrow_mut().connected_on_grant = true;
+        let mut hub = hub(&[(1, &f)]);
+
+        hub.handle(logi(1), 0);
+
+        assert_eq!(grants(&f).len(), 1 + MAX_NESTED_GRANTS);
     }
 }
