@@ -400,12 +400,14 @@ impl HidppEngine {
                 Outcome::Offline => actions.push(Action::Asleep(d.key.clone())),
                 Outcome::Nothing => {}
             },
-            // Source: Solaar `base.py` (0x04 connect fail, 0x09 resource error: device unreachable).
-            Reply::Err20(_) | Reply::Err10(ERR_CONNECT_FAIL | ERR_RESOURCE_ERROR) => {
+            // Source: Solaar `base.py` (0x04 connect fail, 0x08 "no device with that number
+            // currently accessible", 0x09 resource error); kernel hid-logitech-hidpp.c treats 0x08
+            // and 0x09 alike as "device might not be connected". Hardware: an idle Superlight behind
+            // a LIGHTSPEED receiver answers 0x08. Unpairing is the receiver's 0x40/0x02 notification.
+            Reply::Err20(_)
+            | Reply::Err10(ERR_CONNECT_FAIL | ERR_UNKNOWN_DEVICE | ERR_RESOURCE_ERROR) => {
                 actions.push(Action::Asleep(d.key.clone()));
             }
-            // Nothing paired there any more.
-            Reply::Err10(ERR_UNKNOWN_DEVICE) => self.forget(index, actions),
             Reply::Err10(_) | Reply::NotMine => {}
         }
     }
@@ -1390,16 +1392,30 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     }
 
     #[test]
-    fn unknown_device_error_on_read_unregisters() {
+    fn unknown_device_error_on_read_marks_asleep() {
+        // Hardware: an idle Superlight behind a LIGHTSPEED receiver answers 0x08.
         let mut e = mouse_engine();
         e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
 
         let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 6, 0x1B, 0x08]), 110);
 
-        assert_eq!(a, vec![Action::Unregister(mouse_key())]);
-        // The index is unknown again: link-up goes through discovery.
+        assert_eq!(a, vec![Action::Asleep(mouse_key())]);
+        // Still known: link-up is a Connected on the device, not a rediscovery.
         let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 120);
-        assert_eq!(a, vec![Action::Connected(e.group_key())]);
+        assert_eq!(a, vec![Action::Connected(mouse_key())]);
+    }
+
+    #[test]
+    fn unknown_device_error_on_hidpp10_link_up_marks_asleep() {
+        let key = DeviceKey("logi:C547:1".into());
+        let mut e = hidpp10_engine();
+        e.on_grant(&grant(3, &key, Trigger::Connected), 100);
+
+        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 0x81, 0x00, 0x08]), 110);
+
+        assert_eq!(a, vec![Action::Asleep(key.clone())]);
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 120);
+        assert_eq!(a, vec![Action::Connected(key)]);
     }
 
     /// Receiver with a HID++ 1.0 device (register 0x0D) on index 1 and no conversation left.
