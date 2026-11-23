@@ -14,6 +14,13 @@ cargo build --release
 
 The binary is written to `target/release/batterysight.exe`.
 
+With the MSVC toolchain (Visual Studio Build Tools installed) nothing else is needed. With the `x86_64-pc-windows-gnu` toolchain, the `windows` crate needs GNU binutils (`dlltool` and `as`): install them, for example with `winget install --scope user BrechtSanders.WinLibs.POSIX.UCRT`, and point rustc at that `dlltool.exe` in your user `~/.cargo/config.toml`:
+
+```toml
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "dlltool=<path to WinLibs>/mingw64/bin/dlltool.exe"]
+```
+
 ## License
 
 GPL-3.0-only. See [LICENSE](LICENSE).
