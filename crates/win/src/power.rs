@@ -20,28 +20,33 @@ pub struct PowerGuard {
     handle: HPOWERNOTIFY,
     /// The subscription passed at registration, kept alive with the registration.
     _params: Box<DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS>,
-    /// The callback context; freed only after unregistering.
-    _poster: Box<Poster>,
 }
 
 impl Drop for PowerGuard {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `PowerRegisterSuspendResumeNotification`.
+        // SAFETY: the handle came from `PowerRegisterSuspendResumeNotification`. The callback
+        // context is leaked, so a callback still running during or after this call is sound.
         let _ = unsafe { PowerUnregisterSuspendResumeNotification(self.handle) };
     }
 }
 
 /// Posts `Resume` on every automatic resume from sleep until the guard drops.
+///
+/// Each successful registration leaks its `Poster`, the callback context, on purpose.
+/// `PowerUnregisterSuspendResumeNotification` is not documented to wait for a running
+/// callback, so the context must outlive the registration. Once the reactor is gone, the
+/// leaked `Poster` only drops events.
 pub fn register_power(poster: Poster) -> windows::core::Result<PowerGuard> {
-    let poster = Box::new(poster);
+    let context = Box::into_raw(Box::new(poster));
     let params = Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
         Callback: Some(on_power),
-        Context: ptr::from_ref::<Poster>(&poster).cast_mut().cast(),
+        Context: context.cast(),
     });
     let mut handle = ptr::null_mut();
     // SAFETY: with `DEVICE_NOTIFY_CALLBACK` the recipient is a pointer to the subscription
-    // parameters; they and the poster they point to live as long as the guard.
-    unsafe {
+    // parameters, which live as long as the guard; the context they carry is never freed
+    // once registered.
+    let registered = unsafe {
         PowerRegisterSuspendResumeNotification(
             DEVICE_NOTIFY_CALLBACK,
             HANDLE(
@@ -52,23 +57,27 @@ pub fn register_power(poster: Poster) -> windows::core::Result<PowerGuard> {
             &mut handle,
         )
     }
-    .ok()?;
+    .ok();
+    if let Err(error) = registered {
+        // SAFETY: registration failed, so no callback can see the context; it is still ours.
+        drop(unsafe { Box::from_raw(context) });
+        return Err(error);
+    }
     Ok(PowerGuard {
         handle: HPOWERNOTIFY(handle as isize),
         _params: params,
-        _poster: poster,
     })
 }
 
 /// `PDEVICE_NOTIFY_CALLBACK_ROUTINE`: posts `Resume` for `PBT_APMRESUMEAUTOMATIC` and ignores
-/// every other event. `context` is the guard's `Poster`.
+/// every other event. `context` is the leaked `Poster` of the registration.
 unsafe extern "system" fn on_power(
     context: *const c_void,
     kind: u32,
     _setting: *const c_void,
 ) -> u32 {
     if kind == PBT_APMRESUMEAUTOMATIC {
-        // SAFETY: the context is the poster boxed in the guard, alive while registered.
+        // SAFETY: the context is the registration's leaked poster, never freed.
         unsafe { &*context.cast::<Poster>() }.post(OsEvent::Resume);
     }
     ERROR_SUCCESS.0

@@ -10,8 +10,8 @@ use std::slice;
 
 use batterysight_core::hid::CollectionId;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE,
-    HANDLE,
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
@@ -31,9 +31,12 @@ pub(crate) fn is_exclusive(usage_page: u16, usage: u16) -> bool {
 /// Opens a collection for overlapped I/O, shared read/write, never exclusively.
 ///
 /// Asks for read and write access, and for read access alone when that is denied. Returns the
-/// handle and whether it is writable. `path` must be NUL-terminated.
+/// handle and whether it is writable. A `path` that is not NUL-terminated is refused with
+/// `ERROR_INVALID_PARAMETER`.
 pub(crate) fn open(path: &[u16]) -> windows::core::Result<(OwnedHandle, bool)> {
-    debug_assert_eq!(path.last(), Some(&0), "path must be NUL-terminated");
+    if path.last() != Some(&0) {
+        return Err(ERROR_INVALID_PARAMETER.into());
+    }
     match create(path, GENERIC_READ.0 | GENERIC_WRITE.0) {
         Ok(handle) => Ok((handle, true)),
         Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {
@@ -99,10 +102,11 @@ impl Op {
 
     /// Starts the operation on `handle`, which must be associated with a completion port.
     ///
-    /// Returns `true` when the operation is pending or already complete: either way a
-    /// completion packet will be queued, and the `Op` belongs to the kernel until
-    /// [`Op::from_completion`] takes it back. Returns `false` when the call failed at once; no
-    /// packet is queued then and the `Op` is freed here.
+    /// Returns `true` when a completion packet will be queued: the operation is pending, or
+    /// already complete with success or a warning status (see [`queues_completion`]). The
+    /// `Op` then belongs to the kernel until [`Op::from_completion`] takes it back, and the
+    /// outcome comes from [`Op::result`]. Returns `false` when the call failed at once with an
+    /// error status; no packet is queued then and the `Op` is freed here.
     pub(crate) fn start(mut self: Box<Self>, handle: HANDLE) -> bool {
         self.overlapped = OVERLAPPED::default();
         let len = self.buffer.len();
@@ -127,15 +131,13 @@ impl Op {
                 ),
             }
         };
-        match result {
-            Ok(()) => true,
-            Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => true,
-            Err(_) => {
-                // SAFETY: the call failed synchronously, so the kernel kept no reference.
-                drop(unsafe { Box::from_raw(op) });
-                false
-            }
+        if queues_completion(&result) {
+            return true;
         }
+        // SAFETY: the call failed with an error status (not a warning), so no completion
+        // packet will be queued and the kernel kept no reference.
+        drop(unsafe { Box::from_raw(op) });
+        false
     }
 
     /// Takes back an `Op` whose completion packet was dequeued.
@@ -164,6 +166,21 @@ pub(crate) fn is_cancelled(error: &windows::core::Error) -> bool {
     error.code() == ERROR_OPERATION_ABORTED.to_hresult()
 }
 
+/// Whether a just-issued overlapped `ReadFile`/`WriteFile` will queue a completion packet.
+///
+/// The I/O manager queues one unless the request failed with an error status. Success,
+/// pending, and a warning status all queue one; for example, `STATUS_BUFFER_OVERFLOW`
+/// surfaces as `ERROR_MORE_DATA`.
+fn queues_completion(result: &windows::core::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            error.code() == ERROR_IO_PENDING.to_hresult()
+                || error.code() == ERROR_MORE_DATA.to_hresult()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +200,14 @@ mod tests {
         assert_eq!(padded(&[1, 2, 3], 3), Some(vec![1, 2, 3]));
         assert_eq!(padded(&[1, 2, 3], 2), None);
         assert_eq!(padded(&[], 7), None);
+    }
+
+    #[test]
+    fn warnings_and_pending_queue_a_completion() {
+        assert!(queues_completion(&Ok(())));
+        assert!(queues_completion(&Err(ERROR_IO_PENDING.into())));
+        assert!(queues_completion(&Err(ERROR_MORE_DATA.into())));
+        assert!(!queues_completion(&Err(ERROR_ACCESS_DENIED.into())));
+        assert!(!queues_completion(&Err(ERROR_OPERATION_ABORTED.into())));
     }
 }

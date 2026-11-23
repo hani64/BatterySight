@@ -327,12 +327,13 @@ mod tests {
 
     use batterysight_core::engines::hidpp::frame::fap;
     use batterysight_core::hid::Collection;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, HANDLE};
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
     };
     use windows::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+        SetNamedPipeHandleState,
     };
     use windows::core::PCWSTR;
 
@@ -588,6 +589,45 @@ mod tests {
             vec![OsEvent::ReadFailed { collection: id }]
         );
         assert_eq!(reactor.wait(Some(50), 0), Vec::new());
+    }
+
+    #[test]
+    fn oversized_report_fails_read_once() {
+        let (server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
+        let id = pipe.collection.id;
+        let mut reactor = Reactor::new().unwrap();
+        reactor.open(GroupId(1), &pipe).unwrap();
+        // Message read mode makes a short read fail with ERROR_MORE_DATA, as a HID read into
+        // a too-small buffer does (the client end of a pipe starts in byte mode).
+        let mode = PIPE_READMODE_MESSAGE;
+        // SAFETY: the reactor's client handle is open; `mode` outlives the call.
+        unsafe { SetNamedPipeHandleState(reactor.opens[&id].handle.0, Some(&mode), None, None) }
+            .unwrap();
+        // The first message completes the pending read; the second is already queued in the
+        // pipe when the read is re-issued, so that 7-byte read fails synchronously with
+        // ERROR_MORE_DATA and still queues a completion packet.
+        server.send(&[0x10, 1, 2, 3, 4, 5, 6]);
+        server.send(&[0x11, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            reactor.wait(Some(1000), 0),
+            vec![report(id, &[0x10, 1, 2, 3, 4, 5, 6])]
+        );
+        assert_eq!(
+            reactor.wait(Some(1000), 0),
+            vec![OsEvent::ReadFailed { collection: id }]
+        );
+        assert_eq!(reactor.wait(Some(50), 0), Vec::new());
+        drop(reactor);
+    }
+
+    #[test]
+    fn unterminated_path_is_refused() {
+        let (_server, mut pipe) = Server::new(PIPE_ACCESS_DUPLEX);
+        pipe.path.pop();
+        let mut reactor = Reactor::new().unwrap();
+        let error = reactor.open(GroupId(1), &pipe).unwrap_err();
+        assert_eq!(error.code(), ERROR_INVALID_PARAMETER.to_hresult());
+        assert!(reactor.opens.is_empty());
     }
 
     #[test]
