@@ -139,9 +139,10 @@ impl Reactor {
     }
 
     /// Sends `bytes` (report id first) to `collection`, zero-padded to its output report
-    /// length. Failures arrive as `WriteFailed`, including writes to a collection that is not
-    /// open, is read-only, or whose output report is shorter than `bytes`.
-    pub fn write(&mut self, collection: CollectionId, bytes: &[u8]) {
+    /// length, and returns whether the write was started. Failures arrive as `WriteFailed`,
+    /// including writes to a collection that is not open, is read-only, or whose output
+    /// report is shorter than `bytes` (those are not started).
+    pub fn write(&mut self, collection: CollectionId, bytes: &[u8]) -> bool {
         let started = self.opens.get_mut(&collection).is_some_and(|open| {
             let started = open.writable
                 && hid_io::padded(bytes, open.output_len).is_some_and(|buffer| {
@@ -153,6 +154,7 @@ impl Reactor {
         if !started {
             self.backlog.push(OsEvent::WriteFailed { collection });
         }
+        started
     }
 
     pub fn poster(&self) -> Poster {
@@ -481,7 +483,7 @@ mod tests {
     #[test]
     fn write_to_unknown_collection_fails() {
         let mut reactor = Reactor::new().unwrap();
-        reactor.write(CollectionId(7), &[0x10]);
+        assert!(!reactor.write(CollectionId(7), &[0x10]));
         assert_eq!(
             reactor.wait(Some(0), 0),
             vec![OsEvent::WriteFailed {
@@ -527,7 +529,7 @@ mod tests {
         server.send(&[0x10, 9, 8]);
         assert_eq!(reactor.wait(Some(1000), 0), vec![report(id, &[0x10, 9, 8])]);
 
-        reactor.write(id, &[0x10, 0x01, 0x02]);
+        assert!(reactor.write(id, &[0x10, 0x01, 0x02]));
         assert_eq!(server.receive(), [0x10, 0x01, 0x02, 0, 0, 0, 0]);
         assert_eq!(reactor.wait(Some(50), 0), Vec::new());
     }
@@ -538,7 +540,7 @@ mod tests {
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
         reactor.open(GroupId(1), &pipe).unwrap();
-        reactor.write(id, &[0; 8]);
+        assert!(!reactor.write(id, &[0; 8]));
         assert_eq!(
             reactor.wait(Some(0), 0),
             vec![OsEvent::WriteFailed { collection: id }]
@@ -640,7 +642,7 @@ mod tests {
         assert!(!reactor.opens[&id].writable);
         server.send(&[0x10, 1]);
         assert_eq!(reactor.wait(Some(1000), 0), vec![report(id, &[0x10, 1])]);
-        reactor.write(id, &[0x10]);
+        assert!(!reactor.write(id, &[0x10]));
         assert_eq!(
             reactor.wait(Some(0), 0),
             vec![OsEvent::WriteFailed { collection: id }]

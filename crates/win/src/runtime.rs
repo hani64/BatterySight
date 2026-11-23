@@ -25,7 +25,7 @@ use crate::hid_enum::{self, HidInterface};
 use crate::notify::register_hid_notifications;
 use crate::power::register_power;
 use crate::reactor::{OsEvent, Poster, Reactor};
-use crate::trace::Trace;
+use crate::trace::{Direction, Trace};
 
 /// How long [`RuntimeHandle::stop`] waits for the device thread to finish.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -131,7 +131,7 @@ fn device_thread(
         reactor,
         groups: Vec::new(),
         products: HashMap::new(),
-        retried: HashSet::new(),
+        guard: ReadFailureGuard::default(),
         trace: Trace::from_env(),
         states,
         on_change,
@@ -164,10 +164,9 @@ struct Device {
     groups: Vec<Opened>,
     /// Product strings by lowercased path; each is read from the device once.
     products: HashMap<String, String>,
-    /// Groups closed after a read failure and reopened since the last arrival or resume. A
-    /// second failure leaves them closed until the next arrival or resume, so a read that
-    /// keeps failing does not reopen the device in a loop.
-    retried: HashSet<PathSet>,
+    /// Keeps a group closed after back-to-back read failures until the next arrival,
+    /// resume or refresh.
+    guard: ReadFailureGuard,
     trace: Option<Trace>,
     states: Arc<Mutex<Vec<DeviceState>>>,
     on_change: Box<dyn Fn() + Send>,
@@ -196,7 +195,12 @@ impl Device {
             }
             loop {
                 match commands.try_recv() {
-                    Ok(Command::RefreshNow) => self.feed(HubInput::RefreshNow, now_ms()),
+                    Ok(Command::RefreshNow) => {
+                        // A refresh also reopens groups the read-failure guard closed.
+                        self.guard.clear();
+                        self.rescan();
+                        self.feed(HubInput::RefreshNow, now_ms());
+                    }
                     Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return,
                     Err(TryRecvError::Empty) => break,
                 }
@@ -208,6 +212,16 @@ impl Device {
     fn on_event(&mut self, event: OsEvent) -> bool {
         match event {
             OsEvent::Report { collection, bytes } => {
+                if let Some(trace) = &mut self.trace {
+                    trace.record(Direction::In, collection, &bytes);
+                }
+                if let Some(group) = self
+                    .groups
+                    .iter()
+                    .find(|group| group.collections.contains(&collection))
+                {
+                    self.guard.on_report(&group.paths);
+                }
                 self.feed(HubInput::Report { collection, bytes }, now_ms());
                 false
             }
@@ -219,7 +233,7 @@ impl Device {
                     .position(|group| group.collections.contains(&collection));
                 failed.is_some_and(|index| {
                     let gone = self.remove(index);
-                    self.retried.insert(gone.paths)
+                    self.guard.on_failure(&gone.paths) == AfterFailure::Reopen
                 })
             }
             OsEvent::InterfaceRemoved { path } => {
@@ -234,12 +248,12 @@ impl Device {
                 })
             }
             OsEvent::InterfaceArrived => {
-                self.retried.clear();
+                self.guard.clear();
                 true
             }
             OsEvent::Resume => {
                 // Handles stay open: a device asleep across the suspend keeps its entry.
-                self.retried.clear();
+                self.guard.clear();
                 self.rescan();
                 self.feed(HubInput::Resume, now_ms());
                 false
@@ -249,7 +263,7 @@ impl Device {
     }
 
     /// Enumerates the HID groups engines want, closes the opened ones no longer present
-    /// and opens the new ones.
+    /// and opens the new ones, except those the read-failure guard keeps closed.
     fn rescan(&mut self) {
         let scanned: Vec<(HidGroup, Vec<HidInterface>, PathSet)> =
             hid_enum::group(hid_enum::enumerate())
@@ -268,7 +282,7 @@ impl Device {
             self.remove(index);
         }
         for (index, (group, members, paths)) in scanned.into_iter().enumerate() {
-            if new.contains(&index) {
+            if new.contains(&index) && !self.guard.is_closed(&paths) {
                 self.arrive(group, members, paths);
             }
         }
@@ -328,10 +342,11 @@ impl Device {
                 HubOutput::Send {
                     collection, bytes, ..
                 } => {
-                    if let Some(trace) = &mut self.trace {
-                        trace.send(collection, &bytes);
+                    if self.reactor.write(collection, &bytes)
+                        && let Some(trace) = &mut self.trace
+                    {
+                        trace.record(Direction::Out, collection, &bytes);
                     }
-                    self.reactor.write(collection, &bytes);
                 }
                 HubOutput::StateChanged => changed = true,
             }
@@ -360,6 +375,56 @@ fn unmatched(sets: &[&PathSet], others: &[&PathSet]) -> Vec<usize> {
         .filter(|(_, set)| !others.contains(set))
         .map(|(index, _)| index)
         .collect()
+}
+
+/// What to do with a group whose read just failed.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterFailure {
+    /// Re-enumerate; the group is reopened if still present.
+    Reopen,
+    /// Leave the group closed until the guard is cleared.
+    StayClosed,
+}
+
+/// Counts back-to-back read failures per group, keyed by path set.
+///
+/// A failure reopens the group unless the previous failure of the same group was not
+/// followed by a report from it; then the group stays closed until [`clear`]. That way a
+/// read that keeps failing does not reopen the device in a loop.
+///
+/// [`clear`]: ReadFailureGuard::clear
+#[derive(Default)]
+struct ReadFailureGuard {
+    /// Groups that failed and reported nothing since.
+    failed: HashSet<PathSet>,
+    /// Groups that failed twice in a row.
+    closed: HashSet<PathSet>,
+}
+
+impl ReadFailureGuard {
+    /// The group read normally: its next failure counts as the first again.
+    fn on_report(&mut self, paths: &PathSet) {
+        self.failed.remove(paths);
+    }
+
+    fn on_failure(&mut self, paths: &PathSet) -> AfterFailure {
+        if self.failed.insert(paths.clone()) {
+            AfterFailure::Reopen
+        } else {
+            self.closed.insert(paths.clone());
+            AfterFailure::StayClosed
+        }
+    }
+
+    /// Forgets every failure: closed groups may be reopened.
+    fn clear(&mut self) {
+        self.failed.clear();
+        self.closed.clear();
+    }
+
+    fn is_closed(&self, paths: &PathSet) -> bool {
+        self.closed.contains(paths)
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +475,38 @@ mod tests {
         let a = set(&["a"]);
         assert_eq!(unmatched(&[&a], &[]), [0]);
         assert!(unmatched(&[], &[&a]).is_empty());
+    }
+
+    #[test]
+    fn failures_separated_by_a_report_reopen() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
+        guard.on_report(&group);
+        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
+        assert!(!guard.is_closed(&group));
+    }
+
+    #[test]
+    fn back_to_back_failures_stay_closed() {
+        let group = set(&["a"]);
+        let other = set(&["b"]);
+        let mut guard = ReadFailureGuard::default();
+        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
+        guard.on_report(&other);
+        assert_eq!(guard.on_failure(&group), AfterFailure::StayClosed);
+        assert!(guard.is_closed(&group));
+        assert!(!guard.is_closed(&other));
+    }
+
+    #[test]
+    fn clear_allows_reopening() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        guard.on_failure(&group);
+        guard.on_failure(&group);
+        guard.clear();
+        assert!(!guard.is_closed(&group));
+        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
     }
 }
