@@ -48,6 +48,7 @@ fn coarse_from_bits(bits: u8) -> Option<Level> {
 }
 
 /// Feature 0x1000 (battery level status): `p[0]` percent, `p[2]` status.
+/// A percent above 100 is out of spec and yields no level.
 // Source: Linux kernel hid-logitech-hidpp `hidpp20_batterylevel_map_status_capacity` (facts only).
 pub fn decode_1000(p: &[u8]) -> Reading {
     let &[pct, _, status, ..] = p else {
@@ -61,6 +62,7 @@ pub fn decode_1000(p: &[u8]) -> Reading {
     };
     let level = match status {
         3 => Some(Level::Percent(100)),
+        _ if pct > 100 => None,
         0 => Some(Level::Percent(pct)),
         _ if pct == 0 => None,
         _ => Some(Level::Percent(pct)),
@@ -134,6 +136,7 @@ pub fn decode_1f20(p: &[u8], curve: VoltageCurve) -> Reading {
 
 /// HID++ 1.0 register 0x0D (battery mileage): `p[0]` percent, status in `p[2] >> 6`.
 /// Takes `frame[4..]` for a register reply and `frame[3..]` for a notification.
+/// A percent above 100 is out of spec and yields no level.
 // Source: Linux kernel hid-logitech-hidpp `hidpp10_battery_mileage_map_status` (facts only);
 // Solaar `hidpp10.parse_battery_status` (status `p[2] & 0xF0`: 0x30/0x50/0x90 agree).
 // [UNVERIFIED] kernel/Solaar disagree on 0x0D notification offset; following Solaar
@@ -147,7 +150,7 @@ pub fn decode_reg_0d(p: &[u8]) -> Reading {
         2 => Charge::Full,
         _ => Charge::NotCharging,
     };
-    online(Some(Level::Percent(pct)), None, charge)
+    online((pct <= 100).then_some(Level::Percent(pct)), None, charge)
 }
 
 /// HID++ 1.0 register 0x07 (battery status): `p[0]` level 1..=7, `p[1]` status.
@@ -217,6 +220,18 @@ mod tests {
         assert_eq!(
             decode_1000(&[42, 0, 6]),
             reading(Some(Level::Percent(42)), None, Charge::NotCharging)
+        );
+    }
+
+    #[test]
+    fn b1000_percent_above_100_is_out_of_spec() {
+        assert_eq!(
+            decode_1000(&[100, 0, 0]),
+            reading(Some(Level::Percent(100)), None, Charge::Discharging)
+        );
+        assert_eq!(
+            decode_1000(&[101, 0, 0]),
+            reading(None, None, Charge::Discharging)
         );
     }
 
@@ -294,6 +309,18 @@ mod tests {
         assert_eq!(
             decode_reg_0d(&[55, 0, 0x40]),
             reading(Some(Level::Percent(55)), None, Charge::Charging)
+        );
+    }
+
+    #[test]
+    fn reg0d_percent_above_100_is_out_of_spec() {
+        assert_eq!(
+            decode_reg_0d(&[100, 0, 0x00]),
+            reading(Some(Level::Percent(100)), None, Charge::Discharging)
+        );
+        assert_eq!(
+            decode_reg_0d(&[101, 0, 0x00]),
+            reading(None, None, Charge::Discharging)
         );
     }
 
