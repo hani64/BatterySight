@@ -1,0 +1,42 @@
+# PRO X Wireless Gaming Headset 046D:0ABA: its USB dongle exposes only the
+# long HID++ collection (usage page 0xFF43, usage 0x0202), so every request is
+# a long (0x11) frame addressed to device index 0xFF.
+#
+# Synthetic transcript: frames built from the layouts in Linux
+# drivers/hid/hid-logitech-hidpp.c (long 0x11 reports, 0x1F20 ADC measurement
+# event `hidpp20_adc_measurement_event_1f20`) and Solaar
+# lib/logitech_receiver (base.py ping accepting index 0x00 for 0xFF,
+# hidpp20.py feature calls). Feature indexes are made up. Replace with a real
+# capture in Task 14.
+#
+# Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
+# reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The
+# `out` lines after an `in` are the writes that frame causes.
+
+# Group arrival: ping index 0xFF.
+out long 11 FF 00 1B 00 00 5A
+# The dongle answers with the complementary index 0x00: protocol 4.2.
+in  long 11 00 00 1B 04 02 5A
+# Root getFeature 0x0005 -> absent: name and kind fall back.
+out long 11 FF 00 0B 00 05 00
+in  long 11 FF 00 0B 00
+# Root getFeature 0x0003 -> absent: key falls back to pid and index.
+out long 11 FF 00 0B 00 03 00
+in  long 11 FF 00 0B 00
+# Battery features in preference order: 0x1004, 0x1000, 0x1001 absent ...
+out long 11 FF 00 0B 10 04 00
+in  long 11 FF 00 0B 00
+out long 11 FF 00 0B 10 00 00
+in  long 11 FF 00 0B 00
+out long 11 FF 00 0B 10 01 00
+in  long 11 FF 00 0B 00
+# ... 0x1F20 (ADC measurement) at index 8.
+out long 11 FF 00 0B 1F 20 00
+in  long 11 FF 00 0B 08
+# 0x1F20 fn 0: 3828 mV, discharging -> 68 % on the PRO X curve -> registered.
+out long 11 FF 08 0B 00 00 00
+in  long 11 FF 08 0B 0E F4 01
+# Broadcast with flags 0x0F: headset switched off -> asleep, level kept.
+in  long 11 FF 08 00 0E F4 0F
+# Broadcast: back on, 3971 mV charging -> 87 %.
+in  long 11 FF 08 00 0F 83 03
