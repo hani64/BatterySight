@@ -1,5 +1,7 @@
 //! Built-in protocol engines.
 
+pub mod hidpp;
+
 use crate::catalog::Catalog;
 use crate::engine::Engine;
 use crate::hid::HidGroup;
