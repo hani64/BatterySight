@@ -6,7 +6,7 @@
 
 use crate::hid::CollectionId;
 use crate::model::{DeviceKey, DeviceUpdate};
-use crate::scheduler::{Capabilities, Grant, GrantId, Trigger};
+use crate::scheduler::{Capabilities, Grant, GrantId};
 use crate::time::Ms;
 
 /// What an engine asks the hub to do.
@@ -25,14 +25,17 @@ pub enum Action {
         caps: Capabilities,
         initial: DeviceUpdate,
     },
-    /// The device is gone from this group (e.g. unpaired); its entry goes offline.
+    /// This group no longer serves the device (e.g. unpaired); with no other
+    /// group serving it, its entry goes offline.
     Unregister(DeviceKey),
     /// New reading or presence for a registered device.
     Update(DeviceUpdate),
     /// The device sleeps or lost its link: stop asking it.
     Asleep(DeviceKey),
-    /// Ask the scheduler for a grant on `key` (a device or this engine's group key).
-    WantGrant { key: DeviceKey, trigger: Trigger },
+    /// A link to `key` (a device or this engine's group key) was established.
+    /// The only grant an engine can ask for: the hub requests
+    /// [`Trigger::Connected`](crate::scheduler::Trigger::Connected) for it.
+    Connected(DeviceKey),
 }
 
 pub trait Engine {
