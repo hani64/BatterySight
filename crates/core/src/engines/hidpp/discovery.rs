@@ -25,6 +25,12 @@ const BATTERY_NOTIFICATIONS: u8 = 0x10;
 // HID++ 1.0 error codes. Source: Solaar `hidpp10_constants.py` `ErrorCode`.
 const ERR_INVALID_SUB_ID: u8 = 0x01;
 const ERR_INVALID_ADDRESS: u8 = 0x02;
+/// The receiver could not reach the device (link down).
+pub(super) const ERR_CONNECT_FAIL: u8 = 0x04;
+/// No device paired on that index.
+pub(super) const ERR_UNKNOWN_DEVICE: u8 = 0x08;
+/// The device is busy or asleep.
+pub(super) const ERR_RESOURCE_ERROR: u8 = 0x09;
 
 /// Echoed by a ping reply. Source: Solaar `base.py` `ping()`.
 const PING_MARK: u8 = 0x5A;
@@ -250,6 +256,11 @@ pub(super) fn request(step: Step, f: &Found) -> Option<Request> {
 
 /// The step after `reply` to discovery `step`, recording what it taught in `f`.
 pub(super) fn advance<'a>(step: Step, f: &mut Found, reply: Reply<'a>) -> Next<'a> {
+    // Unreachable, unpaired or asleep: stop at any step, register nothing.
+    // Source: Solaar `base.py` (0x04 / 0x08 / 0x09 end a request to the device).
+    if let Reply::Err10(ERR_CONNECT_FAIL | ERR_UNKNOWN_DEVICE | ERR_RESOURCE_ERROR) = reply {
+        return Next::Done;
+    }
     match step {
         Step::GetNotifications => match reply {
             // Only add the wireless flag; leave every other bit as it is.
@@ -320,7 +331,7 @@ pub(super) fn advance<'a>(step: Step, f: &mut Found, reply: Reply<'a>) -> Next<'
             Next::Ask(f.after_kind())
         }
         Step::UnitId => {
-            // Source: Solaar `hidpp20.py` `get_firmware` (0x0003 fn 0: unit id in bytes 1..5).
+            // Source: Solaar `hidpp20.py` `get_ids` (0x0003 fn 0: unit id in bytes 1..5).
             if let Reply::Ok(&[_, u0, u1, u2, u3, ..]) = reply {
                 f.unit = u32::from_be_bytes([u0, u1, u2, u3]);
             }

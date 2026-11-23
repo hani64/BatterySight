@@ -25,7 +25,8 @@ use crate::time::Ms;
 use super::battery::{self, Reading};
 use super::curves::{self, VoltageCurve};
 use super::discovery::{
-    self, Decoder, Found, Next, REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
+    self, Decoder, ERR_CONNECT_FAIL, ERR_RESOURCE_ERROR, ERR_UNKNOWN_DEVICE, Found, Next,
+    REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
 };
 use super::frame::{LONG, Reply, SHORT};
 
@@ -52,10 +53,10 @@ const RECEIVER_SLOTS: RangeInclusive<u8> = 1..=6;
 // Source: Solaar `notifications.py` (0x41 DJ pairing), `hidpp10_constants.py`.
 const LINK_NOTIFICATION: u8 = 0x41;
 const LINK_LOST: u8 = 0x40;
-
-// HID++ 1.0 error codes. Source: Solaar `hidpp10_constants.py` `ErrorCode`.
-const ERR_CONNECT_FAIL: u8 = 0x04;
-const ERR_RESOURCE_ERROR: u8 = 0x09;
+/// Receiver sub id for connect/disconnect events; address 0x02 means the device was unpaired.
+// Source: Solaar `notifications.py` (CONNECT_DISCONNECT 0x40, address 0x02 un-paired).
+const CONNECT_DISCONNECT: u8 = 0x40;
+const UNPAIRED: u8 = 0x02;
 
 /// One device index's exchange under a grant.
 #[derive(Debug)]
@@ -63,6 +64,10 @@ struct Conversation {
     grant: GrantId,
     step: Step,
     found: Found,
+    /// The device is registered: the conversation ends in a [`Step::Read`], not a `Register`.
+    known: bool,
+    /// A timed-out read was already asked again.
+    retried: bool,
 }
 
 impl Conversation {
@@ -71,6 +76,8 @@ impl Conversation {
             grant,
             step,
             found: Found::default(),
+            known: false,
+            retried: false,
         }
     }
 }
@@ -310,6 +317,11 @@ impl HidppEngine {
             return;
         }
         match discovery::advance(c.step, &mut c.found, reply) {
+            // A known device re-enabled its notifications: read with what we know.
+            Next::Ask(Step::Battery) if c.known => {
+                c.step = Step::Read;
+                self.issue(index, c, now, actions);
+            }
             Next::Ask(step) => {
                 c.step = step;
                 self.issue(index, c, now, actions);
@@ -319,6 +331,8 @@ impl HidppEngine {
             Next::Done if matches!(c.step, Step::GetNotifications | Step::SetNotifications(_)) => {
                 self.discover(RECEIVER_SLOTS, c.grant, now, actions);
             }
+            // A known device answered with an error: same meaning as on a read.
+            Next::Done if c.known => self.read_reply(index, reply, actions),
             Next::Done => {}
         }
     }
@@ -370,7 +384,7 @@ impl HidppEngine {
     }
 
     /// Handles the answer to a known device's battery read.
-    fn read_reply(&self, index: u8, reply: Reply<'_>, actions: &mut Vec<Action>) {
+    fn read_reply(&mut self, index: u8, reply: Reply<'_>, actions: &mut Vec<Action>) {
         let Some(d) = self.devices.get(&index) else {
             return;
         };
@@ -390,7 +404,17 @@ impl HidppEngine {
             Reply::Err20(_) | Reply::Err10(ERR_CONNECT_FAIL | ERR_RESOURCE_ERROR) => {
                 actions.push(Action::Asleep(d.key.clone()));
             }
+            // Nothing paired there any more.
+            Reply::Err10(ERR_UNKNOWN_DEVICE) => self.forget(index, actions),
             Reply::Err10(_) | Reply::NotMine => {}
+        }
+    }
+
+    /// The device on `index` is gone (unpaired): drop it so the next link-up rediscovers the index.
+    fn forget(&mut self, index: u8, actions: &mut Vec<Action>) {
+        self.in_flight.remove(&index);
+        if let Some(d) = self.devices.remove(&index) {
+            actions.push(Action::Unregister(d.key));
         }
     }
 
@@ -404,6 +428,10 @@ impl HidppEngine {
         }
         if self.receiver && report == SHORT && sub == LINK_NOTIFICATION {
             self.on_link(index, frame, actions);
+            return;
+        }
+        if self.receiver && report == SHORT && sub == CONNECT_DISCONNECT && address == UNPAIRED {
+            self.forget(index, actions);
             return;
         }
         // A direct device may report as index 0x00 instead of 0xFF.
@@ -489,19 +517,22 @@ impl Engine for HidppEngine {
                 let pending = std::mem::take(&mut self.pending);
                 self.discover(pending, grant.id, now, &mut actions);
             }
-        } else if let Some(index) = self
-            .devices
-            .iter()
-            .find(|(_, d)| d.key == grant.subject)
-            .map(|(&index, _)| index)
+        } else if let Some((&index, d)) = self.devices.iter().find(|(_, d)| d.key == grant.subject)
             && !self.in_flight.contains_key(&index)
         {
-            self.issue(
-                index,
-                Conversation::new(grant.id, Step::Read),
-                now,
-                &mut actions,
-            );
+            // HID++ 1.0 devices lose their battery notification flag across a
+            // power cycle; set it again on every link-up before reading.
+            // Source: Solaar `device.py` (re-enables notifications when a device becomes active).
+            let hidpp10 = matches!(d.decoder, Decoder::Reg0D | Decoder::Reg07);
+            let c = if grant.trigger == Trigger::Connected && hidpp10 {
+                Conversation {
+                    known: true,
+                    ..Conversation::new(grant.id, Step::GetReg00)
+                }
+            } else {
+                Conversation::new(grant.id, Step::Read)
+            };
+            self.issue(index, c, now, &mut actions);
         }
         actions
     }
@@ -545,9 +576,22 @@ impl Engine for HidppEngine {
                     self.discover(RECEIVER_SLOTS, f.conversation.grant, now, &mut actions);
                 }
                 Step::Read => {
-                    if let Some(d) = self.devices.get(&index) {
+                    let Some(d) = self.devices.get(&index) else {
+                        continue;
+                    };
+                    if !(self.receiver && RECEIVER_SLOTS.contains(&index)) {
+                        // A direct device that stays silent is gone.
                         actions.push(Action::Asleep(d.key.clone()));
+                    } else if !f.conversation.retried {
+                        // A receiver reports a sleeping device with an error, so
+                        // silence is a lost reply: ask once more within the grant.
+                        let again = Conversation {
+                            retried: true,
+                            ..f.conversation
+                        };
+                        self.issue(index, again, now, &mut actions);
                     }
+                    // A second silence leaves presence as it is.
                 }
                 // Discovery: absent or asleep; its next link notification brings it back.
                 _ => {}
@@ -1271,13 +1315,183 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     #[test]
     fn read_timeout_marks_known_device_asleep() {
-        let mut e = mouse_engine();
-        e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+        // A direct device: silence means it is gone.
+        let mut e = headset_engine();
+        let a = e.on_grant(&grant(2, &headset_key(), Trigger::RefreshNow), 100);
+        assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x08, 0x0B])]);
         assert_eq!(e.next_deadline(), Some(1_100));
 
         assert!(e.on_tick(1_099).is_empty());
-        assert_eq!(e.on_tick(1_100), vec![Action::Asleep(mouse_key())]);
+        assert_eq!(e.on_tick(1_100), vec![Action::Asleep(headset_key())]);
         assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn receiver_read_timeout_retries_once_and_keeps_presence() {
+        let mut e = mouse_engine();
+        let read = s(&[0x10, 1, 6, 0x1B]);
+        let a = e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+        assert_eq!(sent(&a), vec![read.clone()]);
+
+        // A receiver reports a sleeping device with an error: silence is a lost reply.
+        let a = e.on_tick(1_100);
+        assert_eq!(
+            a,
+            vec![Action::Send {
+                grant: GrantId(2),
+                collection: SHORT_C,
+                bytes: read,
+                timeout_ms: 1_000,
+            }]
+        );
+        assert_eq!(e.next_deadline(), Some(2_100));
+
+        let a = e.on_tick(2_100);
+        assert!(a.is_empty(), "no second retry, no Asleep: {a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn receiver_read_retry_needs_budget() {
+        let mut e = mouse_engine();
+        let one = Grant {
+            max_requests: 1,
+            ..grant(2, &mouse_key(), Trigger::RefreshNow)
+        };
+        e.on_grant(&one, 100);
+
+        assert!(e.on_tick(1_100).is_empty());
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn unpair_notification_unregisters_and_next_link_up_rediscovers() {
+        let mut e = mouse_engine();
+        let gk = e.group_key();
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00], 10);
+        assert_eq!(a, vec![Action::Unregister(mouse_key())]);
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 11);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+        let a = e.on_grant(&grant(9, &gk, Trigger::Connected), 12);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
+    }
+
+    #[test]
+    fn unpair_notification_drops_conversation() {
+        let mut e = mouse_engine();
+        e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00], 110);
+
+        assert_eq!(a, vec![Action::Unregister(mouse_key())]);
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn unknown_device_error_on_read_unregisters() {
+        let mut e = mouse_engine();
+        e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+
+        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 6, 0x1B, 0x08]), 110);
+
+        assert_eq!(a, vec![Action::Unregister(mouse_key())]);
+        // The index is unknown again: link-up goes through discovery.
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 120);
+        assert_eq!(a, vec![Action::Connected(e.group_key())]);
+    }
+
+    /// Receiver with a HID++ 1.0 device (register 0x0D) on index 1 and no conversation left.
+    fn hidpp10_engine() -> HidppEngine {
+        let mut e = receiver_pinging();
+        for i in 2..=6 {
+            e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+        }
+        for reply in [
+            s(&[0x10, 1, 0x8F, 0x00, 0x1B, 0x01]),
+            s(&[0x10, 1, 0x81, 0x00, 0x10]),
+        ] {
+            e.on_report(SHORT_C, &reply, 3);
+        }
+        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x81, 0x0D, 50, 0x00, 0x00]), 4);
+        assert!(matches!(a.as_slice(), [Action::Register { .. }]), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+        e
+    }
+
+    #[test]
+    fn connected_grant_reenables_hidpp10_battery_flag() {
+        let key = DeviceKey("logi:C547:1".into());
+        let get = s(&[0x10, 1, 0x81, 0x00]);
+        let read = s(&[0x10, 1, 0x81, 0x0D]);
+        for (flags, write) in [
+            (
+                [0x00, 0x00, 0x00],
+                Some(s(&[0x10, 1, 0x80, 0x00, 0x10, 0x00, 0x00])),
+            ),
+            (
+                [0x01, 0x02, 0x03],
+                Some(s(&[0x10, 1, 0x80, 0x00, 0x11, 0x02, 0x03])),
+            ),
+            ([0x10, 0x00, 0x00], None),
+        ] {
+            let mut e = hidpp10_engine();
+            let a = e.on_grant(&grant(3, &key, Trigger::Connected), 100);
+            assert_eq!(sent(&a), vec![get.clone()]);
+
+            let a = e.on_report(
+                SHORT_C,
+                &s(&[&[0x10, 1, 0x81, 0x00][..], &flags].concat()),
+                110,
+            );
+            match write {
+                Some(set) => {
+                    assert_eq!(sent(&a), vec![set], "{flags:?}");
+                    let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x80, 0x00]), 120);
+                    assert_eq!(sent(&a), vec![read.clone()], "{flags:?}");
+                }
+                None => assert_eq!(sent(&a), vec![read.clone()], "{flags:?}"),
+            }
+
+            let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x81, 0x0D, 55, 0x00, 0x40]), 130);
+            assert_eq!(
+                a,
+                vec![Action::Update(DeviceUpdate {
+                    level: Some(Level::Percent(55)),
+                    charge: Some(Charge::Charging),
+                    presence: Some(Presence::Online),
+                    ..update(key.clone(), Source::Query)
+                })]
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_grant_on_hidpp10_device_reads_only() {
+        let key = DeviceKey("logi:C547:1".into());
+        for trigger in [Trigger::RefreshNow, Trigger::Resume] {
+            let mut e = hidpp10_engine();
+            let a = e.on_grant(&grant(3, &key, trigger), 100);
+            assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x81, 0x0D])], "{trigger:?}");
+        }
+    }
+
+    #[test]
+    fn asleep_errors_mid_discovery_stop_asking() {
+        for code in [0x04, 0x08, 0x09] {
+            let mut e = receiver_pinging();
+            for i in 2..=6 {
+                e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            }
+            let a = e.on_report(LONG_C, &l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 3);
+            assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x0B, 0x00, 0x05])]);
+
+            let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 0x00, 0x0B, code]), 4);
+
+            assert!(a.is_empty(), "{code:#04x}: {a:?}");
+            assert_eq!(e.next_deadline(), None, "{code:#04x}");
+        }
     }
 
     #[test]
