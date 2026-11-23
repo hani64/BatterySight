@@ -1,8 +1,10 @@
-//! Opt-in log of every report the runtime sends.
+//! Opt-in log of every report the runtime sends and reads.
 //!
-//! With `BATTERYSIGHT_TRACE=1`, each send is appended to
-//! `%LOCALAPPDATA%\BatterySight\sends.log` as `"<unix ms> <collection id> <hex>"`. Tracing
-//! never fails the app: an unwritable file just means no trace.
+//! With `BATTERYSIGHT_TRACE=1`, each write the reactor started and each input report read
+//! is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
+//! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread. Tracing only
+//! records frames the hub already exchanges, so it adds no device traffic, and it never
+//! fails the app: an unwritable file just means no trace.
 
 use std::env;
 use std::ffi::OsStr;
@@ -33,20 +35,34 @@ impl Trace {
             .map(Trace)
     }
 
-    /// Appends one send; write errors are ignored.
-    pub(crate) fn send(&mut self, collection: CollectionId, bytes: &[u8]) {
+    /// Appends one frame; write errors are ignored.
+    pub(crate) fn record(&mut self, direction: Direction, collection: CollectionId, bytes: &[u8]) {
         let unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64);
-        let mut text = line(unix_ms, collection, bytes);
+        let mut text = line(unix_ms, direction, collection, bytes);
         text.push('\n');
         let _ = self.0.write_all(text.as_bytes());
     }
 }
 
-/// `"<unix ms> <collection id> <hex>"`, the hex in uppercase pairs without separators.
-fn line(unix_ms: u64, collection: CollectionId, bytes: &[u8]) -> String {
-    let mut text = format!("{unix_ms} {} ", collection.0);
+/// Which way a traced frame went.
+#[derive(Clone, Copy)]
+pub(crate) enum Direction {
+    /// A write the reactor started.
+    Out,
+    /// An input report as read.
+    In,
+}
+
+/// `"<unix ms> <out|in> <collection id> <hex>"`, the hex in uppercase pairs without
+/// separators.
+fn line(unix_ms: u64, direction: Direction, collection: CollectionId, bytes: &[u8]) -> String {
+    let direction = match direction {
+        Direction::Out => "out",
+        Direction::In => "in",
+    };
+    let mut text = format!("{unix_ms} {direction} {} ", collection.0);
     for byte in bytes {
         let _ = write!(text, "{byte:02X}");
     }
@@ -58,19 +74,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn line_has_time_collection_and_hex() {
+    fn out_line_has_time_direction_collection_and_hex() {
         assert_eq!(
             line(
                 1_763_900_000_123,
+                Direction::Out,
                 CollectionId(42),
                 &[0x10, 0xFF, 0x81, 0x00, 0x0A]
             ),
-            "1763900000123 42 10FF81000A"
+            "1763900000123 out 42 10FF81000A"
         );
     }
 
     #[test]
-    fn line_of_empty_send() {
-        assert_eq!(line(5, CollectionId(1), &[]), "5 1 ");
+    fn in_line() {
+        assert_eq!(
+            line(7, Direction::In, CollectionId(8), &[0x11, 0xFF, 0x06, 0x0B]),
+            "7 in 8 11FF060B"
+        );
+    }
+
+    #[test]
+    fn line_of_empty_frame() {
+        assert_eq!(line(5, Direction::Out, CollectionId(1), &[]), "5 out 1 ");
     }
 }
