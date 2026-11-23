@@ -261,7 +261,7 @@ pub fn product_string(path: &[u16]) -> String {
 }
 
 /// Closes the handle on drop.
-struct OwnedHandle(HANDLE);
+pub(crate) struct OwnedHandle(pub(crate) HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
