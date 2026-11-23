@@ -6,13 +6,14 @@
 //!
 //! Usage (one exe, several roles):
 //!   spike run [child|overlay]     run the widget (default: child)
-//!   spike cmd <stall|burst|stall-ui|detach|report|recreate|quit|place:<x>|place-off>
+//!   spike cmd <stall|burst|stall-ui|detach|report|recreate|quit|place:<x>|place-off|bg:<alpha>>
+//!                                 (report also prints and resets the widget-thread timings)
 //!   spike probe                   dump monitors, taskbars, their child windows and our widgets
 //!   spike trycreate               CreateWindowExW / SetParent matrix of styles and parents
 //!   spike measure <secs> [cmd] [delay_ms]
 //!                                 time SendMessageTimeout(WM_NULL) round trips to Shell_TrayWnd,
 //!                                 optionally posting <cmd> to the running spike after delay_ms
-//!   spike hover-test <cmd|none> [touch|click] <tag>
+//!   spike hover-test <cmd|none> [touch|click|rclick|click0] <tag>
 //!                                 does the taskbar still react to mouse input while <cmd> runs?
 //!   spike autohide <get|on|off>   ABM_GETSTATE / ABM_SETSTATE
 //!   spike activate-temp <secs>    make a small window of ours foreground (lets auto-hide hide)
@@ -51,6 +52,8 @@ const CMD_DETACH: u32 = WM_APP + 6;
 const CMD_REPORT: u32 = WM_APP + 7;
 /// wParam = screen x for the primary widget's left edge, lParam 1 = set, 0 = back to the anchor.
 const CMD_PLACE: u32 = WM_APP + 8;
+/// wParam = alpha (0-255) painted under the whole widget (hit-testing check).
+const CMD_BG: u32 = WM_APP + 9;
 const WM_TRAY: u32 = WM_APP + 20;
 const SINK_MSG: u32 = WM_APP + 30;
 const SINK_DONE: u32 = WM_APP + 31;
@@ -67,6 +70,43 @@ static SINK: AtomicIsize = AtomicIsize::new(0);
 static SINK_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static SINK_MAX_LAT_US: AtomicU64 = AtomicU64::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Widget-thread work: (name, calls, max µs, total µs), printed and reset by `cmd report`.
+static TIMINGS: Mutex<Vec<(&'static str, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+fn record(name: &'static str, us: u64) {
+    {
+        let mut t = TIMINGS.lock().unwrap();
+        match t.iter_mut().find(|e| e.0 == name) {
+            Some(e) => {
+                e.1 += 1;
+                e.2 = e.2.max(us);
+                e.3 += us;
+            }
+            None => t.push((name, 1, us, us)),
+        }
+    }
+    if us >= 50_000 && name != "timer gap" {
+        log(format!("slow: {name} took {} ms", us / 1000));
+    }
+}
+
+fn timed<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+    let t0 = Instant::now();
+    let r = f();
+    record(name, t0.elapsed().as_micros() as u64);
+    r
+}
+
+fn print_timings() {
+    let mut t = TIMINGS.lock().unwrap();
+    let mut lines = vec!["timings since last report (name: calls, max ms, mean ms):".to_string()];
+    for (name, n, max, total) in t.iter() {
+        lines.push(format!("  {name}: {n}, max {:.2}, mean {:.3}", *max as f64 / 1000.0, *total as f64 / *n as f64 / 1000.0));
+    }
+    t.clear();
+    drop(t);
+    log(lines.join("\n"));
+}
 
 fn log(msg: impl AsRef<str>) {
     let t = START.elapsed().as_millis();
@@ -279,7 +319,7 @@ impl Drop for Bitmap {
     }
 }
 
-fn render(dpi: u32, height: i32, light: bool) -> Option<Bitmap> {
+fn render(dpi: u32, height: i32, light: bool, bg_alpha: u8) -> Option<Bitmap> {
     let px = |v: i32| v * dpi as i32 / 96;
     unsafe {
         let dc = CreateCompatibleDC(None);
@@ -348,16 +388,17 @@ fn render(dpi: u32, height: i32, light: bool) -> Option<Bitmap> {
         SelectObject(dc, text_font.into()); // deselect before deleting the fonts below
         let _ = DeleteObject(emoji_font.into());
         let _ = DeleteObject(text_font.into());
-        // White-on-black grayscale coverage becomes alpha; colour is premultiplied.
+        // White-on-black grayscale coverage becomes alpha; colour is premultiplied. `bg_alpha` is a
+        // minimum alpha under the whole widget (black, so premultiplied colour stays 0 there).
         let fg: u32 = if light { 0x00 } else { 0xFF };
         let px_slice = std::slice::from_raw_parts_mut(bits as *mut u8, (width * h * 4) as usize);
         for p in px_slice.chunks_exact_mut(4) {
-            let a = p[0].max(p[1]).max(p[2]) as u32;
-            let c = (fg * a / 255) as u8;
+            let cov = p[0].max(p[1]).max(p[2]) as u32;
+            let c = (fg * cov / 255) as u8;
             p[0] = c;
             p[1] = c;
             p[2] = c;
-            p[3] = a as u8;
+            p[3] = (cov as u8).max(bg_alpha);
         }
         Some(Bitmap { dc, bmp, old, w: width, h })
     }
@@ -378,6 +419,7 @@ struct Widget {
     dpi: u32,
     height: i32,
     light: bool,
+    bg_alpha: u8,
     size: SIZE,
     pos: Option<(i32, i32)>,
     raises: u32,
@@ -390,6 +432,7 @@ struct State {
     widgets: Vec<Widget>,
     tray_added: bool,
     light: bool,
+    bg_alpha: u8,
     worker: mpsc::Sender<()>,
     recreate_started: Option<Instant>,
     /// Test override: screen x of the primary widget's left edge (alpha check over a task button).
@@ -415,7 +458,7 @@ fn create_widget(mode: Mode, bar: HWND, primary: bool) -> Option<Widget> {
     unsafe {
         let before = awareness(GetThreadDpiAwarenessContext());
         let proc_before = awareness(GetDpiAwarenessContextForProcess(HANDLE::default()));
-        let r = match mode {
+        let r = timed("CreateWindowExW (child of taskbar)", || match mode {
             Mode::Child => CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_NOACTIVATE,
                 WIDGET_CLASS,
@@ -444,7 +487,7 @@ fn create_widget(mode: Mode, bar: HWND, primary: bool) -> Option<Widget> {
                 Some(hinstance()),
                 None,
             ),
-        };
+        });
         let hwnd = match r {
             Ok(h) => h,
             Err(e) => {
@@ -472,6 +515,7 @@ fn create_widget(mode: Mode, bar: HWND, primary: bool) -> Option<Widget> {
             dpi: 0,
             height: 0,
             light: false,
+            bg_alpha: 0,
             size: SIZE::default(),
             pos: None,
             raises: 0,
@@ -481,17 +525,17 @@ fn create_widget(mode: Mode, bar: HWND, primary: bool) -> Option<Widget> {
 }
 
 /// Paints with UpdateLayeredWindow (per-pixel alpha). Position is set separately with SetWindowPos.
-fn paint(w: &mut Widget, light: bool, overlay_pos: Option<POINT>) -> bool {
+fn paint(w: &mut Widget, light: bool, bg_alpha: u8, overlay_pos: Option<POINT>) -> bool {
     let dpi = unsafe { GetDpiForWindow(w.bar) }.max(96);
     let height = client_rect(w.bar).bottom;
-    let Some(bm) = render(dpi, height, light) else {
+    let Some(bm) = render(dpi, height, light, bg_alpha) else {
         log("render failed");
         return false;
     };
     let size = SIZE { cx: bm.w, cy: bm.h };
     let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-    let r = unsafe {
+    let r = timed("UpdateLayeredWindow", || unsafe {
         UpdateLayeredWindow(
             w.hwnd,
             None,
@@ -503,11 +547,11 @@ fn paint(w: &mut Widget, light: bool, overlay_pos: Option<POINT>) -> bool {
             Some(&blend),
             ULW_ALPHA,
         )
-    };
+    });
     match r {
         Ok(()) => {
             log(format!(
-                "painted {:?}: {}x{} dpi={dpi} light={light} (bar client height {height})",
+                "painted {:?}: {}x{} dpi={dpi} light={light} bg_alpha={bg_alpha} (bar client height {height})",
                 w.hwnd.0, size.cx, size.cy
             ));
             w.dpi = dpi;
@@ -565,9 +609,9 @@ fn position(w: &mut Widget, mode: Mode, place_x: Option<i32>) {
                     ));
                 }
                 w.pos = Some((left, 0));
-                if let Err(e) =
+                if let Err(e) = timed("SetWindowPos (child of taskbar)", || {
                     SetWindowPos(w.hwnd, Some(HWND_TOP), left, 0, w.size.cx, w.size.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW)
-                {
+                }) {
                     log(format!("SetWindowPos failed: {e}"));
                 }
             }
@@ -595,7 +639,7 @@ fn position(w: &mut Widget, mode: Mode, place_x: Option<i32>) {
 
 fn tick(s: &mut State) {
     unsafe {
-        let light = light_theme();
+        let light = timed("registry read (SystemUsesLightTheme)", light_theme);
         if light != s.light {
             log(format!("theme change seen by registry poll: light={light}"));
             s.light = light;
@@ -611,7 +655,7 @@ fn tick(s: &mut State) {
                     IsWindow(Some(w.bar)).as_bool()
                 ));
                 if IsWindow(Some(w.hwnd)).as_bool() {
-                    let _ = DestroyWindow(w.hwnd);
+                    let _ = timed("DestroyWindow (child of taskbar)", || DestroyWindow(w.hwnd));
                 }
             }
             alive
@@ -632,9 +676,11 @@ fn tick(s: &mut State) {
         for w in &mut s.widgets {
             let dpi = GetDpiForWindow(w.bar).max(96);
             let height = client_rect(w.bar).bottom;
-            if w.size.cx == 0 || dpi != w.dpi || height != w.height || s.light != w.light {
+            if w.size.cx == 0 || dpi != w.dpi || height != w.height || s.light != w.light || s.bg_alpha != w.bg_alpha {
                 let overlay = (mode == Mode::Overlay).then(|| POINT { x: window_rect(w.bar).left, y: window_rect(w.bar).top });
-                paint(w, s.light, overlay);
+                if paint(w, s.light, s.bg_alpha, overlay) {
+                    w.bg_alpha = s.bg_alpha;
+                }
             }
             if w.size.cx > 0 {
                 position(w, mode, if w.primary { place_x } else { None });
@@ -666,9 +712,9 @@ fn add_tray(host: HWND) -> bool {
         for (d, c) in nid.szTip.iter_mut().zip("BatterySight spike: right-click for tests".encode_utf16()) {
             *d = c;
         }
-        let added = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+        let added = timed("Shell_NotifyIconW", || Shell_NotifyIconW(NIM_ADD, &nid).as_bool());
         nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let versioned = added && Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool();
+        let versioned = added && timed("Shell_NotifyIconW", || Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool());
         log(format!("tray icon NIM_ADD={added} NIM_SETVERSION(4)={versioned}"));
         added
     }
@@ -686,7 +732,7 @@ fn destroy_widgets(s: &mut State) {
     for w in s.widgets.drain(..) {
         unsafe {
             if IsWindow(Some(w.hwnd)).as_bool() {
-                let _ = DestroyWindow(w.hwnd);
+                let _ = timed("DestroyWindow (child of taskbar)", || DestroyWindow(w.hwnd));
             }
         }
     }
@@ -709,6 +755,7 @@ fn report(s: &State) {
                 GetParent(w.hwnd).map(class_name).unwrap_or_else(|_| "-".into())
             ));
         }
+        print_timings();
     }
 }
 
@@ -738,25 +785,33 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         if msg == tb_created && msg != 0 {
             log("TaskbarCreated received");
-            with_state(|s| {
-                for w in &s.widgets {
-                    log(format!(
-                        "  old widget {:?}: IsWindow={} old bar IsWindow={}",
-                        w.hwnd.0,
-                        IsWindow(Some(w.hwnd)).as_bool(),
-                        IsWindow(Some(w.bar)).as_bool()
-                    ));
-                }
-                destroy_widgets(s);
-                s.tray_added = add_tray(s.host);
-                s.recreate_started = Some(Instant::now());
-                tick(s);
+            timed("TaskbarCreated handler", || {
+                with_state(|s| {
+                    for w in &s.widgets {
+                        log(format!(
+                            "  old widget {:?}: IsWindow={} old bar IsWindow={}",
+                            w.hwnd.0,
+                            IsWindow(Some(w.hwnd)).as_bool(),
+                            IsWindow(Some(w.bar)).as_bool()
+                        ));
+                    }
+                    destroy_widgets(s);
+                    s.tray_added = add_tray(s.host);
+                    s.recreate_started = Some(Instant::now());
+                    tick(s);
+                })
             });
             return LRESULT(0);
         }
         match msg {
             WM_TIMER if wp.0 == TIMER_TICK => {
-                with_state(tick);
+                // Interval between timer ticks: the heartbeat a watchdog on this thread would see.
+                thread_local! { static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
+                let now = Instant::now();
+                if let Some(prev) = LAST.with(|l| l.replace(Some(now))) {
+                    record("timer gap", (now - prev).as_micros() as u64);
+                }
+                timed("tick (timer)", || with_state(tick));
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {
@@ -790,6 +845,14 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             CMD_DETACH => {
                 with_state(|s| detach_probe(s));
+                LRESULT(0)
+            }
+            CMD_BG => {
+                with_state(|s| {
+                    s.bg_alpha = wp.0 as u8;
+                    log(format!("cmd: background alpha {}", s.bg_alpha));
+                    tick(s);
+                });
                 LRESULT(0)
             }
             CMD_PLACE => {
@@ -859,6 +922,20 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_LBUTTONUP => {
                 log(format!("widget {:?}: click", hwnd.0));
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                log(format!("widget {:?}: WM_RBUTTONDOWN", hwnd.0));
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                // Handled here; DefWindowProc would turn it into WM_CONTEXTMENU, which a child
+                // passes to its parent (the taskbar's own menu).
+                log(format!("widget {:?}: WM_RBUTTONUP (right-click)", hwnd.0));
+                LRESULT(0)
+            }
+            WM_CONTEXTMENU => {
+                log(format!("widget {:?}: WM_CONTEXTMENU", hwnd.0));
                 LRESULT(0)
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
@@ -1022,6 +1099,7 @@ fn run(mode: Mode) {
                 worker: tx,
                 recreate_started: None,
                 place_x: None,
+                bg_alpha: 0,
             })
         });
         with_state(|s| {
@@ -1032,7 +1110,7 @@ fn run(mode: Mode) {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            timed("DispatchMessage (one loop iteration)", || DispatchMessageW(&msg));
         }
         log("exit");
     }
@@ -1054,6 +1132,10 @@ fn post_cmd(name: &str) -> bool {
             wp = name[6..].parse::<i32>().unwrap_or(0) as usize;
             lp = 1;
             CMD_PLACE
+        }
+        _ if name.starts_with("bg:") => {
+            wp = name[3..].parse::<u8>().unwrap_or(0) as usize;
+            CMD_BG
         }
         _ => {
             eprintln!("unknown cmd {name}");
@@ -1378,9 +1460,11 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
 /// Moves the cursor onto an opaque pixel of our widget (so a mouse message for our thread enters the
 /// shared input queue), then onto a task button, and compares the button's pixels with an
 /// un-hovered capture: a hover highlight means Explorer processed the input.
-/// `cmd`: spike command to post first (stall-ui, stall, burst) or None. `touch`: pass over our widget
-/// first. Restores the cursor.
-fn hover_test(cmd: Option<&str>, touch: bool, click: bool, tag: &str) {
+/// `cmd`: spike command to post first (stall-ui, stall, burst) or None. `target`: what to do on the
+/// widget first: "touch" (move over an opaque pixel), "click" / "rclick" (left / right click an
+/// opaque pixel), "click0" (left click a pixel with no glyph: alpha 0 unless `cmd bg:<a>`), or nothing.
+/// Restores the cursor.
+fn hover_test(cmd: Option<&str>, target: &str, tag: &str) {
     let stall = cmd.is_some();
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
     use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, TreeScope_Descendants};
@@ -1421,7 +1505,7 @@ fn hover_test(cmd: Option<&str>, touch: bool, click: bool, tag: &str) {
         let mut saved = POINT::default();
         let _ = GetCursorPos(&mut saved);
         println!(
-            "hover-test {tag}: cmd={cmd:?} touch={touch} click={click}; widget {} opaque pixel {:?}; task button {}; cursor saved at ({},{})",
+            "hover-test {tag}: cmd={cmd:?} target={target:?}; widget {} opaque pixel {:?}; task button {}; cursor saved at ({},{})",
             fmt_rect(&wr),
             (opaque.x, opaque.y),
             fmt_rect(&button),
@@ -1440,13 +1524,24 @@ fn hover_test(cmd: Option<&str>, touch: bool, click: bool, tag: &str) {
             assert!(post_cmd(cmd.unwrap()));
             std::thread::sleep(Duration::from_millis(300));
         }
-        if touch || click {
-            move_mouse(opaque);
-            std::thread::sleep(Duration::from_millis(300));
+        // Top-left corner: inside the left padding and above the glyphs, so no text pixel.
+        let blank = POINT { x: wr.left + 1, y: wr.top + 1 };
+        match target {
+            "touch" => move_mouse(opaque),
+            "click" | "rclick" => {
+                move_mouse(opaque);
+                std::thread::sleep(Duration::from_millis(300));
+                // A queued click for the widget's thread, as when the user clicks the widget.
+                mouse_click(target == "rclick");
+            }
+            "click0" => {
+                move_mouse(blank);
+                std::thread::sleep(Duration::from_millis(300));
+                mouse_click(false);
+            }
+            _ => {}
         }
-        if click {
-            // A queued click for the stalled thread, as when the user clicks the widget.
-            mouse_click();
+        if !target.is_empty() {
             std::thread::sleep(Duration::from_millis(300));
         }
         move_mouse(center);
@@ -1497,14 +1592,16 @@ fn hover_test(cmd: Option<&str>, touch: bool, click: bool, tag: &str) {
     }
 }
 
-/// Injected left click at the current cursor position.
-fn mouse_click() {
+/// Injected left or right click at the current cursor position.
+fn mouse_click(right: bool) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput,
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEINPUT, SendInput,
     };
     let ev = |f| INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: f, ..Default::default() } } };
+    let (down, up) = if right { (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP) } else { (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) };
     unsafe {
-        SendInput(&[ev(MOUSEEVENTF_LEFTDOWN), ev(MOUSEEVENTF_LEFTUP)], size_of::<INPUT>() as i32);
+        SendInput(&[ev(down), ev(up)], size_of::<INPUT>() as i32);
     }
 }
 
@@ -1593,7 +1690,7 @@ fn main() {
             }
         }
         Some("hover-test") => {
-            hover_test(a(1).filter(|c| *c != "none"), a(2) == Some("touch"), a(2) == Some("click"), a(3).unwrap_or("hover"))
+            hover_test(a(1).filter(|c| *c != "none"), a(2).unwrap_or(""), a(3).unwrap_or("hover"))
         }
         Some("activate-temp") => activate_temp(a(1).and_then(|s| s.parse().ok()).unwrap_or(5)),
         Some("trycreate") => try_create(),

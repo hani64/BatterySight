@@ -6,10 +6,6 @@ license = "GPL-3.0-only"
 publish = false
 description = "Throwaway spike (Task 2a): taskbar widget as a layered child of Shell_TrayWnd. Not part of the workspace."
 
-# Own workspace root: the repo workspace's `exclude = ["spike/*"]` is not a glob in Cargo, so
-# without this table Cargo thinks this crate belongs to the parent workspace.
-[workspace]
-
 # WS_EX_LAYERED on a child window needs a manifest that declares Windows 8+ compatibility;
 # embed-manifest writes the resource object itself (no rc.exe / windres needed, MSVC or GNU).
 [build-dependencies]
