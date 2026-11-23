@@ -1,0 +1,17 @@
+# Logitech (vid 0x046D). Devices without an entry below are covered by the HID++ family.
+
+[[family]]
+engine = "hidpp"
+vid = 0x046D
+status = "source-verified"
+source = "Linux drivers/hid/hid-logitech-hidpp.c; Solaar lib/logitech_receiver"
+
+[[device]]
+name = "PRO X Wireless Gaming Headset"
+vid = 0x046D
+pids = [0x0AAA, 0x0ABA]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live)"
+quirks = { voltage_curve = "pro-x-wireless-ghub" }

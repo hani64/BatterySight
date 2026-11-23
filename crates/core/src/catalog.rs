@@ -115,6 +115,9 @@ fn parse_status(s: String) -> Result<Verification, CatalogError> {
     }
 }
 
+/// Every built-in catalog file; adding a vendor file is one line here.
+const BUILTIN_FILES: &[&str] = &[include_str!("../catalog/logitech.toml")];
+
 impl Catalog {
     pub fn parse(toml: &str) -> Result<Catalog, CatalogError> {
         let raw: RawCatalog =
@@ -162,6 +165,29 @@ impl Catalog {
             .collect::<Result<_, _>>()?;
 
         Ok(Catalog { families, devices })
+    }
+
+    /// The catalog shipped with the app: every file in `catalog/`, concatenated and parsed.
+    ///
+    /// A parse error panics in debug builds; release builds fall back to an empty catalog so
+    /// bad data can never crash the app (the builtin-catalog test catches it in CI first).
+    pub fn builtin() -> Catalog {
+        match Catalog::parse(&BUILTIN_FILES.join("\n")) {
+            Ok(cat) => cat,
+            Err(e) if cfg!(debug_assertions) => panic!("built-in catalog: {e}"),
+            Err(_) => Catalog {
+                families: Vec::new(),
+                devices: Vec::new(),
+            },
+        }
+    }
+
+    pub fn families(&self) -> &[Family] {
+        &self.families
+    }
+
+    pub fn devices(&self) -> &[DeviceEntry] {
+        &self.devices
     }
 
     /// The first entry listing `pid` for vendor `vid`.
@@ -318,5 +344,40 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let cat = Catalog::parse("").unwrap();
         assert_eq!(cat.device(0x046D, 0x0ABA), None);
         assert_eq!(cat.family(0x046D, EngineKind::Hidpp), None);
+    }
+
+    #[test]
+    fn builtin_catalog_parses_and_resolves_owner_devices() {
+        let cat = Catalog::builtin();
+        assert_eq!(
+            cat.family(0x046D, EngineKind::Hidpp).unwrap().status,
+            Verification::SourceVerified
+        );
+        let dev = cat.device(0x046D, 0x0ABA).unwrap();
+        assert_eq!(dev.name, "PRO X Wireless Gaming Headset");
+        assert_eq!(
+            dev.quirks.voltage_curve.as_deref(),
+            Some("pro-x-wireless-ghub")
+        );
+        assert!(std::ptr::eq(dev, cat.device(0x046D, 0x0AAA).unwrap()));
+
+        let mut families = std::collections::HashSet::new();
+        for f in cat.families() {
+            assert!(!f.source.trim().is_empty(), "{f:?} has no source");
+            assert!(families.insert((f.vid, f.engine)), "duplicate family {f:?}");
+        }
+        let mut pids = std::collections::HashSet::new();
+        for d in cat.devices() {
+            assert!(!d.source.trim().is_empty(), "{} has no source", d.name);
+            assert!(!d.pids.is_empty(), "{} has no pids", d.name);
+            for &pid in &d.pids {
+                assert!(
+                    pids.insert((d.vid, pid)),
+                    "{:#06X}:{pid:#06X} listed twice ({})",
+                    d.vid,
+                    d.name
+                );
+            }
+        }
     }
 }
