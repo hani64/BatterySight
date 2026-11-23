@@ -1,0 +1,73 @@
+# LIGHTSPEED receiver 046D:C547 ("USB Receiver") with a HID++ 2.0 mouse
+# (PRO X Superlight) paired on index 1.
+#
+# Synthetic transcript: frames built from the layouts in Linux
+# drivers/hid/hid-logitech-hidpp.c (short 0x10 / long 0x11 reports, 0x8F
+# HID++ 1.0 error) and Solaar lib/logitech_receiver (base.py ping,
+# hidpp10_constants.py NotificationFlag.WIRELESS, hidpp20.py feature calls,
+# notifications.py 0x41 link notification). Replace with a real capture in
+# Task 14.
+#
+# Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
+# reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The
+# `out` lines after an `in` are the writes that frame causes.
+
+# Group arrival: read the receiver's notification flags (register 0x00).
+out short 10 FF 81 00 00 00 00
+in  short 10 FF 81 00 00 00 00
+# Wireless notifications off: set only bit 0x01 of the middle byte.
+out short 10 FF 80 00 00 01 00
+in  short 10 FF 80 00 00 00 00
+# Ping every device index (HID++ 2.0 root fn 1, mark 0x5A).
+out short 10 01 00 1B 00 00 5A
+out short 10 02 00 1B 00 00 5A
+out short 10 03 00 1B 00 00 5A
+out short 10 04 00 1B 00 00 5A
+out short 10 05 00 1B 00 00 5A
+out short 10 06 00 1B 00 00 5A
+# Indices 2..6 are empty: HID++ 1.0 error 0x08 (unknown device).
+in  short 10 02 8F 00 1B 08 00
+in  short 10 03 8F 00 1B 08 00
+in  short 10 04 8F 00 1B 08 00
+in  short 10 05 8F 00 1B 08 00
+in  short 10 06 8F 00 1B 08 00
+# Index 1 answers with protocol 4.2: HID++ 2.0.
+in  long  11 01 00 1B 04 02 5A
+# Root getFeature 0x0005 (device name and type) -> index 3.
+out short 10 01 00 0B 00 05 00
+in  long  11 01 00 0B 03
+# Root getFeature 0x0003 (firmware info, unit id) -> index 2.
+out short 10 01 00 0B 00 03 00
+in  long  11 01 00 0B 02
+# Root getFeature 0x1004 (unified battery) -> index 6.
+out short 10 01 00 0B 10 04 00
+in  long  11 01 00 0B 06
+# 0x0005 fn 0: name length 16.
+out short 10 01 03 0B 00 00 00
+in  long  11 01 03 0B 10
+# 0x0005 fn 1 at offset 0: "PRO X Superlight".
+out short 10 01 03 1B 00 00 00
+in  long  11 01 03 1B 50 52 4F 20 58 20 53 75 70 65 72 6C 69 67 68 74
+# 0x0005 fn 2: device type 3 (mouse).
+out short 10 01 03 2B 00 00 00
+in  long  11 01 03 2B 03
+# 0x0003 fn 0: unit id 1A2B3C4D in bytes 1..5.
+out short 10 01 02 0B 00 00 00
+in  long  11 01 02 0B 00 1A 2B 3C 4D
+# 0x1004 fn 1: 80 %, level bits "good", discharging -> registered.
+out short 10 01 06 1B 00 00 00
+in  long  11 01 06 1B 50 04 00 00
+# Battery broadcast (fn 0, software id 0): 79 %, no write.
+in  long  11 01 06 00 4F 04 00 00
+# Receiver 0x41: link lost on index 1 -> asleep.
+in  short 10 01 41 04 40 00 00
+# Receiver 0x41: link back on index 1 -> Connected grant -> one battery read.
+in  short 10 01 41 04 00 00 00
+out short 10 01 06 1B 00 00 00
+in  long  11 01 06 1B 4E 04 00 00
+# Receiver 0x41: link on unknown index 2 (new pairing) -> Connected grant on
+# the receiver -> ping index 2 only.
+in  short 10 02 41 04 00 00 00
+out short 10 02 00 1B 00 00 5A
+# Resource error (device asleep): nothing registered, no retry.
+in  short 10 02 8F 00 1B 09 00

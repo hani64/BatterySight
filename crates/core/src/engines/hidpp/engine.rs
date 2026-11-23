@@ -1,0 +1,1320 @@
+//! HID++ engine: event-first discovery and battery reading for Logitech
+//! receivers and directly attached devices.
+//!
+//! One engine serves one HID group. On the group's arrival grant it enables
+//! the receiver's connection notifications, pings every device index and
+//! discovers each answering device once (protocol, battery feature, name,
+//! kind, unit id, first battery reading). Afterwards it lives on pushed
+//! reports: battery broadcasts and register notifications become `Update`s,
+//! receiver link notifications become `Asleep` or `Connected`. A device is
+//! only asked again under a grant the hub hands out for it.
+//!
+//! Every device index has at most one request in flight; a request
+//! unanswered after one second counts as no answer.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::RangeInclusive;
+
+use crate::catalog::Catalog;
+use crate::engine::{Action, Engine};
+use crate::hid::{Collection, CollectionId, HidGroup};
+use crate::model::{DeviceKey, DeviceKind, DeviceUpdate, Presence, Source, Via};
+use crate::scheduler::{Capabilities, Grant, GrantId, Trigger};
+use crate::time::Ms;
+
+use super::battery::{self, Reading};
+use super::curves::{self, VoltageCurve};
+use super::discovery::{
+    self, Decoder, Found, Next, REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
+};
+use super::frame::{LONG, Reply, SHORT};
+
+/// Per-request timeout.
+const TIMEOUT_MS: u32 = 1_000;
+
+const LOGITECH: u16 = 0x046D;
+
+// HID++ collections. Source: Linux kernel hid-logitech-dj.c / hid-logitech-hidpp.c
+// (vendor page 0xFF00: usage 1 short 7-byte reports, usage 2 long 20-byte
+// reports); HeadsetControl `logitech_g633_g933_935.hpp` (G headsets: 0xFF43/0x0202).
+const SHORT_USAGE: (u16, u16) = (0xFF00, 0x0001);
+const LONG_USAGES: [(u16, u16); 2] = [(0xFF00, 0x0002), (0xFF43, 0x0202)];
+const HEADSET_PAGE: u16 = 0xFF43;
+const SHORT_LEN: u16 = 7;
+const LONG_LEN: u16 = 20;
+
+/// Device index of a direct device, and of the receiver itself.
+const DIRECT: u8 = 0xFF;
+/// Device indices behind a receiver. Source: Solaar `receiver.py` (max 6 devices).
+const RECEIVER_SLOTS: RangeInclusive<u8> = 1..=6;
+
+/// Receiver sub id reporting a device's link state; `flags & 0x40` means link lost.
+// Source: Solaar `notifications.py` (0x41 DJ pairing), `hidpp10_constants.py`.
+const LINK_NOTIFICATION: u8 = 0x41;
+const LINK_LOST: u8 = 0x40;
+
+// HID++ 1.0 error codes. Source: Solaar `hidpp10_constants.py` `ErrorCode`.
+const ERR_CONNECT_FAIL: u8 = 0x04;
+const ERR_RESOURCE_ERROR: u8 = 0x09;
+
+/// One device index's exchange under a grant.
+#[derive(Debug)]
+struct Conversation {
+    grant: GrantId,
+    step: Step,
+    found: Found,
+}
+
+impl Conversation {
+    fn new(grant: GrantId, step: Step) -> Self {
+        Self {
+            grant,
+            step,
+            found: Found::default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InFlight {
+    conversation: Conversation,
+    request: Request,
+    deadline: Ms,
+}
+
+/// A discovered device.
+#[derive(Debug)]
+struct Device {
+    key: DeviceKey,
+    decoder: Decoder,
+    /// Battery feature index (HID++ 2.0 only).
+    battery_fi: u8,
+}
+
+/// What is left of a grant we were handed.
+#[derive(Debug)]
+struct Budget {
+    remaining: u16,
+    expires_ms: Ms,
+}
+
+/// What a battery payload says.
+enum Outcome {
+    Reading(Reading),
+    /// The device answered that it is off (0x1F20 with unknown flags).
+    Offline,
+    /// Nothing usable (e.g. a truncated payload).
+    Nothing,
+}
+
+pub struct HidppEngine {
+    group_key: DeviceKey,
+    pid: u16,
+    product: String,
+    /// Report id and collection every request is written with.
+    report_id: u8,
+    out: CollectionId,
+    receiver: bool,
+    fallback_kind: DeviceKind,
+    curve: VoltageCurve,
+    query_wakes: bool,
+    devices: BTreeMap<u8, Device>,
+    in_flight: BTreeMap<u8, InFlight>,
+    /// Indices whose link came up while unknown: discovered on the next group grant.
+    pending: BTreeSet<u8>,
+    budgets: HashMap<GrantId, Budget>,
+}
+
+fn is_short(c: &Collection) -> bool {
+    c.vid == LOGITECH && (c.usage_page, c.usage) == SHORT_USAGE && c.output_len == SHORT_LEN
+}
+
+fn is_long(c: &Collection) -> bool {
+    c.vid == LOGITECH && LONG_USAGES.contains(&(c.usage_page, c.usage)) && c.output_len == LONG_LEN
+}
+
+fn update(key: DeviceKey, presence: Presence, source: Source) -> DeviceUpdate {
+    DeviceUpdate {
+        key,
+        name: None,
+        kind: None,
+        via: None,
+        level: None,
+        millivolts: None,
+        charge: None,
+        presence: Some(presence),
+        source,
+    }
+}
+
+fn reading_update(key: DeviceKey, r: &Reading, source: Source) -> DeviceUpdate {
+    DeviceUpdate {
+        level: r.level,
+        millivolts: r.millivolts,
+        charge: Some(r.charge),
+        ..update(key, Presence::Online, source)
+    }
+}
+
+impl HidppEngine {
+    /// A Logitech group with a short or long HID++ collection.
+    pub fn accepts(group: &HidGroup) -> bool {
+        group.collections.iter().any(|c| is_short(c) || is_long(c))
+    }
+
+    /// # Panics
+    /// If [`HidppEngine::accepts`] rejects `group`.
+    pub fn new(group: &HidGroup, catalog: &Catalog) -> Self {
+        // Requests go out short when the device has a short collection;
+        // long-only devices get long frames for everything.
+        let (report_id, out) = match group.collections.iter().find(|c| is_short(c)) {
+            Some(c) => (SHORT, c),
+            None => (
+                LONG,
+                group
+                    .collections
+                    .iter()
+                    .find(|c| is_long(c))
+                    .expect("HidppEngine::new needs a group it accepts"),
+            ),
+        };
+        let quirks = catalog.device(out.vid, out.pid).map(|d| &d.quirks);
+        let curve = quirks
+            .and_then(|q| q.voltage_curve.as_deref())
+            .and_then(curves::curve_by_name)
+            .unwrap_or(VoltageCurve::HeadsetControlG633);
+        let fallback_kind = if group
+            .collections
+            .iter()
+            .any(|c| c.usage_page == HEADSET_PAGE)
+        {
+            DeviceKind::Headset
+        } else {
+            DeviceKind::Other
+        };
+        Self {
+            group_key: DeviceKey(format!("logi-group:{:04X}:{}", out.pid, group.id.0)),
+            pid: out.pid,
+            product: out.product.clone(),
+            report_id,
+            out: out.id,
+            receiver: out.product.contains("Receiver"),
+            fallback_kind,
+            curve,
+            query_wakes: quirks.is_some_and(|q| q.query_wakes),
+            devices: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            budgets: HashMap::new(),
+        }
+    }
+
+    fn device_key(&self, index: u8, unit: u32) -> DeviceKey {
+        if unit != 0 {
+            DeviceKey(format!("logi:unit:{unit:08X}"))
+        } else {
+            DeviceKey(format!("logi:{:04X}:{index}", self.pid))
+        }
+    }
+
+    /// Takes one send from `grant`'s budget.
+    fn spend(&mut self, grant: GrantId, now: Ms) -> bool {
+        match self.budgets.get_mut(&grant) {
+            Some(b) if b.remaining > 0 && now <= b.expires_ms => {
+                b.remaining -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn request(&self, index: u8, c: &Conversation) -> Option<Request> {
+        if c.step == Step::Read {
+            let d = self.devices.get(&index)?;
+            return Some(d.decoder.read(d.battery_fi));
+        }
+        discovery::request(c.step, &c.found)
+    }
+
+    /// Sends the request for `c`'s step to `index`. Without budget left the
+    /// conversation ends quietly: the device did nothing wrong.
+    fn issue(&mut self, index: u8, c: Conversation, now: Ms, actions: &mut Vec<Action>) {
+        let Some(request) = self.request(index, &c) else {
+            return;
+        };
+        if !self.spend(c.grant, now) {
+            return;
+        }
+        actions.push(Action::Send {
+            grant: c.grant,
+            collection: self.out,
+            bytes: request.bytes(self.report_id, index),
+            timeout_ms: TIMEOUT_MS,
+        });
+        self.in_flight.insert(
+            index,
+            InFlight {
+                conversation: c,
+                request,
+                deadline: now.saturating_add(Ms::from(TIMEOUT_MS)),
+            },
+        );
+    }
+
+    /// Pings each idle index in `indices`.
+    fn discover(
+        &mut self,
+        indices: impl IntoIterator<Item = u8>,
+        grant: GrantId,
+        now: Ms,
+        actions: &mut Vec<Action>,
+    ) {
+        for index in indices {
+            if !self.in_flight.contains_key(&index) {
+                self.issue(index, Conversation::new(grant, Step::Ping), now, actions);
+            }
+        }
+    }
+
+    fn interpret(&self, decoder: Decoder, p: &[u8]) -> Outcome {
+        let r = match decoder {
+            Decoder::Unified => battery::decode_1004(p),
+            Decoder::LevelStatus => battery::decode_1000(p),
+            Decoder::Voltage => battery::decode_1001(p),
+            Decoder::Adc => battery::decode_1f20(p, self.curve),
+            Decoder::Reg0D => battery::decode_reg_0d(p),
+            Decoder::Reg07 => battery::decode_reg_07(p),
+        };
+        if r.online {
+            Outcome::Reading(r)
+        } else if decoder == Decoder::Adc && p.len() >= 3 {
+            // Only a full 0x1F20 payload with unknown flags means the headset is
+            // off; a truncated one is no reading at all.
+            Outcome::Offline
+        } else {
+            Outcome::Nothing
+        }
+    }
+
+    /// Moves `c` on after `reply` to its request on `index`.
+    fn advance(
+        &mut self,
+        index: u8,
+        mut c: Conversation,
+        reply: Reply<'_>,
+        now: Ms,
+        actions: &mut Vec<Action>,
+    ) {
+        if c.step == Step::Read {
+            self.read_reply(index, reply, actions);
+            return;
+        }
+        match discovery::advance(c.step, &mut c.found, reply) {
+            Next::Ask(step) => {
+                c.step = step;
+                self.issue(index, c, now, actions);
+            }
+            Next::Discovered(p) => self.discovered(index, c.found, p, actions),
+            // Receiver notifications set up (or refused): discover its devices.
+            Next::Done if matches!(c.step, Step::GetNotifications | Step::SetNotifications(_)) => {
+                self.discover(RECEIVER_SLOTS, c.grant, now, actions);
+            }
+            Next::Done => {}
+        }
+    }
+
+    /// Registers the device on `index` from its first battery payload `p`.
+    fn discovered(&mut self, index: u8, found: Found, p: &[u8], actions: &mut Vec<Action>) {
+        let Some((decoder, battery_fi)) = found.battery else {
+            return;
+        };
+        let key = self.device_key(index, found.unit);
+        let mut initial = match self.interpret(decoder, p) {
+            Outcome::Reading(r) => reading_update(key.clone(), &r, Source::Query),
+            Outcome::Offline => update(key.clone(), Presence::Asleep, Source::Query),
+            Outcome::Nothing => return,
+        };
+        let name = String::from_utf8_lossy(&found.name);
+        let name = name.trim_end_matches('\0').trim();
+        initial.name = Some(if name.is_empty() {
+            self.product.clone()
+        } else {
+            name.to_owned()
+        });
+        initial.kind = Some(found.kind.unwrap_or(self.fallback_kind));
+        initial.via = Some(if self.receiver {
+            Via::Receiver
+        } else {
+            Via::Usb
+        });
+
+        // The same device may have moved to another index (re-pairing).
+        self.devices.retain(|_, d| d.key != key);
+        self.devices.insert(
+            index,
+            Device {
+                key: key.clone(),
+                decoder,
+                battery_fi,
+            },
+        );
+        actions.push(Action::Register {
+            key,
+            caps: Capabilities {
+                pushes_battery: true,
+                query_wakes: self.query_wakes,
+                min_query_gap_ms: 0,
+            },
+            initial,
+        });
+    }
+
+    /// Handles the answer to a known device's battery read.
+    fn read_reply(&self, index: u8, reply: Reply<'_>, actions: &mut Vec<Action>) {
+        let Some(d) = self.devices.get(&index) else {
+            return;
+        };
+        match reply {
+            Reply::Ok(p) => match self.interpret(d.decoder, p) {
+                Outcome::Reading(r) => {
+                    actions.push(Action::Update(reading_update(
+                        d.key.clone(),
+                        &r,
+                        Source::Query,
+                    )));
+                }
+                Outcome::Offline => actions.push(Action::Asleep(d.key.clone())),
+                Outcome::Nothing => {}
+            },
+            // Source: Solaar `base.py` (0x04 connect fail, 0x09 resource error: device unreachable).
+            Reply::Err20(_) | Reply::Err10(ERR_CONNECT_FAIL | ERR_RESOURCE_ERROR) => {
+                actions.push(Action::Asleep(d.key.clone()));
+            }
+            Reply::Err10(_) | Reply::NotMine => {}
+        }
+    }
+
+    /// A report that answers no request: a broadcast or notification. Never sends.
+    fn on_event(&mut self, frame: &[u8], actions: &mut Vec<Action>) {
+        let &[report, index, sub, address, ..] = frame else {
+            return;
+        };
+        if report != SHORT && report != LONG {
+            return;
+        }
+        if self.receiver && report == SHORT && sub == LINK_NOTIFICATION {
+            self.on_link(index, frame, actions);
+            return;
+        }
+        // A direct device may report as index 0x00 instead of 0xFF.
+        let index = if !self.receiver && index == 0 {
+            DIRECT
+        } else {
+            index
+        };
+        let Some(d) = self.devices.get(&index) else {
+            return;
+        };
+        let outcome = match d.decoder {
+            // Source: kernel hid-logitech-hidpp.c / Solaar `notifications.py`:
+            // short register notifications carry the register payload from byte 3.
+            Decoder::Reg0D | Decoder::Reg07 if report == SHORT => match sub {
+                REG_BATTERY_STATUS => self.interpret(Decoder::Reg07, &frame[3..]),
+                REG_BATTERY_CHARGE => self.interpret(Decoder::Reg0D, &frame[3..]),
+                _ => return,
+            },
+            Decoder::Reg0D | Decoder::Reg07 => return,
+            // HID++ 2.0 broadcasts: battery feature index, function 0, software id 0.
+            _ if sub == d.battery_fi && address == 0x00 => self.interpret(d.decoder, &frame[4..]),
+            _ => return,
+        };
+        match outcome {
+            Outcome::Reading(r) => {
+                actions.push(Action::Update(reading_update(
+                    d.key.clone(),
+                    &r,
+                    Source::Push,
+                )));
+            }
+            Outcome::Offline => actions.push(Action::Asleep(d.key.clone())),
+            Outcome::Nothing => {}
+        }
+    }
+
+    /// Receiver 0x41 link notification for `index`.
+    // Source: Solaar `notifications.py` (DJ pairing / 0x41 link status handling).
+    fn on_link(&mut self, index: u8, frame: &[u8], actions: &mut Vec<Action>) {
+        let Some(&flags) = frame.get(4) else {
+            return;
+        };
+        let lost = flags & LINK_LOST != 0;
+        if let Some(d) = self.devices.get(&index) {
+            actions.push(if lost {
+                Action::Asleep(d.key.clone())
+            } else {
+                Action::Connected(d.key.clone())
+            });
+        } else if !lost && RECEIVER_SLOTS.contains(&index) && !self.in_flight.contains_key(&index) {
+            // New pairing, or a device that slept through our arrival pings.
+            self.pending.insert(index);
+            actions.push(Action::Connected(self.group_key.clone()));
+        }
+    }
+}
+
+impl Engine for HidppEngine {
+    fn group_key(&self) -> DeviceKey {
+        self.group_key.clone()
+    }
+
+    fn on_grant(&mut self, grant: &Grant, now: Ms) -> Vec<Action> {
+        self.budgets.retain(|_, b| now <= b.expires_ms);
+        self.budgets.insert(
+            grant.id,
+            Budget {
+                remaining: grant.max_requests,
+                expires_ms: grant.expires_ms,
+            },
+        );
+        let mut actions = Vec::new();
+        if grant.subject == self.group_key {
+            if grant.trigger == Trigger::Arrival {
+                if self.receiver {
+                    let c = Conversation::new(grant.id, Step::GetNotifications);
+                    self.issue(DIRECT, c, now, &mut actions);
+                } else {
+                    self.discover([DIRECT], grant.id, now, &mut actions);
+                }
+            } else {
+                let pending = std::mem::take(&mut self.pending);
+                self.discover(pending, grant.id, now, &mut actions);
+            }
+        } else if let Some(index) = self
+            .devices
+            .iter()
+            .find(|(_, d)| d.key == grant.subject)
+            .map(|(&index, _)| index)
+            && !self.in_flight.contains_key(&index)
+        {
+            self.issue(
+                index,
+                Conversation::new(grant.id, Step::Read),
+                now,
+                &mut actions,
+            );
+        }
+        actions
+    }
+
+    fn on_report(&mut self, _collection: CollectionId, bytes: &[u8], now: Ms) -> Vec<Action> {
+        let mut actions = Vec::new();
+        // Replies may come on either collection of the group.
+        let answer =
+            self.in_flight
+                .iter()
+                .find_map(|(&index, f)| match f.request.reply(bytes, index) {
+                    Reply::NotMine => None,
+                    reply => Some((index, reply)),
+                });
+        match answer {
+            Some((index, reply)) => {
+                if let Some(f) = self.in_flight.remove(&index) {
+                    self.advance(index, f.conversation, reply, now, &mut actions);
+                }
+            }
+            None => self.on_event(bytes, &mut actions),
+        }
+        actions
+    }
+
+    fn on_tick(&mut self, now: Ms) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let due: Vec<u8> = self
+            .in_flight
+            .iter()
+            .filter(|(_, f)| f.deadline <= now)
+            .map(|(&index, _)| index)
+            .collect();
+        for index in due {
+            let Some(f) = self.in_flight.remove(&index) else {
+                continue;
+            };
+            match f.conversation.step {
+                // The receiver did not answer: discover its devices anyway.
+                Step::GetNotifications | Step::SetNotifications(_) => {
+                    self.discover(RECEIVER_SLOTS, f.conversation.grant, now, &mut actions);
+                }
+                Step::Read => {
+                    if let Some(d) = self.devices.get(&index) {
+                        actions.push(Action::Asleep(d.key.clone()));
+                    }
+                }
+                // Discovery: absent or asleep; its next link notification brings it back.
+                _ => {}
+            }
+        }
+        actions
+    }
+
+    fn next_deadline(&self) -> Option<Ms> {
+        self.in_flight.values().map(|f| f.deadline).min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hid::{Collection, GroupId};
+    use crate::model::{
+        Charge, CoarseLevel, DeviceKind, DeviceUpdate, Level, Presence, Source, Via,
+    };
+    use crate::scheduler::{Capabilities, GrantId, Trigger};
+
+    const SHORT_C: CollectionId = CollectionId(1);
+    const LONG_C: CollectionId = CollectionId(2);
+
+    const CATALOG: &str = r#"
+[[family]]
+engine = "hidpp"
+vid = 0x046D
+status = "source-verified"
+source = "test"
+
+[[device]]
+name = "PRO X Wireless Gaming Headset"
+vid = 0x046D
+pids = [0x0ABA]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "test"
+quirks = { voltage_curve = "pro-x-wireless-ghub" }
+"#;
+
+    const FIXTURES: [&str; 3] = [
+        include_str!("../../../tests/fixtures/hidpp/receiver_mouse_discovery.txt"),
+        include_str!("../../../tests/fixtures/hidpp/headset_long_only_discovery.txt"),
+        include_str!("../../../tests/fixtures/hidpp/receiver_hidpp10_discovery.txt"),
+    ];
+
+    fn catalog() -> Catalog {
+        Catalog::parse(CATALOG).unwrap()
+    }
+
+    fn coll(
+        id: CollectionId,
+        page: u16,
+        usage: u16,
+        len: u16,
+        pid: u16,
+        product: &str,
+    ) -> Collection {
+        Collection {
+            id,
+            vid: 0x046D,
+            pid,
+            usage_page: page,
+            usage,
+            input_len: len,
+            output_len: len,
+            feature_len: 0,
+            product: product.into(),
+        }
+    }
+
+    fn receiver_group() -> HidGroup {
+        HidGroup {
+            id: GroupId(7),
+            collections: vec![
+                coll(SHORT_C, 0xFF00, 0x0001, 7, 0xC547, "USB Receiver"),
+                coll(LONG_C, 0xFF00, 0x0002, 20, 0xC547, "USB Receiver"),
+            ],
+        }
+    }
+
+    fn headset_group() -> HidGroup {
+        HidGroup {
+            id: GroupId(8),
+            collections: vec![coll(
+                LONG_C,
+                0xFF43,
+                0x0202,
+                20,
+                0x0ABA,
+                "PRO X Wireless Gaming Headset",
+            )],
+        }
+    }
+
+    /// Short frame, zero-padded to 7 bytes.
+    fn s(head: &[u8]) -> Vec<u8> {
+        let mut f = head.to_vec();
+        f.resize(7, 0);
+        f
+    }
+
+    /// Long frame, zero-padded to 20 bytes.
+    fn l(head: &[u8]) -> Vec<u8> {
+        let mut f = head.to_vec();
+        f.resize(20, 0);
+        f
+    }
+
+    fn grant(id: u32, subject: &DeviceKey, trigger: Trigger) -> Grant {
+        Grant {
+            id: GrantId(id),
+            subject: subject.clone(),
+            trigger,
+            expires_ms: 10_000,
+            max_requests: 96,
+        }
+    }
+
+    fn sent(actions: &[Action]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn mouse_key() -> DeviceKey {
+        DeviceKey("logi:unit:1A2B3C4D".into())
+    }
+
+    fn headset_key() -> DeviceKey {
+        DeviceKey("logi:0ABA:255".into())
+    }
+
+    fn pushing() -> Capabilities {
+        Capabilities {
+            pushes_battery: true,
+            query_wakes: false,
+            min_query_gap_ms: 0,
+        }
+    }
+
+    fn update(key: DeviceKey, source: Source) -> DeviceUpdate {
+        DeviceUpdate {
+            key,
+            name: None,
+            kind: None,
+            via: None,
+            level: None,
+            millivolts: None,
+            charge: None,
+            presence: None,
+            source,
+        }
+    }
+
+    /// Feeds each reply and checks it triggers exactly the paired request.
+    fn run(e: &mut HidppEngine, script: &[(Vec<u8>, Vec<u8>)], now: Ms) {
+        for (i, (reply, want)) in script.iter().enumerate() {
+            let actions = e.on_report(LONG_C, reply, now);
+            assert_eq!(sent(&actions), vec![want.clone()], "step {i}: {actions:?}");
+        }
+    }
+
+    /// Receiver after arrival with wireless notifications already on: pings 1..=6 outstanding.
+    fn receiver_pinging() -> HidppEngine {
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+        assert_eq!(sent(&a), vec![s(&[0x10, 0xFF, 0x81, 0x00])]);
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        let pings: Vec<Vec<u8>> = (1..=6)
+            .map(|i| s(&[0x10, i, 0x00, 0x1B, 0x00, 0x00, 0x5A]))
+            .collect();
+        assert_eq!(sent(&a), pings);
+        e
+    }
+
+    /// Replies of the mouse on index 1 from its ping up to unit id, each with the request it triggers.
+    fn mouse_script() -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            (
+                l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]),
+                s(&[0x10, 1, 0x00, 0x0B, 0x00, 0x05]),
+            ),
+            (
+                l(&[0x11, 1, 0x00, 0x0B, 3]),
+                s(&[0x10, 1, 0x00, 0x0B, 0x00, 0x03]),
+            ),
+            (
+                l(&[0x11, 1, 0x00, 0x0B, 2]),
+                s(&[0x10, 1, 0x00, 0x0B, 0x10, 0x04]),
+            ),
+            (l(&[0x11, 1, 0x00, 0x0B, 6]), s(&[0x10, 1, 3, 0x0B])),
+            (l(&[0x11, 1, 3, 0x0B, 5]), s(&[0x10, 1, 3, 0x1B, 0])),
+            (
+                l(&[0x11, 1, 3, 0x1B, b'P', b'R', b'O', b' ', b'X']),
+                s(&[0x10, 1, 3, 0x2B]),
+            ),
+            (l(&[0x11, 1, 3, 0x2B, 3]), s(&[0x10, 1, 2, 0x0B])),
+            (
+                l(&[0x11, 1, 2, 0x0B, 0x00, 0x1A, 0x2B, 0x3C, 0x4D]),
+                s(&[0x10, 1, 6, 0x1B]),
+            ),
+        ]
+    }
+
+    /// Receiver with the mouse registered on index 1 and no conversation left.
+    fn mouse_engine() -> HidppEngine {
+        let mut e = receiver_pinging();
+        for i in 2..=6 {
+            let a = e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            assert!(a.is_empty(), "{a:?}");
+        }
+        run(&mut e, &mouse_script(), 3);
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 4);
+        assert!(matches!(a.as_slice(), [Action::Register { .. }]), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+        e
+    }
+
+    /// Replies of the headset from its ping up to the 0x1F20 lookup, each with the request it triggers.
+    fn headset_script() -> Vec<(Vec<u8>, Vec<u8>)> {
+        let get = |hi, lo| l(&[0x11, 0xFF, 0x00, 0x0B, hi, lo]);
+        let found = |fi| l(&[0x11, 0xFF, 0x00, 0x0B, fi]);
+        vec![
+            (
+                l(&[0x11, 0xFF, 0x00, 0x1B, 0x04, 0x02, 0x5A]),
+                get(0x00, 0x05),
+            ),
+            (found(0), get(0x00, 0x03)),
+            (found(0), get(0x10, 0x04)),
+            (found(0), get(0x10, 0x00)),
+            (found(0), get(0x10, 0x01)),
+            (found(0), get(0x1F, 0x20)),
+            (found(8), l(&[0x11, 0xFF, 0x08, 0x0B])),
+        ]
+    }
+
+    /// Runs the headset's arrival with `catalog` and returns the engine and its `Register`.
+    fn headset_with(catalog: &Catalog) -> (HidppEngine, Vec<Action>) {
+        let mut e = HidppEngine::new(&headset_group(), catalog);
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(
+            sent(&a),
+            vec![l(&[0x11, 0xFF, 0x00, 0x1B, 0x00, 0x00, 0x5A])]
+        );
+        run(&mut e, &headset_script(), 1);
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 2);
+        (e, a)
+    }
+
+    fn headset_engine() -> HidppEngine {
+        let (e, a) = headset_with(&catalog());
+        assert!(matches!(a.as_slice(), [Action::Register { .. }]), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+        e
+    }
+
+    /// Every `in` frame of every fixture.
+    fn fixture_inputs() -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        for text in FIXTURES {
+            for line in text.lines() {
+                let line = line.split('#').next().unwrap_or_default();
+                let mut words = line.split_whitespace();
+                if words.next() != Some("in") {
+                    continue;
+                }
+                let len = match words.next() {
+                    Some("short") => 7,
+                    _ => 20,
+                };
+                let mut f: Vec<u8> = words.map(|w| u8::from_str_radix(w, 16).unwrap()).collect();
+                f.resize(len, 0);
+                frames.push(f);
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn accepts_logitech_hidpp_groups_only() {
+        assert!(HidppEngine::accepts(&receiver_group()));
+        assert!(HidppEngine::accepts(&headset_group()));
+
+        let mut other_vendor = receiver_group();
+        for c in &mut other_vendor.collections {
+            c.vid = 0x1532;
+        }
+        assert!(!HidppEngine::accepts(&other_vendor));
+
+        let mut wrong_len = receiver_group();
+        wrong_len.collections[0].output_len = 20;
+        wrong_len.collections[1].output_len = 7;
+        assert!(!HidppEngine::accepts(&wrong_len));
+
+        let mut mouse_only = receiver_group();
+        for c in &mut mouse_only.collections {
+            (c.usage_page, c.usage) = (0x0001, 0x0002);
+        }
+        assert!(!HidppEngine::accepts(&mouse_only));
+    }
+
+    #[test]
+    fn group_key_names_pid_and_group() {
+        let e = HidppEngine::new(&receiver_group(), &catalog());
+        assert_eq!(e.group_key(), DeviceKey("logi-group:C547:7".into()));
+        let e = HidppEngine::new(&headset_group(), &catalog());
+        assert_eq!(e.group_key(), DeviceKey("logi-group:0ABA:8".into()));
+    }
+
+    #[test]
+    fn receiver_arrival_enables_wireless_notifications_or_only() {
+        for (flags, write) in [
+            ([0x00, 0x00, 0x00], Some([0x00, 0x01, 0x00])),
+            ([0x09, 0x0A, 0x30], Some([0x09, 0x0B, 0x30])),
+            ([0x00, 0x01, 0x00], None),
+        ] {
+            let mut e = HidppEngine::new(&receiver_group(), &catalog());
+            let gk = e.group_key();
+            let a = e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+            assert_eq!(
+                a,
+                vec![Action::Send {
+                    grant: GrantId(1),
+                    collection: SHORT_C,
+                    bytes: s(&[0x10, 0xFF, 0x81, 0x00]),
+                    timeout_ms: 1_000,
+                }]
+            );
+
+            let a = e.on_report(
+                SHORT_C,
+                &s(&[&[0x10, 0xFF, 0x81, 0x00][..], &flags].concat()),
+                1,
+            );
+            let pings: Vec<Vec<u8>> = (1..=6)
+                .map(|i| s(&[0x10, i, 0x00, 0x1B, 0x00, 0x00, 0x5A]))
+                .collect();
+            match write {
+                Some(params) => {
+                    assert_eq!(
+                        sent(&a),
+                        vec![s(&[&[0x10, 0xFF, 0x80, 0x00][..], &params].concat())]
+                    );
+                    let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
+                    assert_eq!(sent(&a), pings, "{flags:?}");
+                }
+                None => assert_eq!(sent(&a), pings, "{flags:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hidpp20_discovery_registers_mouse_with_unified_battery() {
+        let mut e = receiver_pinging();
+        run(&mut e, &mouse_script(), 2);
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 3);
+
+        assert_eq!(
+            a,
+            vec![Action::Register {
+                key: mouse_key(),
+                caps: pushing(),
+                initial: DeviceUpdate {
+                    name: Some("PRO X".into()),
+                    kind: Some(DeviceKind::Mouse),
+                    via: Some(Via::Receiver),
+                    level: Some(Level::Percent(34)),
+                    charge: Some(Charge::Discharging),
+                    presence: Some(Presence::Online),
+                    ..update(mouse_key(), Source::Query)
+                },
+            }]
+        );
+        // Pings 2..=6 went out at t = 1 and are still unanswered.
+        assert_eq!(e.next_deadline(), Some(1_001));
+    }
+
+    #[test]
+    fn long_names_are_read_in_chunks() {
+        let name = b"G PRO X SUPERLIGHT 2";
+        let mut e = receiver_pinging();
+        let mut script = mouse_script();
+        script.truncate(4);
+        script.extend([
+            (l(&[0x11, 1, 3, 0x0B, 20]), s(&[0x10, 1, 3, 0x1B, 0])),
+            (
+                l(&[&[0x11, 1, 3, 0x1B][..], &name[..16]].concat()),
+                s(&[0x10, 1, 3, 0x1B, 16]),
+            ),
+            (
+                l(&[&[0x11, 1, 3, 0x1B][..], &name[16..]].concat()),
+                s(&[0x10, 1, 3, 0x2B]),
+            ),
+            (l(&[0x11, 1, 3, 0x2B, 3]), s(&[0x10, 1, 2, 0x0B])),
+            (
+                l(&[0x11, 1, 2, 0x0B, 0x00, 0x1A, 0x2B, 0x3C, 0x4D]),
+                s(&[0x10, 1, 6, 0x1B]),
+            ),
+        ]);
+        run(&mut e, &script, 2);
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 3);
+
+        let [Action::Register { initial, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(initial.name.as_deref(), Some("G PRO X SUPERLIGHT 2"));
+    }
+
+    #[test]
+    fn headset_long_only_uses_long_frames_and_prox_curve() {
+        let mut e = HidppEngine::new(&headset_group(), &catalog());
+        let gk = e.group_key();
+        let send = |bytes| Action::Send {
+            grant: GrantId(5),
+            collection: LONG_C,
+            bytes,
+            timeout_ms: 1_000,
+        };
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(
+            a,
+            vec![send(l(&[0x11, 0xFF, 0x00, 0x1B, 0x00, 0x00, 0x5A]))]
+        );
+        for (i, (reply, want)) in headset_script().into_iter().enumerate() {
+            let a = e.on_report(LONG_C, &reply, 1);
+            assert_eq!(a, vec![send(want)], "step {i}");
+        }
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 2);
+
+        assert_eq!(
+            a,
+            vec![Action::Register {
+                key: headset_key(),
+                caps: pushing(),
+                initial: DeviceUpdate {
+                    name: Some("PRO X Wireless Gaming Headset".into()),
+                    kind: Some(DeviceKind::Headset),
+                    via: Some(Via::Usb),
+                    level: Some(Level::Percent(68)),
+                    millivolts: Some(3828),
+                    charge: Some(Charge::Discharging),
+                    presence: Some(Presence::Online),
+                    ..update(headset_key(), Source::Query)
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn headset_without_curve_quirk_uses_default_curve() {
+        let plain = Catalog::parse("").unwrap();
+        let (_, a) = headset_with(&plain);
+        let [Action::Register { initial, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        // HeadsetControl G633 curve: 3828 mV lies between 3750 (40 %) and 3850 (60 %).
+        assert_eq!(initial.level, Some(Level::Percent(55)));
+    }
+
+    #[test]
+    fn query_wakes_quirk_reaches_capabilities() {
+        let wakes = Catalog::parse(&CATALOG.replace(
+            "quirks = { voltage_curve = \"pro-x-wireless-ghub\" }",
+            "quirks = { query_wakes = true }",
+        ))
+        .unwrap();
+        let (_, a) = headset_with(&wakes);
+        let [Action::Register { caps, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(
+            *caps,
+            Capabilities {
+                query_wakes: true,
+                ..pushing()
+            }
+        );
+    }
+
+    #[test]
+    fn ping_resource_error_registers_nothing_and_does_not_retry() {
+        let mut e = receiver_pinging();
+
+        let a = e.on_report(SHORT_C, &s(&[0x10, 2, 0x8F, 0x00, 0x1B, 0x09]), 2);
+        assert!(a.is_empty(), "{a:?}");
+
+        // The other pings time out: skipped during discovery, nothing retried.
+        let a = e.on_tick(1 + 1_000);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn hidpp10_enables_battery_reporting_bit_only() {
+        for (flags, next) in [
+            (
+                [0x00, 0x00, 0x00],
+                s(&[0x10, 1, 0x80, 0x00, 0x10, 0x00, 0x00]),
+            ),
+            (
+                [0x01, 0x05, 0x09],
+                s(&[0x10, 1, 0x80, 0x00, 0x11, 0x05, 0x09]),
+            ),
+            ([0x10, 0x00, 0x00], s(&[0x10, 1, 0x81, 0x0D])),
+        ] {
+            let mut e = receiver_pinging();
+            let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 0x00, 0x1B, 0x01]), 2);
+            assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x81, 0x00])]);
+
+            let a = e.on_report(
+                SHORT_C,
+                &s(&[&[0x10, 1, 0x81, 0x00][..], &flags].concat()),
+                3,
+            );
+
+            assert_eq!(sent(&a), vec![next], "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn hidpp10_falls_back_to_register_07() {
+        let mut e = receiver_pinging();
+        let script = [
+            (
+                s(&[0x10, 1, 0x8F, 0x00, 0x1B, 0x01]),
+                s(&[0x10, 1, 0x81, 0x00]),
+            ),
+            (s(&[0x10, 1, 0x81, 0x00, 0x10]), s(&[0x10, 1, 0x81, 0x0D])),
+            (
+                s(&[0x10, 1, 0x8F, 0x81, 0x0D, 0x02]),
+                s(&[0x10, 1, 0x81, 0x07]),
+            ),
+        ];
+        for (reply, want) in script {
+            let a = e.on_report(SHORT_C, &reply, 2);
+            assert_eq!(sent(&a), vec![want]);
+        }
+
+        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x81, 0x07, 5, 0x00]), 3);
+
+        let key = DeviceKey("logi:C547:1".into());
+        assert_eq!(
+            a,
+            vec![Action::Register {
+                key: key.clone(),
+                caps: pushing(),
+                initial: DeviceUpdate {
+                    name: Some("USB Receiver".into()),
+                    kind: Some(DeviceKind::Other),
+                    via: Some(Via::Receiver),
+                    level: Some(Level::Coarse(CoarseLevel::Good)),
+                    charge: Some(Charge::Discharging),
+                    presence: Some(Presence::Online),
+                    ..update(key, Source::Query)
+                },
+            }]
+        );
+
+        // Register notifications of a known HID++ 1.0 device.
+        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x0D, 60, 0x00, 0x40]), 4);
+        let [Action::Update(u)] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(
+            (u.level, u.charge, u.source),
+            (
+                Some(Level::Percent(60)),
+                Some(Charge::Charging),
+                Source::Push
+            )
+        );
+    }
+
+    #[test]
+    fn battery_broadcast_updates_without_send() {
+        let mut e = mouse_engine();
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x00, 40, 4, 0, 0]), 10);
+
+        assert_eq!(
+            a,
+            vec![Action::Update(DeviceUpdate {
+                level: Some(Level::Percent(40)),
+                charge: Some(Charge::Discharging),
+                presence: Some(Presence::Online),
+                ..update(mouse_key(), Source::Push)
+            })]
+        );
+    }
+
+    #[test]
+    fn adc_broadcast_offline_marks_asleep_keeps_level() {
+        let mut e = headset_engine();
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x00, 0x0E, 0xF4, 0x0F]), 10);
+
+        // No Update: the level stays what it was, only presence changes.
+        assert_eq!(a, vec![Action::Asleep(headset_key())]);
+    }
+
+    #[test]
+    fn truncated_adc_broadcast_is_ignored() {
+        let mut e = headset_engine();
+        let a = e.on_report(LONG_C, &[0x11, 0xFF, 0x08, 0x00, 0x0E, 0xF4], 10);
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    #[test]
+    fn direct_device_broadcast_on_index_zero_updates() {
+        let mut e = headset_engine();
+        let a = e.on_report(LONG_C, &l(&[0x11, 0x00, 0x08, 0x00, 0x0F, 0x83, 0x03]), 10);
+        assert_eq!(
+            a,
+            vec![Action::Update(DeviceUpdate {
+                level: Some(Level::Percent(87)),
+                millivolts: Some(3971),
+                charge: Some(Charge::Charging),
+                presence: Some(Presence::Online),
+                ..update(headset_key(), Source::Push)
+            })]
+        );
+    }
+
+    #[test]
+    fn link_lost_notification_marks_asleep() {
+        let mut e = mouse_engine();
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x40, 0x00, 0x00], 10);
+        assert_eq!(a, vec![Action::Asleep(mouse_key())]);
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x03, 0x41, 0x04, 0x40, 0x00, 0x00], 11);
+        assert!(a.is_empty(), "unknown index: {a:?}");
+    }
+
+    #[test]
+    fn link_established_notification_requests_connected_grant() {
+        let mut e = mouse_engine();
+        let gk = e.group_key();
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 10);
+        assert_eq!(a, vec![Action::Connected(mouse_key())]);
+
+        // Unknown index: a new pairing (or a device asleep at startup).
+        let a = e.on_report(SHORT_C, &[0x10, 0x02, 0x41, 0x04, 0x00, 0x00, 0x00], 11);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+
+        let a = e.on_grant(&grant(9, &gk, Trigger::Connected), 12);
+        assert_eq!(
+            a,
+            vec![Action::Send {
+                grant: GrantId(9),
+                collection: SHORT_C,
+                bytes: s(&[0x10, 2, 0x00, 0x1B, 0x00, 0x00, 0x5A]),
+                timeout_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn device_grant_reads_battery_once() {
+        let mut e = mouse_engine();
+        let a = e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 6, 0x1B])]);
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 55, 4, 1, 0]), 110);
+
+        assert_eq!(
+            a,
+            vec![Action::Update(DeviceUpdate {
+                level: Some(Level::Percent(55)),
+                charge: Some(Charge::Charging),
+                presence: Some(Presence::Online),
+                ..update(mouse_key(), Source::Query)
+            })]
+        );
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn battery_read_errors_mark_asleep() {
+        for reply in [
+            l(&[0x11, 1, 0xFF, 6, 0x1B, 0x05]),
+            s(&[0x10, 1, 0x8F, 6, 0x1B, 0x09]),
+            s(&[0x10, 1, 0x8F, 6, 0x1B, 0x04]),
+        ] {
+            let mut e = mouse_engine();
+            e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+
+            let a = e.on_report(LONG_C, &reply, 110);
+
+            assert_eq!(a, vec![Action::Asleep(mouse_key())], "{reply:02X?}");
+        }
+    }
+
+    #[test]
+    fn ignores_replies_with_foreign_software_id() {
+        let mut e = HidppEngine::new(&headset_group(), &catalog());
+        let gk = e.group_key();
+        e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x1D, 0x04, 0x02, 0x5A]), 10);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), Some(1_000));
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 20);
+        assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x00, 0x0B, 0x00, 0x05])]);
+    }
+
+    #[test]
+    fn read_timeout_marks_known_device_asleep() {
+        let mut e = mouse_engine();
+        e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+        assert_eq!(e.next_deadline(), Some(1_100));
+
+        assert!(e.on_tick(1_099).is_empty());
+        assert_eq!(e.on_tick(1_100), vec![Action::Asleep(mouse_key())]);
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn exhausted_grant_ends_conversation_quietly() {
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        let small = Grant {
+            max_requests: 2,
+            ..grant(1, &gk, Trigger::Arrival)
+        };
+        e.on_grant(&small, 0);
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00]), 1);
+        assert_eq!(sent(&a).len(), 1);
+
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
+
+        assert!(a.is_empty(), "no budget left for pings: {a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn pushed_events_never_send() {
+        let frames = fixture_inputs();
+        assert!(frames.len() > 20);
+        let engines = [
+            HidppEngine::new(&receiver_group(), &catalog()),
+            HidppEngine::new(&headset_group(), &catalog()),
+            mouse_engine(),
+            headset_engine(),
+        ];
+        for mut e in engines {
+            for (t, f) in (100..).zip(&frames) {
+                let c = if f.len() == 7 { SHORT_C } else { LONG_C };
+                let a = e.on_report(c, f, t);
+                assert!(sent(&a).is_empty(), "{f:02X?} -> {a:?}");
+            }
+            assert!(e.on_tick(1_000_000).is_empty());
+        }
+    }
+}

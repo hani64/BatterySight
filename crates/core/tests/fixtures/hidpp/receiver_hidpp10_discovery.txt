@@ -1,0 +1,43 @@
+# Receiver 046D:C547 ("USB Receiver") with a HID++ 1.0 device on index 1.
+#
+# Synthetic transcript: frames built from the layouts in Linux
+# drivers/hid/hid-logitech-hidpp.c (short 0x10 reports, 0x8F HID++ 1.0 error,
+# battery registers 0x07 / 0x0D) and Solaar lib/logitech_receiver
+# (base.py ping, hidpp10_constants.py NotificationFlag.BATTERY_STATUS and
+# Registers.BATTERY_STATUS / BATTERY_CHARGE). Replace with a real capture in
+# Task 14.
+#
+# Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
+# reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The
+# `out` lines after an `in` are the writes that frame causes.
+
+# Group arrival: read the receiver's notification flags.
+out short 10 FF 81 00 00 00 00
+# Wireless notifications already on: no write.
+in  short 10 FF 81 00 00 01 00
+out short 10 01 00 1B 00 00 5A
+out short 10 02 00 1B 00 00 5A
+out short 10 03 00 1B 00 00 5A
+out short 10 04 00 1B 00 00 5A
+out short 10 05 00 1B 00 00 5A
+out short 10 06 00 1B 00 00 5A
+# Index 1: error 0x01 (invalid sub id) -> HID++ 1.0; read register 0x00.
+in  short 10 01 8F 00 1B 01 00
+out short 10 01 81 00 00 00 00
+in  short 10 02 8F 00 1B 08 00
+in  short 10 03 8F 00 1B 08 00
+in  short 10 04 8F 00 1B 08 00
+in  short 10 05 8F 00 1B 08 00
+in  short 10 06 8F 00 1B 08 00
+# Battery reporting off: set only bit 0x10 of the first byte.
+in  short 10 01 81 00 00 00 00
+out short 10 01 80 00 10 00 00
+in  short 10 01 80 00 00 00 00
+# Register 0x0D (battery charge) is not supported: error 0x02 ...
+out short 10 01 81 0D 00 00 00
+in  short 10 01 8F 81 0D 02 00
+# ... so read register 0x07 (battery status): level 5 (good), discharging.
+out short 10 01 81 07 00 00 00
+in  short 10 01 81 07 05 00 00
+# Register 0x07 notification: level 3 (low), no write.
+in  short 10 01 07 03 00 00 00
