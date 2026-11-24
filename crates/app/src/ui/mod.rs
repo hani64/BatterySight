@@ -599,10 +599,14 @@ impl Ui {
             MenuCommand::ShowAs(DisplayMode::Widget) => self.choose_widget(),
             MenuCommand::ShowAs(DisplayMode::Tray) => self.choose_tray(),
             _ if !changed => {}
-            MenuCommand::ToggleShown(_)
-            | MenuCommand::MoveLeft(_)
-            | MenuCommand::MoveRight(_)
-            | MenuCommand::Threshold(..) => self.update_views(&read_snapshot(&self.runtime)),
+            MenuCommand::ToggleShown(_) | MenuCommand::MoveLeft(_) | MenuCommand::MoveRight(_) => {
+                self.update_views(&read_snapshot(&self.runtime));
+            }
+            MenuCommand::Threshold(key, _) => {
+                // A new threshold gets its own alert, even after one at the old threshold.
+                self.alerts.rearm(&key);
+                self.update_views(&read_snapshot(&self.runtime));
+            }
             MenuCommand::ShowOn(_) => {
                 if matches!(self.surface, Surface::Widgets(_)) {
                     self.show();
@@ -730,9 +734,14 @@ fn post(msg: u32) {
     post_with(msg, 0);
 }
 
+/// The host window (null before it exists), from any thread.
+fn host() -> HWND {
+    HWND(HOST.load(Ordering::Relaxed) as *mut c_void)
+}
+
 /// Posts `msg` with `wparam` to the host window, from any thread.
 fn post_with(msg: u32, wparam: usize) {
-    let host = HWND(HOST.load(Ordering::Relaxed) as *mut c_void);
+    let host = host();
     if !host.is_invalid() {
         // SAFETY: no pointers involved; a stale handle only makes the post fail.
         let _ = unsafe { PostMessageW(Some(host), msg, WPARAM(wparam), LPARAM(0)) };

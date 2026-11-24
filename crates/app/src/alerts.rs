@@ -1,10 +1,11 @@
-//! Low-battery alert rules: which readings raise a notification.
+//! Low-battery alert rules: which updates raise a notification.
 //!
-//! A device alerts once when a fresh reading (its `updated_ms` changed since the last
-//! check) from an awake, shown, non-charging device is at or below its threshold. It can
-//! alert again only after it charges or rises [`REARM_POINTS`] above its threshold, so a
-//! level hovering at the threshold alerts once. The state lives in memory only: after a
-//! restart a device that is still low alerts once more.
+//! A device alerts once when a fresh update (its `updated_ms` changed since the last check;
+//! an update without a new level counts, with the level the device kept) from an awake,
+//! shown device that is neither charging nor full is at or below its threshold. It can
+//! alert again only after it charges, rises [`REARM_POINTS`] above its threshold or gets a
+//! new threshold ([`Alerts::rearm`]), so a level hovering at the threshold alerts once. The
+//! state lives in memory only: after a restart a device that is still low alerts once more.
 
 use std::collections::HashMap;
 
@@ -44,6 +45,11 @@ impl Alert {
 }
 
 impl Alerts {
+    /// The device's threshold changed: its next low update alerts again.
+    pub fn rearm(&mut self, key: &DeviceKey) {
+        self.armed.remove(key);
+    }
+
     /// The devices whose fresh readings in `states` alert now (see the module doc).
     pub fn check(&mut self, states: &[DeviceState], settings: &Settings) -> Vec<Alert> {
         let mut alerts = Vec::new();
@@ -205,6 +211,56 @@ mod tests {
             run(&mut alerts, &Settings::default(), &[charging(5, 1)]),
             []
         );
+    }
+
+    #[test]
+    fn full_rearms_and_other_charge_states_alert() {
+        let full = |p, updated_ms| DeviceState {
+            charge: Charge::Full,
+            ..percent(p, updated_ms)
+        };
+        let mut alerts = Alerts::default();
+        let readings = [percent(14, 1), full(14, 2), percent(14, 3)];
+        assert_eq!(
+            run(&mut alerts, &Settings::default(), &readings),
+            [Some(14), Some(14)]
+        );
+        for charge in [Charge::NotCharging, Charge::Unknown] {
+            let mut alerts = Alerts::default();
+            let s = DeviceState {
+                charge,
+                ..percent(14, 1)
+            };
+            assert_eq!(run(&mut alerts, &Settings::default(), &[s]), [Some(14)]);
+        }
+    }
+
+    #[test]
+    fn rearms_when_threshold_changes() {
+        let key = DeviceKey("M".into());
+        // Lowered from 20 to 15 after an alert at 20: alerts again at 15.
+        let mut settings = Settings::default();
+        settings.set_threshold(&key, Threshold::Percent(20));
+        let mut alerts = Alerts::default();
+        assert_eq!(run(&mut alerts, &settings, &[percent(20, 1)]), [Some(20)]);
+        settings.set_threshold(&key, Threshold::Percent(15));
+        alerts.rearm(&key);
+        let readings = [
+            percent(19, 2),
+            percent(15, 3),
+            percent(10, 4),
+            percent(5, 5),
+        ];
+        assert_eq!(run(&mut alerts, &settings, &readings), [Some(15)]);
+
+        // Lowered from 15 to 5 after an alert at 15: alerts again at 5.
+        let mut settings = Settings::default();
+        let mut alerts = Alerts::default();
+        assert_eq!(run(&mut alerts, &settings, &[percent(15, 1)]), [Some(15)]);
+        settings.set_threshold(&key, Threshold::Percent(5));
+        alerts.rearm(&key);
+        let readings = [percent(14, 2), percent(6, 3), percent(5, 4)];
+        assert_eq!(run(&mut alerts, &settings, &readings), [Some(5)]);
     }
 
     #[test]
