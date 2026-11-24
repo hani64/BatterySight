@@ -31,7 +31,9 @@ const ERR_INVALID_SUB_ID: u8 = 0x01;
 const ERR_INVALID_ADDRESS: u8 = 0x02;
 /// The receiver could not reach the device (link down).
 pub(super) const ERR_CONNECT_FAIL: u8 = 0x04;
-/// No device paired on that index.
+/// No device with that number currently accessible: none paired, or the paired device is
+/// asleep or off (an idle Superlight behind its receiver answers it). It ends discovery
+/// and marks a known device asleep; unpairing is reported by the receiver's 0x40 instead.
 pub(super) const ERR_UNKNOWN_DEVICE: u8 = 0x08;
 /// The device is busy or asleep.
 pub(super) const ERR_RESOURCE_ERROR: u8 = 0x09;
