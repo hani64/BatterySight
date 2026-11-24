@@ -1,10 +1,10 @@
 # Logitech (vid 0x046D). Devices without an entry below are covered by the HID++ family.
 #
 # A device entry lists USB product ids in `pids` (the device itself, or a dongle that is the
-# device, like a headset's) and/or wireless product ids in `wpids` (a device paired to a
-# receiver, matched by the id the receiver reports for its slot; the receiver's own USB id
-# says nothing about the devices paired to it). The entry's `name` replaces the name the
-# device reports.
+# device, like a headset's) and/or wireless product ids in `wpids`. A device paired to a
+# receiver is matched only by the wireless id the receiver reports for its slot, never by the
+# receiver's own USB id; without a wireless id it gets the family entry. Every entry needs at
+# least one id. The entry's `name` replaces the name the device reports.
 
 [[family]]
 engine = "hidpp"
@@ -40,3 +40,12 @@ kind = "mouse"
 engine = "hidpp"
 status = "hardware-tested"
 source = "G HUB core/data/devices/devices_0001.json (pro_x_wireless_mouse: displayName PRO X SUPERLIGHT, interfaces 046d_4093 and 046d_c094); its own HID++ name is PRO X Wireless (Solaar lib/logitech_receiver/descriptors.py, wpid 4093, usbid C094); owner hardware test 2026-11-23 on a C547 receiver: discovery on link-up, link-lost and resume, Refresh now, G HUB comparison 79/79 twice"
+
+[[device]]
+name = "PRO X Superlight"
+vid = 0x046D
+pids = [0xC094]
+kind = "mouse"
+engine = "hidpp"
+status = "source-verified"
+source = "G HUB core/data/devices/devices_0001.json (pro_x_wireless_mouse: displayName PRO X SUPERLIGHT, interfaces 046d_4093 and 046d_c094); the same mouse on its USB cable, untested on hardware"

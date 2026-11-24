@@ -1129,25 +1129,52 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert_eq!(e.next_deadline(), Some(4_001));
     }
 
-    #[test]
-    fn receiver_slot_registers_with_wireless_pid_from_link_notification() {
-        let mut e = receiver_notified();
+    /// Feeds the 0x41 `link` for slot 1, discovers the mouse and returns its `Register` wpid.
+    fn link_up_registers(e: &mut HidppEngine, link: [u8; 7], now: Ms) -> Option<u16> {
         let gk = e.group_key();
-        // Owner capture 2026-11-23: link up on slot 1, wireless PID 0x4093 little-endian in
-        // bytes 5..7 (the device's own 0x0003 model id says 4093 too).
-        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x41, 0x11, 0xA2, 0x93, 0x40]), 3);
+        let a = e.on_report(SHORT_C, &link, now);
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
-        let a = e.on_grant(&grant(2, &gk, Trigger::Connected), 4);
+        let a = e.on_grant(&grant(2, &gk, Trigger::Connected), now + 1);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
-        run(&mut e, &mouse_script(), 5);
+        run(e, &mouse_script(), now + 2);
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 6);
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), now + 3);
 
         let [Action::Register { key, wpid, .. }] = a.as_slice() else {
             panic!("{a:?}");
         };
         assert_eq!(*key, mouse_key());
-        assert_eq!(*wpid, Some(0x4093));
+        *wpid
+    }
+
+    #[test]
+    fn receiver_slot_registers_with_wireless_pid_from_link_notification() {
+        let mut e = receiver_notified();
+        // Owner capture 2026-11-23: link up on slot 1, wireless PID 0x4093 little-endian in
+        // bytes 5..7 (the device's own 0x0003 model id says 4093 too).
+        let wpid = link_up_registers(&mut e, [0x10, 1, 0x41, 0x11, 0xA2, 0x93, 0x40], 3);
+        assert_eq!(wpid, Some(0x4093));
+    }
+
+    #[test]
+    fn zero_wireless_pid_is_not_stored() {
+        let mut e = receiver_notified();
+        let wpid = link_up_registers(&mut e, [0x10, 1, 0x41, 0x11, 0xA2, 0x00, 0x00], 3);
+        assert_eq!(wpid, None);
+    }
+
+    #[test]
+    fn unpairing_forgets_the_wireless_pid() {
+        let mut e = receiver_notified();
+        let wpid = link_up_registers(&mut e, [0x10, 1, 0x41, 0x11, 0xA2, 0x93, 0x40], 3);
+        assert_eq!(wpid, Some(0x4093));
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00], 10);
+        assert_eq!(a, vec![Action::Unregister(mouse_key())]);
+
+        // A new pairing on the slot whose 0x41 carries no wireless PID.
+        let wpid = link_up_registers(&mut e, [0x10, 1, 0x41, 0x11, 0xA2, 0x00, 0x00], 11);
+        assert_eq!(wpid, None);
     }
 
     #[test]
