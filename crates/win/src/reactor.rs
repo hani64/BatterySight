@@ -322,7 +322,7 @@ fn timeout_ms(deadline: Option<Ms>, now: Ms) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
@@ -370,10 +370,10 @@ mod tests {
 
     /// The server end of a message-mode named pipe; the reactor opens the client end as if it
     /// were a HID collection with 7-byte input and output reports.
-    struct Server(HANDLE);
+    pub(crate) struct Server(HANDLE);
 
     impl Server {
-        fn new(mode: FILE_FLAGS_AND_ATTRIBUTES) -> (Server, HidInterface) {
+        pub(crate) fn new(mode: FILE_FLAGS_AND_ATTRIBUTES) -> (Server, HidInterface) {
             let name = wide(&format!(
                 r"\\.\pipe\batterysight-test-{}-{}",
                 std::process::id(),
@@ -660,7 +660,7 @@ mod tests {
         let mut reactor = Reactor::new().unwrap();
         let ping = fap(0x10, 0x01, 0x00, 1, &[0, 0, 0x5A]);
         let mut pinged = 0;
-        for (hid_group, members) in group(enumerate()) {
+        for (hid_group, members) in group(enumerate().expect("enumeration failed")) {
             let short = members.iter().find(|m| {
                 let c = &m.collection;
                 c.vid == 0x046D && c.pid == 0xC547 && c.usage_page == 0xFF00 && c.usage == 0x0001

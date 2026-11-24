@@ -4,7 +4,7 @@ pub mod hidpp;
 
 use crate::catalog::Catalog;
 use crate::engine::Engine;
-use crate::hid::HidGroup;
+use crate::hid::{Collection, HidGroup};
 
 use hidpp::HidppEngine;
 
@@ -20,6 +20,12 @@ pub fn engine_for(group: &HidGroup, catalog: &Catalog) -> Option<Box<dyn Engine>
 /// only, so it needs no product string and no request to the device.
 pub fn wants(group: &HidGroup) -> bool {
     HidppEngine::accepts(group)
+}
+
+/// Whether an engine reads `collection`. Only these are opened: reports of any other
+/// collection of a wanted group (such as a headset's volume keys) never enter the process.
+pub fn reads(collection: &Collection) -> bool {
+    HidppEngine::reads(collection)
 }
 
 #[cfg(test)]
@@ -54,5 +60,17 @@ mod tests {
     fn does_not_want_other_groups() {
         assert!(!wants(&group(0x1234, 0xFF00, 0x0001, 7)));
         assert!(!wants(&group(0x046D, 0x0001, 0x0002, 7)));
+    }
+
+    #[test]
+    fn reads_only_hidpp_collections() {
+        let one = |vid, page, usage, len| group(vid, page, usage, len).collections.remove(0);
+        assert!(reads(&one(0x046D, 0xFF00, 0x0001, 7)));
+        assert!(reads(&one(0x046D, 0xFF00, 0x0002, 20)));
+        assert!(reads(&one(0x046D, 0xFF43, 0x0202, 20)));
+        // The PRO X Wireless dongle's consumer control, next to its HID++ collection.
+        assert!(!reads(&one(0x046D, 0x000C, 0x0001, 3)));
+        assert!(!reads(&one(0x046D, 0xFF00, 0x0001, 20)));
+        assert!(!reads(&one(0x1234, 0xFF00, 0x0001, 7)));
     }
 }

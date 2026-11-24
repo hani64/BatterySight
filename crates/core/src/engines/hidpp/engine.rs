@@ -179,7 +179,12 @@ fn reading_update(key: DeviceKey, r: &Reading, source: Source) -> DeviceUpdate {
 impl HidppEngine {
     /// A Logitech group with a short or long HID++ collection.
     pub fn accepts(group: &HidGroup) -> bool {
-        group.collections.iter().any(|c| is_short(c) || is_long(c))
+        group.collections.iter().any(Self::reads)
+    }
+
+    /// A short or long HID++ collection: the only collections the engine reads or writes.
+    pub fn reads(c: &Collection) -> bool {
+        is_short(c) || is_long(c)
     }
 
     /// # Panics

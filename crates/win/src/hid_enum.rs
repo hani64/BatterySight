@@ -1,7 +1,9 @@
 //! HID interface enumeration and grouping by physical device.
 //!
 //! Interfaces are opened with access 0 and shared read/write, only long enough to read
-//! attributes, capabilities and the product string. No reports are read or written here.
+//! attributes and capabilities, which the HID class driver serves without a request to the
+//! device. No reports are read or written here. [`product_string`] is the one request to a
+//! device; the runtime calls it only for collections an engine reads.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,18 +41,22 @@ pub struct HidInterface {
     pub collection: Collection,
 }
 
-/// Lists the present HID interfaces in the order Configuration Manager returns them.
+/// Lists the present HID interfaces in the order Configuration Manager returns them, or
+/// `None` when Configuration Manager cannot list them (which says nothing about what is
+/// present).
 ///
 /// Each interface gets a fresh `CollectionId`. Only attributes and capabilities are read; both
 /// come from the HID class driver without a request to the device. An interface whose
 /// attributes or capabilities cannot be read is skipped. `collection.product` is left empty:
 /// see [`product_string`].
-pub fn enumerate() -> Vec<HidInterface> {
-    interface_list()
-        .split(|&unit| unit == 0)
-        .filter(|path| !path.is_empty())
-        .filter_map(query)
-        .collect()
+pub fn enumerate() -> Option<Vec<HidInterface>> {
+    let list = interface_list()?;
+    Some(
+        list.split(|&unit| unit == 0)
+            .filter(|path| !path.is_empty())
+            .filter_map(query)
+            .collect(),
+    )
 }
 
 /// Key shared by every collection of one physical device.
@@ -128,8 +134,9 @@ fn is_collection_part(part: &str) -> bool {
         .is_some_and(|digits| digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// The present HID interface paths as a NUL-separated, double-NUL-terminated list.
-fn interface_list() -> Vec<u16> {
+/// The present HID interface paths as a NUL-separated, double-NUL-terminated list, or `None`
+/// when Configuration Manager fails.
+fn interface_list() -> Option<Vec<u16>> {
     for _ in 0..LIST_ATTEMPTS {
         let mut len = 0u32;
         // SAFETY: `len` is a valid out pointer and the GUID outlives the call.
@@ -142,7 +149,7 @@ fn interface_list() -> Vec<u16> {
             )
         };
         if status != CR_SUCCESS {
-            return Vec::new();
+            return None;
         }
         let mut buffer = vec![0u16; len as usize];
         // SAFETY: the buffer is writable for its full length, which the wrapper passes along.
@@ -155,13 +162,13 @@ fn interface_list() -> Vec<u16> {
             )
         };
         if status == CR_SUCCESS {
-            return buffer;
+            return Some(buffer);
         }
         if status != CR_BUFFER_SMALL {
-            return Vec::new();
+            return None;
         }
     }
-    Vec::new()
+    None
 }
 
 /// Opens one interface without access rights, shared read/write, for queries only.
@@ -417,7 +424,7 @@ mod tests {
     #[test]
     #[ignore = "reads the HID devices of this machine"]
     fn print_enumeration() {
-        for (hid_group, members) in group(enumerate()) {
+        for (hid_group, members) in group(enumerate().expect("enumeration failed")) {
             for member in &members {
                 let c = &member.collection;
                 println!(
