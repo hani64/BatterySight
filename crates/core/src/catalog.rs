@@ -221,7 +221,7 @@ pids = [0x0AAA, 0x0ABA]
 kind = "headset"
 engine = "hidpp"
 status = "source-verified"
-source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml (BatterySight issue notes); BatteryHub PR #3470"
+source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml; BatteryHub PR #3470"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 "#;
 
@@ -280,7 +280,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     #[test]
     fn rejects_empty_source() {
         let toml = SAMPLE.replace(
-            "source = \"G HUB pro_headset/pro_x_wireless_headset_battery.xml (BatterySight issue notes); BatteryHub PR #3470\"",
+            "source = \"G HUB pro_headset/pro_x_wireless_headset_battery.xml; BatteryHub PR #3470\"",
             "source = \"\"",
         );
         assert_eq!(

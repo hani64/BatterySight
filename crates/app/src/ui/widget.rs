@@ -1,6 +1,5 @@
 //! The in-taskbar widget: a layered child window of `Shell_TrayWnd` and of every
-//! `Shell_SecondaryTrayWnd`, drawn with `UpdateLayeredWindow` (technique and measurements:
-//! docs/spike/taskbar-results.md).
+//! `Shell_SecondaryTrayWnd`, drawn with `UpdateLayeredWindow`.
 //!
 //! Positioning is event-driven. WinEvent hooks on the taskbars' threads only (not the rest of
 //! Explorer) report when a taskbar or its notification area (`TrayNotifyWnd`) moves or
@@ -11,9 +10,9 @@
 //! on a windowless MTA thread ([`uia_thread`]), queried again only on `TaskbarCreated`,
 //! `WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`, a new secondary taskbar or one that changed width.
 //!
-//! Explorer-directed calls made on the UI thread are only those the spike measured:
-//! `CreateWindowExW` / `DestroyWindow` of the child, `SetWindowPos` on it and
-//! `UpdateLayeredWindow`. Everything else here reads window-manager state locally.
+//! The only Explorer-directed calls made on the UI thread are `CreateWindowExW` /
+//! `DestroyWindow` of the child, `SetWindowPos` on it and `UpdateLayeredWindow`, each
+//! measured to stay bounded. Everything else here reads window-manager state locally.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
