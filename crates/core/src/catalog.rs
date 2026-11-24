@@ -20,8 +20,6 @@ pub struct Quirks {
     pub voltage_curve: Option<String>,
     /// An active battery query wakes the device, so it is only queried on user activity.
     pub query_wakes: bool,
-    /// Minimum seconds between active queries.
-    pub min_query_gap_s: Option<u32>,
 }
 
 /// Engine support for every device of a vendor that has no specific entry.
@@ -310,20 +308,27 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let q = &cat.device(0x046D, 0x0ABA).unwrap().quirks;
         assert!(!q.query_wakes);
         assert_eq!(q.voltage_curve, None);
-        assert_eq!(q.min_query_gap_s, None);
+    }
+
+    #[test]
+    fn min_query_gap_is_not_a_quirk() {
+        let toml = SAMPLE.replace(
+            "quirks = { voltage_curve = \"pro-x-wireless-ghub\" }",
+            "quirks = { min_query_gap_s = 600 }",
+        );
+        assert!(Catalog::parse(&toml).is_err());
     }
 
     #[test]
     fn parses_all_quirks() {
         let toml = SAMPLE.replace(
             "quirks = { voltage_curve = \"pro-x-wireless-ghub\" }",
-            "quirks = { query_wakes = true, min_query_gap_s = 600 }",
+            "quirks = { query_wakes = true, voltage_curve = \"pro-x-wireless-ghub\" }",
         );
         let cat = Catalog::parse(&toml).unwrap();
         let q = &cat.device(0x046D, 0x0ABA).unwrap().quirks;
         assert!(q.query_wakes);
-        assert_eq!(q.min_query_gap_s, Some(600));
-        assert_eq!(q.voltage_curve, None);
+        assert_eq!(q.voltage_curve.as_deref(), Some("pro-x-wireless-ghub"));
     }
 
     #[test]

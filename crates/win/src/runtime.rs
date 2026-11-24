@@ -340,9 +340,7 @@ impl Device {
         let mut changed = false;
         for output in self.hub.handle(input, now) {
             match output {
-                HubOutput::Send {
-                    collection, bytes, ..
-                } => {
+                HubOutput::Send { collection, bytes } => {
                     if self.reactor.write(collection, &bytes)
                         && let Some(trace) = &mut self.trace
                     {

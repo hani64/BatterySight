@@ -137,10 +137,9 @@ struct Expect {
 /// Replays `text` and returns the hub for state checks.
 fn replay(name: &str, text: &str, group: HidGroup) -> Hub {
     let entries = parse(name, text);
-    let receiver = group.collections[0].product.contains("Receiver");
     let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
     let mut now = 0;
-    let mut sent = sends(hub.handle(HubInput::GroupArrived(group), now), receiver);
+    let mut sent = sends(hub.handle(HubInput::GroupArrived(group), now));
     let mut expected = Vec::new();
     for (line, entry) in entries {
         let input = match entry {
@@ -158,30 +157,17 @@ fn replay(name: &str, text: &str, group: HidGroup) -> Hub {
             }
         };
         assert_eq!(sent, expected, "{name}: writes before line {line}");
-        sent.extend(sends(hub.handle(input, now), receiver));
+        sent.extend(sends(hub.handle(input, now)));
     }
     assert_eq!(sent, expected, "{name}: writes at end of transcript");
     hub
 }
 
-/// The writes in `out`. Requests to a receiver itself time out after 1 s,
-/// requests to a device (receiver slot or direct device) after 4 s.
-fn sends(out: Vec<HubOutput>, receiver: bool) -> Vec<(CollectionId, Vec<u8>)> {
+/// The writes in `out`.
+fn sends(out: Vec<HubOutput>) -> Vec<(CollectionId, Vec<u8>)> {
     out.into_iter()
         .filter_map(|o| match o {
-            HubOutput::Send {
-                collection,
-                bytes,
-                timeout_ms,
-            } => {
-                let want = if receiver && bytes[1] == 0xFF {
-                    1_000
-                } else {
-                    4_000
-                };
-                assert_eq!(timeout_ms, want, "{bytes:02X?}");
-                Some((collection, bytes))
-            }
+            HubOutput::Send { collection, bytes } => Some((collection, bytes)),
             HubOutput::StateChanged => None,
         })
         .collect()

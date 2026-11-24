@@ -36,7 +36,6 @@ pub enum HubOutput {
     Send {
         collection: CollectionId,
         bytes: Vec<u8>,
-        timeout_ms: u32,
     },
     /// The snapshot changed during this call.
     StateChanged,
@@ -303,16 +302,11 @@ impl Hub {
                     grant,
                     collection,
                     bytes,
-                    timeout_ms,
                 } => {
                     if self.routes.get(&collection) == Some(&gid)
                         && self.scheduler.admit_send(grant, now)
                     {
-                        pass.out.push(HubOutput::Send {
-                            collection,
-                            bytes,
-                            timeout_ms,
-                        });
+                        pass.out.push(HubOutput::Send { collection, bytes });
                     }
                 }
                 Action::Register { key, caps, initial } => {
@@ -611,7 +605,6 @@ source = "test"
             grant,
             collection,
             bytes: vec![byte],
-            timeout_ms: 1_000,
         }
     }
 
@@ -710,12 +703,10 @@ source = "test"
                 HubOutput::Send {
                     collection: coll(1),
                     bytes: vec![0xA1],
-                    timeout_ms: 1_000,
                 },
                 HubOutput::Send {
                     collection: coll(1),
                     bytes: vec![0xA2],
-                    timeout_ms: 1_000,
                 },
             ]
         );
