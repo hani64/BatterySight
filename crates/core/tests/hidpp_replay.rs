@@ -258,7 +258,9 @@ fn headset_long_only_discovery() {
             name: "PRO X Wireless Gaming Headset",
             kind: DeviceKind::Headset,
             via: Via::Usb,
-            level: Level::Percent(87),
+            // Charging at 3971 mV (ascending 14 %) after the discovery read 68 % discharging:
+            // a charge never reads below the level before it.
+            level: Level::Percent(68),
             millivolts: Some(3971),
             charge: Charge::Charging,
             presence: Presence::Online,

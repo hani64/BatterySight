@@ -2,7 +2,7 @@
 
 use crate::model::{Charge, CoarseLevel, Level};
 
-use super::curves::{self, VoltageCurve};
+use super::curves::{self, ChargeTrack, VoltageCurve};
 
 /// One decoded battery report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,9 +114,10 @@ pub fn decode_1004(p: &[u8]) -> Reading {
 }
 
 /// Feature 0x1F20 (ADC measurement): big-endian mV in `p[0..2]`, flags in `p[2]`.
-/// Flags other than 0x01/0x03/0x07 mean the headset is off or out of range.
+/// Flags other than 0x01/0x03/0x07 mean the headset is off or out of range, which ends the
+/// charge `track` follows.
 // Source: Linux kernel hid-logitech-hidpp `hidpp20_map_adc_measurement_1f20` (facts only).
-pub fn decode_1f20(p: &[u8], curve: VoltageCurve) -> Reading {
+pub fn decode_1f20(p: &[u8], curve: VoltageCurve, track: &mut ChargeTrack) -> Reading {
     let &[hi, lo, flags, ..] = p else {
         return NO_READING;
     };
@@ -124,11 +125,14 @@ pub fn decode_1f20(p: &[u8], curve: VoltageCurve) -> Reading {
         0x01 => Charge::Discharging,
         0x03 => Charge::Charging,
         0x07 => Charge::Full,
-        _ => return NO_READING,
+        _ => {
+            track.reset();
+            return NO_READING;
+        }
     };
     let mv = u16::from_be_bytes([hi, lo]);
     online(
-        Some(Level::Percent(curves::percent(curve, mv))),
+        Some(Level::Percent(track.percent(curve, mv, charge))),
         Some(mv),
         charge,
     )
@@ -288,17 +292,33 @@ mod tests {
         assert_eq!(r.millivolts, Some(3980));
     }
 
+    fn adc(p: &[u8], curve: VoltageCurve) -> Reading {
+        decode_1f20(p, curve, &mut ChargeTrack::default())
+    }
+
     #[test]
     fn adc_discharging_prox() {
         assert_eq!(
-            decode_1f20(&[0x0F, 0x83, 0x01], VoltageCurve::ProXWirelessGhub),
+            adc(&[0x0F, 0x83, 0x01], VoltageCurve::ProXWirelessGhub),
             reading(Some(Level::Percent(87)), Some(3971), Charge::Discharging)
         );
     }
 
     #[test]
+    fn adc_charging_and_full_prox() {
+        assert_eq!(
+            adc(&[0x0F, 0xF5, 0x03], VoltageCurve::ProXWirelessGhub),
+            reading(Some(Level::Percent(52)), Some(4085), Charge::Charging)
+        );
+        assert_eq!(
+            adc(&[0x0F, 0xF5, 0x07], VoltageCurve::ProXWirelessGhub),
+            reading(Some(Level::Percent(100)), Some(4085), Charge::Full)
+        );
+    }
+
+    #[test]
     fn adc_unknown_flags_means_offline() {
-        let r = decode_1f20(&[0x0F, 0x83, 0x0F], VoltageCurve::ProXWirelessGhub);
+        let r = adc(&[0x0F, 0x83, 0x0F], VoltageCurve::ProXWirelessGhub);
         assert!(!r.online);
         assert_eq!(r.level, None);
         assert_eq!(r.charge, Charge::Unknown);
@@ -308,7 +328,7 @@ mod tests {
     fn adc_zero_payload_means_offline() {
         // What the PRO X Wireless dongle broadcasts when the headset is switched off (owner
         // capture 2026-11-23): 0 mV, flags 0x00.
-        let r = decode_1f20(&[0x00, 0x00, 0x00], VoltageCurve::ProXWirelessGhub);
+        let r = adc(&[0x00, 0x00, 0x00], VoltageCurve::ProXWirelessGhub);
         assert!(!r.online);
         assert_eq!(r.level, None);
         assert_eq!(r.millivolts, None);
@@ -362,7 +382,7 @@ mod tests {
         assert_eq!(decode_1001(&[0x0F, 0x8C]), NO_READING);
         assert_eq!(decode_1004(&[64, 4]), NO_READING);
         assert_eq!(
-            decode_1f20(&[0x0F, 0x83], VoltageCurve::HeadsetControlG633),
+            adc(&[0x0F, 0x83], VoltageCurve::HeadsetControlG633),
             NO_READING
         );
         assert_eq!(decode_reg_0d(&[55]), NO_READING);
