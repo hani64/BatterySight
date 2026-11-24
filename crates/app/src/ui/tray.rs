@@ -1,8 +1,8 @@
 //! Tray-icon fallback: one notification-area icon per device, or one placeholder icon when
 //! there is none, so the menu stays reachable.
 //!
-//! Runs on the UI thread. `Shell_NotifyIconW` is one of the bounded Explorer calls the spike
-//! allows on that thread (up to 32 ms during an Explorer restart).
+//! Runs on the UI thread. `Shell_NotifyIconW` is one of the bounded Explorer calls allowed
+//! on that thread (measured at up to 32 ms during an Explorer restart).
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};

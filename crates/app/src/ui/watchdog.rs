@@ -1,9 +1,9 @@
 //! Widget watchdog.
 //!
-//! The widget's thread shares its input queue with Explorer's taskbar thread. The spike
-//! showed that a click on the widget while that thread is stalled freezes all mouse input to
-//! the taskbar, and that neither `WM_NULL` round trips nor `IsHungAppWindow` notice. So the
-//! widget thread stores a heartbeat ([`beat`]) on every message-loop iteration and on a
+//! The widget's thread shares its input queue with Explorer's taskbar thread. A click on the
+//! widget while that thread is stalled freezes all mouse input to the taskbar, and neither
+//! `WM_NULL` round trips nor `IsHungAppWindow` notice. So the widget thread stores a
+//! heartbeat ([`beat`]) on every message-loop iteration and on a
 //! 500 ms timer, and a thread that owns no windows checks it every 500 ms. When the beat has
 //! not changed for 1.5 s while Explorer's taskbar thread still answers (a busy Explorer is
 //! not our stall), or for 5 s whatever Explorer does (its taskbar thread may itself be

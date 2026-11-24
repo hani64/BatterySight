@@ -1,4 +1,4 @@
-//! Decides when anything may be sent to a device (design §5.1).
+//! Decides when anything may be sent to a device.
 //!
 //! Engines never query on their own: they ask for a [`Grant`] with the event
 //! that justifies it, then call [`Scheduler::admit_send`] before every report

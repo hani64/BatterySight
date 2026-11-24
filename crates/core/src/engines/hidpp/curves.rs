@@ -40,7 +40,8 @@ const HEADSETCONTROL_G633: &[(u16, u8)] = &[
     (3150, 0),
 ];
 
-// Source: G HUB-derived PRO X Wireless curve, verified against G HUB 2026.7 (design §10).
+// Source: G HUB `pro_headset/pro_x_wireless_headset_battery.xml` discharge curve, matched
+// against G HUB 2026.7.
 const PRO_X_WIRELESS_GHUB: &[(u16, u8)] = &[
     (4102, 100),
     (4046, 95),

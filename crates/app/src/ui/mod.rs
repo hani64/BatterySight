@@ -37,9 +37,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::time::Duration;
 
-use batterysight_core::model::{
-    Charge, CoarseLevel, DeviceKind, DeviceState, Level, Presence, Verification,
-};
+use batterysight_core::model::{Charge, CoarseLevel, DeviceKind, DeviceState, Level, Presence};
 use batterysight_win::runtime::{self, RuntimeHandle};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -110,11 +108,6 @@ fn view(s: &DeviceState) -> DeviceView {
     if charging {
         tooltip.push_str(" charging");
     }
-    tooltip.push_str(match s.verification {
-        Verification::CommunityTested => " (community-tested)",
-        Verification::SourceVerified => " (not yet tested on hardware)",
-        Verification::HardwareTested | Verification::Generic => "",
-    });
     DeviceView {
         glyph,
         text,
@@ -650,29 +643,19 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_labels_status() {
+    fn tooltip_omits_verification_status() {
         let with = |verification| DeviceState {
             verification,
             ..percent("PRO X", 40)
         };
-        let tips: Vec<String> = [
+        for status in [
             Verification::HardwareTested,
             Verification::SourceVerified,
             Verification::CommunityTested,
             Verification::Generic,
-        ]
-        .into_iter()
-        .map(|status| views(&[with(status)])[0].tooltip.clone())
-        .collect();
-        assert_eq!(
-            tips,
-            [
-                "PRO X — 40%",
-                "PRO X — 40% (not yet tested on hardware)",
-                "PRO X — 40% (community-tested)",
-                "PRO X — 40%",
-            ]
-        );
+        ] {
+            assert_eq!(views(&[with(status)])[0].tooltip, "PRO X — 40%");
+        }
     }
 
     #[test]
