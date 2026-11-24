@@ -400,27 +400,55 @@ source = "test"
             cat.family(0x046D, EngineKind::Hidpp).unwrap().status,
             Verification::SourceVerified
         );
-        let dev = cat.device(0x046D, 0x0ABA).unwrap();
-        assert_eq!(dev.name, "PRO X Wireless Gaming Headset");
-        assert_eq!(
-            dev.quirks.voltage_curve.as_deref(),
-            Some("pro-x-wireless-ghub")
-        );
-        assert!(std::ptr::eq(dev, cat.device(0x046D, 0x0AAA).unwrap()));
+        // The owner's headset (0ABA) is hardware-tested; the other PRO X Wireless dongle is not.
+        let tested = cat.device(0x046D, 0x0ABA).unwrap();
+        let other = cat.device(0x046D, 0x0AAA).unwrap();
+        assert!(!std::ptr::eq(tested, other));
+        assert_eq!(tested.status, Verification::HardwareTested);
+        assert_eq!(other.status, Verification::SourceVerified);
+        for dev in [tested, other] {
+            assert_eq!(dev.name, "PRO X Wireless Gaming Headset");
+            assert_eq!(dev.kind, DeviceKind::Headset);
+            assert_eq!(
+                dev.quirks.voltage_curve.as_deref(),
+                Some("pro-x-wireless-ghub")
+            );
+        }
+        // The owner's mouse behind its LIGHTSPEED receiver, by wireless PID only.
+        let mouse = cat.device_by_wpid(0x046D, 0x4093).unwrap();
+        assert_eq!(mouse.name, "PRO X Superlight");
+        assert_eq!(mouse.kind, DeviceKind::Mouse);
+        assert_eq!(mouse.status, Verification::HardwareTested);
+        assert_eq!(cat.device(0x046D, 0xC547), None);
 
         let mut families = std::collections::HashSet::new();
         for f in cat.families() {
             assert!(!f.source.trim().is_empty(), "{f:?} has no source");
             assert!(families.insert((f.vid, f.engine)), "duplicate family {f:?}");
         }
-        let mut pids = std::collections::HashSet::new();
+        let (mut pids, mut wpids) = (
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
         for d in cat.devices() {
             assert!(!d.source.trim().is_empty(), "{} has no source", d.name);
-            assert!(!d.pids.is_empty(), "{} has no pids", d.name);
+            assert!(
+                !d.pids.is_empty() || !d.wpids.is_empty(),
+                "{} has no pids",
+                d.name
+            );
             for &pid in &d.pids {
                 assert!(
                     pids.insert((d.vid, pid)),
                     "{:#06X}:{pid:#06X} listed twice ({})",
+                    d.vid,
+                    d.name
+                );
+            }
+            for &wpid in &d.wpids {
+                assert!(
+                    wpids.insert((d.vid, wpid)),
+                    "{:#06X} wireless {wpid:#06X} listed twice ({})",
                     d.vid,
                     d.name
                 );
