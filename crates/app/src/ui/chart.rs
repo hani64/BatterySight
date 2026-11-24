@@ -84,16 +84,23 @@ fn height(level: Level) -> u8 {
 
 /// The plot in pixel columns (`x` maps a time to its column), at most one point per
 /// column, so drawing is bounded by the chart's width however many samples there are.
-/// Within a line, a later point in the same column replaces the earlier one; a line's
-/// points in columns an earlier line already took are left out (a line left without
-/// points is dropped). Charging spans clamped to `left..right` that touch or overlap are
-/// merged.
+/// Within a column, a later point replaces the earlier one. A line that starts in the
+/// column the line before it ended in continues that line: a gap narrower than a column
+/// cannot be drawn, and dropping the point would open a false one. Charging spans
+/// clamped to `left..right` that touch or overlap are merged.
 fn columns(plot: &Plot, x: impl Fn(u64) -> i32, left: i32, right: i32) -> Columns {
     let mut out = Columns::default();
     // The column of the last point kept, in any line.
     let mut taken: Option<i32> = None;
     for line in &plot.lines {
-        let mut points: Vec<(i32, u8)> = Vec::new();
+        let joins = line
+            .first()
+            .is_some_and(|&(t, _)| taken.is_some_and(|c| x(t) <= c));
+        let mut points = if joins {
+            out.lines.pop().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         for &(t, p) in line {
             let column = x(t);
             if taken.is_some_and(|c| column <= c) {
@@ -518,9 +525,9 @@ mod tests {
         let plot = Plot {
             lines: vec![
                 vec![(0, 90), (1, 89), (4, 88), (10, 80)],
-                // Starts in the column the line before ended in.
+                // Starts in the column the line before ended in: continues it.
                 vec![(11, 79), (20, 70)],
-                // Wholly in a column already taken: dropped.
+                // Wholly in that column: joins it too, the later value winning.
                 vec![(21, 69)],
                 vec![(40, 60)],
             ],
@@ -528,11 +535,36 @@ mod tests {
             drawn: true,
         };
         let c = columns(&plot, |t| (t / 5) as i32, 0, 20);
-        assert_eq!(
-            c.lines,
-            [vec![(0, 88), (2, 80)], vec![(4, 70)], vec![(8, 60)]]
-        );
+        assert_eq!(c.lines, [vec![(0, 88), (2, 79), (4, 69)], vec![(8, 60)]]);
         // Pixel spans (0,0) empty, (1,2) and (2,3) merge, (6,20) clamped to the right edge.
         assert_eq!(c.charging, [(1, 3), (6, 20)]);
+    }
+
+    #[test]
+    fn a_nap_within_a_column_leaves_no_gap() {
+        // 2 min per column. The device slept for a minute within one column (the first
+        // line ends at its asleep sample), then was in use for 30 min at the same level.
+        let samples = [
+            on(0, 90),
+            on(8, 89),
+            s(
+                10,
+                Some(Level::Percent(89)),
+                Presence::Asleep,
+                Charge::Discharging,
+            ),
+            on(11, 89),
+            s(
+                42,
+                Some(Level::Percent(89)),
+                Presence::Asleep,
+                Charge::Discharging,
+            ),
+        ];
+        let p = plot(&samples, at(0), at(60));
+        assert_eq!(p.lines.len(), 2);
+        let c = columns(&p, |t| ((t - at(0)) / (2 * MIN)) as i32, 0, 30);
+        // One line: the session after the nap is drawn, not a dot after a gap.
+        assert_eq!(c.lines, [vec![(0, 90), (4, 89), (5, 89), (21, 89)]]);
     }
 }

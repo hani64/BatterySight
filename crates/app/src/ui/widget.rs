@@ -93,7 +93,7 @@ struct Widget {
 }
 
 /// The device under the cursor on a widget ([`Widgets::hit`]), in screen coordinates.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Hover {
     pub key: DeviceKey,
     /// The device's columns of the widget.

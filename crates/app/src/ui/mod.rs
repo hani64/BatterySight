@@ -127,24 +127,43 @@ impl DeviceView {
     }
 }
 
-/// The devices to show: in the user's order, hidden and offline devices left out. `kept`:
-/// the history, for the time left; `now`: the monotonic time of the readings; `unix_now`:
-/// the wall-clock time of the samples.
-pub fn views(
-    states: &[DeviceState],
-    settings: &Settings,
-    kept: &HashMap<DeviceKey, Vec<Sample>>,
+/// What the tooltips of tray icons are made from: the hover card's text
+/// ([`card::card_text`]).
+struct Tips<'a> {
+    /// The history, for the time left.
+    kept: &'a HashMap<DeviceKey, Vec<Sample>>,
+    /// The monotonic time of the readings.
     now: Ms,
+    /// The wall-clock time of the samples.
     unix_now: u64,
-) -> Vec<DeviceView> {
+}
+
+impl<'a> Tips<'a> {
+    fn new(kept: &'a HashMap<DeviceKey, Vec<Sample>>) -> Tips<'a> {
+        Tips {
+            kept,
+            now: tick_ms(),
+            unix_now: unix_now_ms(),
+        }
+    }
+
+    /// The card's lines of `s`, one per line.
+    fn text(&self, s: &DeviceState) -> String {
+        let samples = self.kept.get(&s.key).map_or(&[][..], Vec::as_slice);
+        let left = history::time_left(samples, self.unix_now);
+        card::card_text(s, left, self.now).join("\n")
+    }
+}
+
+/// The devices to show: in the user's order, hidden and offline devices left out. With
+/// `tips` (tray icons show them) they get their tooltips; without, those stay empty.
+fn views(states: &[DeviceState], settings: &Settings, tips: Option<&Tips>) -> Vec<DeviceView> {
     settings
         .ordered(states)
         .into_iter()
         .filter(|s| s.presence != Presence::Offline && !settings.hidden.contains(&s.key))
         .map(|s| {
-            let samples = kept.get(&s.key).map_or(&[][..], Vec::as_slice);
-            let left = history::time_left(samples, unix_now);
-            let tooltip = card::card_text(s, left, now).join("\n");
+            let tooltip = tips.map(|t| t.text(s)).unwrap_or_default();
             view(s, settings.threshold(&s.key), tooltip)
         })
         .collect()
@@ -325,23 +344,25 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
     let unix_now = unix_now_ms();
     let mut history = HashMap::new();
     history::add(&mut history, samples, unix_now);
-    let views = views(&states, &settings, &history, tick_ms(), unix_now);
+    // Without tooltips: the widget shows none.
+    let plain = views(&states, &settings, None);
     let widgets = match options.tray {
         Some(reason) => Err(reason),
         None => {
-            Widgets::new(&views, light, &settings.monitors).map_err(|_| TrayReason::CreateFailed)
+            Widgets::new(&plain, light, &settings.monitors).map_err(|_| TrayReason::CreateFailed)
         }
     };
-    let (surface, tray_reason) = match widgets {
+    let (surface, tray_reason, views) = match widgets {
         Ok(widgets) => {
             start_widget_checks(host);
-            (Surface::Widgets(widgets), None)
+            (Surface::Widgets(widgets), None, plain)
         }
         Err(reason) => {
             fallback::trace(reason);
+            let views = views(&states, &settings, Some(&Tips::new(&history)));
             let mut tray = Tray::new(host);
             tray.show(&views, light);
-            (Surface::Tray(tray), Some(reason))
+            (Surface::Tray(tray), Some(reason), views)
         }
     };
     let mut ui = Ui {
@@ -441,12 +462,16 @@ impl Ui {
     fn handle(&mut self, msg: u32, wp: WPARAM) {
         match msg {
             WM_APP_CHANGED => self.changed(),
-            WM_APP_LAYOUT => self.show(),
+            WM_APP_LAYOUT => {
+                self.show();
+                self.follow_hover(None);
+            }
             WM_APP_CLOCKS => {
                 if let Surface::Widgets(w) = &mut self.surface {
                     w.take_clocks();
                 }
                 self.show();
+                self.follow_hover(None);
             }
             WM_APP_TASKBAR_CREATED => {
                 // The taskbar the card sat above is gone.
@@ -536,9 +561,7 @@ impl Ui {
         let states = read_snapshot(&self.runtime);
         self.record(&states);
         self.update_views(&states);
-        if self.card.shown().is_some() {
-            self.show_card(&states);
-        }
+        self.follow_hover(Some(&states));
         let alerts = self.alerts.check(&states, &self.settings);
         let Some(first) = alerts.first() else {
             return;
@@ -548,8 +571,14 @@ impl Ui {
             Surface::Tray(t) => t.icon_id(&first.key),
             Surface::Widgets(_) => None,
         };
-        let view = self.views.iter().find(|v| v.key == first.key);
-        self.notifier.show(&alerts, on, view, self.light);
+        let mut view = self.views.iter().find(|v| v.key == first.key).cloned();
+        // A temporary icon (widget mode) needs the tooltip the widget's views lack.
+        if let Some(v) = view.as_mut().filter(|v| v.tooltip.is_empty())
+            && let Some(s) = states.iter().find(|s| s.key == v.key)
+        {
+            v.tooltip = Tips::new(&self.history).text(s);
+        }
+        self.notifier.show(&alerts, on, view.as_ref(), self.light);
     }
 
     /// Records the samples `states` give (hidden devices too).
@@ -593,15 +622,9 @@ impl Ui {
     }
 
     /// Shows the views of `states` if they changed; the widgets only if they look
-    /// different (they show no tooltips).
+    /// different (they show no tooltips, so their views have none).
     fn update_views(&mut self, states: &[DeviceState]) {
-        let views = views(
-            states,
-            &self.settings,
-            &self.history,
-            tick_ms(),
-            unix_now_ms(),
-        );
+        let views = self.views_of(states, matches!(self.surface, Surface::Tray(_)));
         if views == self.views {
             return;
         }
@@ -616,14 +639,25 @@ impl Ui {
         self.show();
     }
 
+    /// The views of `states`; with `tips` (for tray icons), their tooltips too.
+    fn views_of(&self, states: &[DeviceState], tips: bool) -> Vec<DeviceView> {
+        let tips = tips.then(|| Tips::new(&self.history));
+        views(states, &self.settings, tips.as_ref())
+    }
+
     /// The cursor moved on a widget. On a device other than the one hovered so far, the
-    /// card switches to it at once if one shows, else shows [`HOVER_MS`] later.
+    /// card switches to it at once if one shows, else shows [`HOVER_MS`] later. On the
+    /// same device, a shown card follows a widget that moved.
     fn hover(&mut self) {
         let Some(hover) = self.hit() else {
             self.end_hover();
             return;
         };
         if self.hover.as_ref().is_some_and(|h| h.key == hover.key) {
+            if self.card.shown().is_some() && self.hover.as_ref() != Some(&hover) {
+                self.hover = Some(hover);
+                self.show_card(&read_snapshot(&self.runtime));
+            }
             return;
         }
         self.hover = Some(hover);
@@ -632,6 +666,28 @@ impl Ui {
         } else {
             // SAFETY: our own window; setting an existing timer id restarts it.
             unsafe { SetTimer(Some(self.host), HOVER_TIMER, HOVER_MS, None) };
+        }
+    }
+
+    /// After a new snapshot (`fresh`) or a layout: a shown card follows the device under
+    /// the cursor, repainted with the new readings or moved with its widget; a hover the
+    /// cursor has left ends (should its `WM_MOUSELEAVE` have been lost).
+    fn follow_hover(&mut self, fresh: Option<&[DeviceState]>) {
+        if self.hover.is_none() {
+            return;
+        }
+        let Some(hover) = self.hit() else {
+            self.end_hover();
+            return;
+        };
+        let moved = self.hover.as_ref() != Some(&hover);
+        if self.card.shown().is_none() || (fresh.is_none() && !moved) {
+            return;
+        }
+        self.hover = Some(hover);
+        match fresh {
+            Some(states) => self.show_card(states),
+            None => self.show_card(&read_snapshot(&self.runtime)),
         }
     }
 
@@ -725,6 +781,8 @@ impl Ui {
             let _ = KillTimer(Some(self.host), HEARTBEAT_TIMER);
             let _ = KillTimer(Some(self.host), WIDGET_CHECK_TIMER);
         }
+        // Tray icons show tooltips, which the widget's views lack.
+        self.views = self.views_of(&read_snapshot(&self.runtime), true);
         let mut tray = Tray::new(self.host);
         tray.show(&self.views, self.light);
         // Dropping the widgets destroys their windows and hooks.
@@ -1273,9 +1331,9 @@ mod tests {
     use batterysight_core::model::{Source, Verification, Via};
     use batterysight_core::settings::Threshold;
 
-    /// The views of `states` with `settings`, without history, at time 0.
+    /// The views of `states` with `settings`, without tooltips (as for the widget).
     fn shown(states: &[DeviceState], settings: &Settings) -> Vec<DeviceView> {
-        views(states, settings, &HashMap::new(), 0, 0)
+        views(states, settings, None)
     }
 
     fn all(states: &[DeviceState]) -> Vec<DeviceView> {
@@ -1433,18 +1491,20 @@ mod tests {
                 sample(T + 2 * HOUR, 80),
             ],
         );
-        let v = views(
-            std::slice::from_ref(&s),
-            &Settings::default(),
-            &kept,
-            5 * 60_000,
-            T + 2 * HOUR,
-        );
+        let tips = Tips {
+            kept: &kept,
+            now: 5 * 60_000,
+            unix_now: T + 2 * HOUR,
+        };
+        let one = std::slice::from_ref(&s);
+        let v = views(one, &Settings::default(), Some(&tips));
         // 10 % in 2 h: 80 % lasts 16 h.
         assert_eq!(
             v[0].tooltip,
             "M\nBattery: 80%\nUpdated 5 min ago\nTime left: about 16 h"
         );
+        // The widget shows no tooltips: none is made for it.
+        assert_eq!(views(one, &Settings::default(), None)[0].tooltip, "");
     }
 
     #[test]

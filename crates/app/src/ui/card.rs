@@ -68,9 +68,8 @@ impl Card {
             return;
         };
         let size = painter.size();
-        let center = (hover.device.left + hover.device.right) / 2;
         let gap = 8 * hover.dpi as i32 / 96;
-        let at = place(size, center, hover.bar, monitor, work, gap);
+        let at = place(size, hover.device, hover.bar, monitor, work, gap);
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -215,17 +214,29 @@ fn age_text(ms: u64) -> String {
     }
 }
 
-/// Where a card of `size` goes: centred on `center_x`, `gap` above the taskbar `bar` (below
-/// it when the taskbar is in the top half of its `monitor`), kept inside the monitor's
-/// `work` area.
-fn place(size: SIZE, center_x: i32, bar: RECT, monitor: RECT, work: RECT, gap: i32) -> POINT {
-    let at_top = bar.top + bar.bottom < monitor.top + monitor.bottom;
-    let y = if at_top {
-        bar.bottom + gap
+/// Where a card of `size` goes for the `device` (its columns of a widget on the taskbar
+/// `bar`): `gap` above the taskbar and centred on the device (below it when the taskbar is
+/// in the top half of its `monitor`); beside a vertical taskbar, on the monitor's side of
+/// it, level with the device. Kept inside the monitor's `work` area.
+fn place(size: SIZE, device: RECT, bar: RECT, monitor: RECT, work: RECT, gap: i32) -> POINT {
+    let vertical = bar.bottom - bar.top > bar.right - bar.left;
+    let (x, y) = if vertical {
+        let at_left = bar.left + bar.right < monitor.left + monitor.right;
+        let x = if at_left {
+            bar.right + gap
+        } else {
+            bar.left - gap - size.cx
+        };
+        (x, (device.top + device.bottom) / 2 - size.cy / 2)
     } else {
-        bar.top - gap - size.cy
+        let at_top = bar.top + bar.bottom < monitor.top + monitor.bottom;
+        let y = if at_top {
+            bar.bottom + gap
+        } else {
+            bar.top - gap - size.cy
+        };
+        ((device.left + device.right) / 2 - size.cx / 2, y)
     };
-    let x = center_x - size.cx / 2;
     POINT {
         x: x.clamp(work.left, (work.right - size.cx).max(work.left)),
         y: y.clamp(work.top, (work.bottom - size.cy).max(work.top)),
@@ -337,21 +348,67 @@ mod tests {
         let monitor = rect(1920, 0, 3840, 1080);
         let bar = rect(1920, 1032, 3840, 1080);
         let work = rect(1920, 0, 3840, 1032);
-        let at = |x| place(size, x, bar, monitor, work, 8);
+        // The device's columns of a widget on `bar`, centred on `x`.
+        let device = |x| rect(x - 20, 1032, x + 20, 1080);
+        let at = |x| place(size, device(x), bar, monitor, work, 8);
         assert_eq!(at(3000), POINT { x: 2850, y: 824 });
         // Kept on the monitor of the taskbar.
         assert_eq!(at(3800), POINT { x: 3540, y: 824 });
         assert_eq!(at(1930), POINT { x: 1920, y: 824 });
         // Auto-hide: the work area is the whole monitor; still above the taskbar.
         assert_eq!(
-            place(size, 3000, bar, monitor, monitor, 8),
+            place(size, device(3000), bar, monitor, monitor, 8),
             POINT { x: 2850, y: 824 }
         );
         // A taskbar at the top: below it.
         let top = rect(1920, 0, 3840, 48);
         assert_eq!(
-            place(size, 3000, top, monitor, rect(1920, 48, 3840, 1080), 8),
+            place(
+                size,
+                rect(2980, 0, 3020, 48),
+                top,
+                monitor,
+                rect(1920, 48, 3840, 1080),
+                8
+            ),
             POINT { x: 2850, y: 56 }
+        );
+    }
+
+    #[test]
+    fn card_sits_beside_a_vertical_taskbar_next_to_the_device() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let size = SIZE { cx: 300, cy: 200 };
+        let monitor = rect(0, 0, 1920, 1080);
+        // Left: right of the taskbar, centred on the device's height.
+        let left = rect(0, 0, 48, 1080);
+        let work = rect(48, 0, 1920, 1080);
+        assert_eq!(
+            place(size, rect(0, 500, 48, 540), left, monitor, work, 8),
+            POINT { x: 56, y: 420 }
+        );
+        // Kept inside the work area near the bottom.
+        assert_eq!(
+            place(size, rect(0, 1000, 48, 1060), left, monitor, work, 8),
+            POINT { x: 56, y: 880 }
+        );
+        // Right: left of the taskbar.
+        let right = rect(1872, 0, 1920, 1080);
+        assert_eq!(
+            place(
+                size,
+                rect(1872, 20, 1920, 60),
+                right,
+                monitor,
+                rect(0, 0, 1872, 1080),
+                8
+            ),
+            POINT { x: 1564, y: 0 }
         );
     }
 }
