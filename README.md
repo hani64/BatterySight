@@ -33,6 +33,8 @@ Otherwise it only listens. Opening the menu never queries; it shows the last kno
 
 BatterySight collects no telemetry. Its only network call is the update check (arriving in milestone 4).
 
+Settings and battery history live in `%LOCALAPPDATA%\BatterySight` (`settings.toml`, `history.tsv`) and contain device ids, such as unit ids, as keys; they stay on your PC.
+
 For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it write every HID++ frame it sends and receives to `%LOCALAPPDATA%\BatterySight\sends.log`, along with when audio starts and stops on a device or cannot be watched (`audio` lines) and why it switched to tray icons (`ui fallback` lines). Tracing is off by default. The frames include device unit ids and other serial-like values, so review the file before sharing it.
 
 ## Usage

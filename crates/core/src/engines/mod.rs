@@ -5,6 +5,7 @@ pub mod hidpp;
 use crate::catalog::Catalog;
 use crate::engine::Engine;
 use crate::hid::{Collection, HidGroup};
+use crate::model::DeviceKey;
 
 use hidpp::HidppEngine;
 
@@ -26,6 +27,12 @@ pub fn wants(group: &HidGroup) -> bool {
 /// collection of a wanted group (such as a headset's volume keys) never enter the process.
 pub fn reads(collection: &Collection) -> bool {
     HidppEngine::reads(collection)
+}
+
+/// Whether two devices present at once can be registered under the same `key`: a key an
+/// engine builds without a serial or unit id. The hub tells such devices apart.
+pub fn shared_key(key: &DeviceKey) -> bool {
+    HidppEngine::is_fallback_key(key)
 }
 
 #[cfg(test)]
