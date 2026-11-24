@@ -26,33 +26,44 @@ pub enum Trigger {
     Resume,
     /// Explicit "Refresh now" command.
     RefreshNow,
-    /// User or audio activity observed on the device, or a charging device's timed read (the
-    /// hub asks it when the gap allows, without activity). Refused while the device is asleep
-    /// and never wakes it: a headset's dongle plays audio with the headset off, so activity
-    /// proves nothing about the device itself.
+    /// Audio on the physical device or an opted-in charging check. Cannot wake an
+    /// asleep device: audio can still play to a dongle whose headset is off.
     Activity,
+    /// Fresh activity reported by the device itself.
+    Awake,
 }
 
 /// How many [`Trigger::Rediscovery`] grants a key gets after each arrival grant.
 pub const REDISCOVERIES: u8 = 3;
 
-/// Gap between `Activity` grants of a device without a user gap: 10 minutes, or the
+/// Gap between interval grants without a user setting: 10 minutes, or the
 /// device's `min_query_gap_ms` when that is longer.
 pub const DEFAULT_INTERVAL_MS: Ms = 600_000;
 
 /// What an engine declares about a registered device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capabilities {
-    /// The device reports battery on its own; asking after activity is pointless.
+    /// The device reports battery changes on its own and doesn't need interval reads.
     pub pushes_battery: bool,
     /// A query wakes the device: only observed activity may justify one.
     pub query_wakes: bool,
-    /// The device's minimum time since the last granted request (any trigger) or noted read
-    /// ([`Scheduler::note_read`]) before an `Activity` grant; the other triggers ignore it.
-    /// A user gap ([`Scheduler::set_user_gaps`]), or [`DEFAULT_INTERVAL_MS`] without one,
-    /// may lengthen it, never shorten it; the first grant after a wake uses it alone. Zero
-    /// means no `Activity` grant at all.
+    /// Audible activity on this device's physical container permits a read.
+    pub audio: bool,
+    /// A fresh input report from this device permits a read.
+    pub awake_signal: bool,
+    /// Being online and charging permits a timed read, even without activity.
+    pub charging: bool,
+    /// Minimum time since the last grant or noted read before any interval grant.
+    /// A user gap or [`DEFAULT_INTERVAL_MS`] may lengthen it; the first grant
+    /// after a wake uses this minimum alone. Zero disables all interval grants.
     pub min_query_gap_ms: Ms,
+}
+
+#[derive(Clone, Copy)]
+enum ActivitySource {
+    Audio,
+    Awake,
+    Charging,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,9 +110,34 @@ struct DeviceSlot {
     rediscoveries: u8,
     asleep: bool,
     /// The device just registered or woke, and no grant other than a `Connected` one has
-    /// been issued since: its latest reading is a wake reading, so the next `Activity`
-    /// grant waits only the engine minimum, not the user gap.
+    /// been issued since: the next interval grant waits only the engine minimum,
+    /// not the user gap.
     woke: bool,
+}
+
+impl DeviceSlot {
+    fn interval_ready_at(
+        &self,
+        source: ActivitySource,
+        user_gap: impl FnOnce() -> Option<Ms>,
+    ) -> Option<Ms> {
+        let caps = self.caps;
+        let allowed = match source {
+            ActivitySource::Audio => caps.audio,
+            ActivitySource::Awake => caps.awake_signal,
+            ActivitySource::Charging => caps.charging,
+        };
+        let min = caps.min_query_gap_ms;
+        if !allowed || caps.pushes_battery || self.asleep || min == 0 {
+            return None;
+        }
+        let gap = if self.woke {
+            min
+        } else {
+            min.max(user_gap().unwrap_or(DEFAULT_INTERVAL_MS))
+        };
+        Some(self.last_grant_ms.map_or(0, |last| last.saturating_add(gap)))
+    }
 }
 
 /// What is left of an issued grant.
@@ -137,7 +173,7 @@ pub struct Scheduler {
     grants: HashMap<GrantId, OpenGrant>,
     /// Id of the next grant; ids are never reused.
     next_id: u32,
-    /// User gaps between `Activity` grants, by device key; kept across registrations.
+    /// User gaps between interval grants, by device key; kept across registrations.
     user_gaps: HashMap<DeviceKey, Ms>,
 }
 
@@ -169,6 +205,13 @@ impl Scheduler {
             });
     }
 
+    /// Restores the current registrant's capabilities without changing the read history.
+    pub(crate) fn set_capabilities(&mut self, key: &DeviceKey, caps: Capabilities) {
+        if let Some(slot) = self.devices.get_mut(key) {
+            slot.caps = caps;
+        }
+    }
+
     /// Lets `key` have another arrival grant, and with it [`REDISCOVERIES`] more
     /// rediscovery grants: for a group that registered no device, a resume or refresh
     /// starts over as an arrival.
@@ -189,7 +232,7 @@ impl Scheduler {
         self.grants.retain(|_, grant| grant.subject != *key);
     }
 
-    /// Replaces every user gap between `Activity` grants (key → ms). A gap below the
+    /// Replaces every user gap between interval grants (key → ms). A gap below the
     /// device's `min_query_gap_ms` counts as the minimum; a key without one uses
     /// [`DEFAULT_INTERVAL_MS`], or the minimum if that is longer.
     pub fn set_user_gaps(&mut self, gaps: HashMap<DeviceKey, Ms>) {
@@ -204,10 +247,34 @@ impl Scheduler {
         trigger: Trigger,
         now: Ms,
     ) -> Option<Grant> {
-        // A clock that went backwards counts as no time passed.
-        if trigger == Trigger::Activity && self.activity_ready_at(key).is_none_or(|at| now < at) {
-            return None;
-        }
+        self.request_with_source(key, owner, trigger, ActivitySource::Audio, now)
+    }
+
+    /// Charging retains the existing Activity grant for the engine, but does not
+    /// borrow the audio eligibility that normally backs that trigger.
+    pub(crate) fn request_charging(
+        &mut self,
+        key: &DeviceKey,
+        owner: GroupId,
+        now: Ms,
+    ) -> Option<Grant> {
+        self.request_with_source(
+            key,
+            owner,
+            Trigger::Activity,
+            ActivitySource::Charging,
+            now,
+        )
+    }
+
+    fn request_with_source(
+        &mut self,
+        key: &DeviceKey,
+        owner: GroupId,
+        trigger: Trigger,
+        activity_source: ActivitySource,
+        now: Ms,
+    ) -> Option<Grant> {
         let slot = self.devices.get_mut(key)?;
         let caps = slot.caps;
         let allowed = match trigger {
@@ -215,8 +282,15 @@ impl Scheduler {
             Trigger::Rediscovery => !caps.query_wakes && slot.rediscoveries < REDISCOVERIES,
             Trigger::Connected => !caps.query_wakes,
             Trigger::Resume | Trigger::RefreshNow => !caps.query_wakes && !slot.asleep,
-            // Checked above.
-            Trigger::Activity => true,
+            Trigger::Activity | Trigger::Awake => {
+                let source = if trigger == Trigger::Awake {
+                    ActivitySource::Awake
+                } else {
+                    activity_source
+                };
+                slot.interval_ready_at(source, || self.user_gaps.get(key).copied())
+                    .is_some_and(|at| now >= at)
+            }
         };
         if !allowed {
             return None;
@@ -229,7 +303,8 @@ impl Scheduler {
         if trigger != Trigger::Connected {
             slot.woke = false;
         }
-        // Only a push, a link-up or a successful read wakes an asleep device.
+        // A link-up can clear asleep itself; an Awake grant requires the hub to
+        // have already validated the signal and marked the device awake.
         match trigger {
             Trigger::Arrival => {
                 slot.arrival_used = true;
@@ -240,14 +315,14 @@ impl Scheduler {
                 slot.woke |= slot.asleep;
                 slot.asleep = false;
             }
-            Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => {}
+            Trigger::Resume | Trigger::RefreshNow | Trigger::Activity | Trigger::Awake => {}
         }
 
         let (max_requests, duration) = match trigger {
             Trigger::Arrival | Trigger::Rediscovery | Trigger::Connected => {
                 (self.policy.discovery_budget, self.policy.discovery_ms)
             }
-            Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => {
+            Trigger::Resume | Trigger::RefreshNow | Trigger::Activity | Trigger::Awake => {
                 (self.policy.read_budget, self.policy.read_ms)
             }
         };
@@ -315,38 +390,25 @@ impl Scheduler {
         self.devices.get(key).is_some_and(|slot| slot.asleep)
     }
 
-    /// When `key` may next get an [`Trigger::Activity`] grant: its gap after its last grant
-    /// or read (at once without one). The gap is the larger of `min_query_gap_ms` and the
-    /// key's user gap ([`DEFAULT_INTERVAL_MS`] without one), or just `min_query_gap_ms` while
-    /// the latest reading is a wake reading.
-    /// `None` while no activity can justify a query: the device is unknown, pushes its
-    /// battery, is asleep, or declares no gap (the gap is the only limit on activity reads,
-    /// so a device without one gets none).
+    /// When audio can next justify a [`Trigger::Activity`] grant. There is no
+    /// deadline for a device that disallows audio, pushes, is asleep or has no gap.
     pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
-        let slot = self.devices.get(key)?;
-        let min = slot.caps.min_query_gap_ms;
-        if slot.caps.pushes_battery || slot.asleep || min == 0 {
-            return None;
-        }
-        let gap = if slot.woke {
-            min
-        } else {
-            min.max(
-                self.user_gaps
-                    .get(key)
-                    .copied()
-                    .unwrap_or(DEFAULT_INTERVAL_MS),
-            )
-        };
-        Some(
-            slot.last_grant_ms
-                .map_or(0, |last| last.saturating_add(gap)),
-        )
+        self.interval_ready_at(key, ActivitySource::Audio)
+    }
+
+    pub(crate) fn charging_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
+        self.interval_ready_at(key, ActivitySource::Charging)
+    }
+
+    fn interval_ready_at(&self, key: &DeviceKey, source: ActivitySource) -> Option<Ms> {
+        self.devices
+            .get(key)?
+            .interval_ready_at(source, || self.user_gaps.get(key).copied())
     }
 
     /// `key` was read without a grant of its own (its discovery's first battery read, or a
-    /// reading it pushed): the activity gap counts from `now`, unless a later grant already
-    /// restarted it.
+    /// reading it pushed): the interval counts from `now`, unless a later grant
+    /// already restarted it.
     pub fn note_read(&mut self, key: &DeviceKey, now: Ms) {
         if let Some(slot) = self.devices.get_mut(key) {
             slot.last_grant_ms = Some(slot.last_grant_ms.map_or(now, |last| last.max(now)));
@@ -360,13 +422,14 @@ mod tests {
 
     const OWNER: GroupId = GroupId(1);
 
-    const ALL_TRIGGERS: [Trigger; 6] = [
+    const ALL_TRIGGERS: [Trigger; 7] = [
         Trigger::Arrival,
         Trigger::Rediscovery,
         Trigger::Connected,
         Trigger::Resume,
         Trigger::RefreshNow,
         Trigger::Activity,
+        Trigger::Awake,
     ];
 
     fn key() -> DeviceKey {
@@ -377,6 +440,9 @@ mod tests {
         Capabilities {
             pushes_battery,
             query_wakes,
+            audio: !pushes_battery && min_query_gap_ms > 0,
+            awake_signal: false,
+            charging: false,
             min_query_gap_ms,
         }
     }
@@ -431,6 +497,38 @@ mod tests {
         }
         // Only activity is pointless for a pushing device; arrival still reads once.
         assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
+    }
+
+    #[test]
+    fn pushing_device_never_gets_awake_grants() {
+        let mut s = scheduler_with(Capabilities {
+            awake_signal: true,
+            ..caps(true, false, 300_000)
+        });
+        assert_eq!(s.request(&key(), OWNER, Trigger::Awake, 0), None);
+        assert_eq!(s.request(&key(), OWNER, Trigger::Awake, 600_000), None);
+    }
+
+    #[test]
+    fn awake_audio_and_charging_share_one_interval() {
+        let mut s = scheduler_with(Capabilities {
+            audio: true,
+            awake_signal: true,
+            charging: true,
+            ..caps(false, false, 100)
+        });
+        s.note_read(&key(), 0);
+        s.set_user_gaps([(key(), 300)].into_iter().collect());
+
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 100).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Awake, 399), None);
+        assert_eq!(s.request_charging(&key(), OWNER, 399), None);
+        assert!(s.request_charging(&key(), OWNER, 400).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Awake, 699), None);
+        assert_eq!(s.activity_ready_at(&key()), Some(700));
+        assert!(s.request(&key(), OWNER, Trigger::Awake, 700).is_some());
+        assert_eq!(s.charging_ready_at(&key()), Some(1_000));
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 999), None);
     }
 
     #[test]
@@ -577,14 +675,19 @@ mod tests {
         );
         // A 1 ms gap (minimum and user gap) lets the activity request one millisecond after
         // the others.
-        let mut s = scheduler_with(caps(false, false, 1));
+        let mut s = scheduler_with(Capabilities {
+            awake_signal: true,
+            ..caps(false, false, 1)
+        });
         s.set_user_gaps([(key(), 1)].into_iter().collect());
         let mut ids = Vec::new();
         for (now, trigger) in (1_000..).zip(ALL_TRIGGERS) {
             let grant = s.request(&key(), OWNER, trigger, now).unwrap();
             let (budget, duration) = match trigger {
                 Trigger::Arrival | Trigger::Rediscovery | Trigger::Connected => (96, 10_000),
-                Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => (4, 3_000),
+                Trigger::Resume | Trigger::RefreshNow | Trigger::Activity | Trigger::Awake => {
+                    (4, 3_000)
+                }
             };
             assert_eq!(grant.subject, key());
             assert_eq!(grant.trigger, trigger);
@@ -600,7 +703,8 @@ mod tests {
                 GrantId(3),
                 GrantId(4),
                 GrantId(5),
-                GrantId(6)
+                GrantId(6),
+                GrantId(7),
             ]
         );
     }

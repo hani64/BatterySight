@@ -41,6 +41,9 @@ pub enum Action {
     /// A link to `key` (a device or this engine's group key) was established: the hub
     /// requests [`Trigger::Connected`](crate::scheduler::Trigger::Connected) for it.
     Connected(DeviceKey),
+    /// A fresh device-originated sign of activity, not a battery reading. Only
+    /// accepted from the current owner's routed input report.
+    Awake(DeviceKey),
     /// The group's discovery registered nothing and is due again: the hub requests
     /// [`Trigger::Rediscovery`](crate::scheduler::Trigger::Rediscovery) on the group key
     /// while the group has no registered device.

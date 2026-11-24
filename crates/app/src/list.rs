@@ -112,6 +112,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::SourceVerified,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 

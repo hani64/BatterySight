@@ -87,9 +87,11 @@ pub struct DeviceState {
     pub updated_ms: Ms,
     pub source: Source,
     pub verification: Verification,
-    /// The engine's minimum gap between battery checks while the device is in use, for a
-    /// device asked during use; `None` for one that pushes its battery or is never asked.
+    /// The engine's minimum for battery checks driven by audio, when an interval
+    /// setting is available for this device.
     pub poll_min_ms: Option<Ms>,
+    /// Whether the device reports battery changes on its own.
+    pub reports_changes: bool,
 }
 
 /// Partial change to a [`DeviceState`]; `None` fields leave the current value untouched.
@@ -153,6 +155,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::SourceVerified,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 

@@ -563,6 +563,9 @@ impl HidppEngine {
             caps: Capabilities {
                 pushes_battery: !self.no_in_use_push,
                 query_wakes: self.query_wakes,
+                audio: self.no_in_use_push,
+                awake_signal: false,
+                charging: self.no_in_use_push,
                 min_query_gap_ms: if self.no_in_use_push {
                     ACTIVITY_GAP_MS
                 } else {
@@ -1108,6 +1111,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         Capabilities {
             pushes_battery: true,
             query_wakes: false,
+            audio: false,
+            awake_signal: false,
+            charging: false,
             min_query_gap_ms: 0,
         }
     }
@@ -1561,6 +1567,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             Capabilities {
                 pushes_battery: false,
                 query_wakes: false,
+                audio: true,
+                awake_signal: false,
+                charging: true,
                 min_query_gap_ms: 300_000,
             }
         );

@@ -357,6 +357,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::Generic,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 

@@ -8,8 +8,8 @@
 //! peak level of at least -60 dBFS), the device thread hands the hub an activity input for
 //! each of that device's registered devices as soon as the scheduler would grant one (for
 //! the PRO X Wireless, 10 minutes after its last read by default, 5 after a wake). Devices
-//! the scheduler would refuse (asleep, or pushing their battery) are not metered. Without an
-//! active session it sets no deadline for this, so a silent PC never wakes the thread.
+//! that do not allow audio-triggered reads or are asleep are not metered. Without an active
+//! session it sets no audio deadline, so a silent PC never wakes the thread for audio.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -441,9 +441,8 @@ impl Device {
         due
     }
 
-    /// Every registered device of an opened group whose container has an active audio
-    /// session and that the scheduler could grant an activity read, with that container and
-    /// when the scheduler could grant it ([`Hub::activity_ready_at`]).
+    /// Devices of an opened group whose container has an active audio session, and when
+    /// each can next be read in response to audible audio ([`Hub::audio_ready_at`]).
     fn activity_candidates(&self) -> Vec<(ContainerId, DeviceKey, Ms)> {
         let mut candidates = Vec::new();
         if self.audio.active.is_empty() {
@@ -457,7 +456,7 @@ impl Device {
                 continue;
             }
             for key in self.hub.keys_of(group.id) {
-                if let Some(ready) = self.hub.activity_ready_at(&key) {
+                if let Some(ready) = self.hub.audio_ready_at(&key) {
                     candidates.push((container, key, ready));
                 }
             }
@@ -476,9 +475,8 @@ impl Device {
         ready.max(silent_until.unwrap_or(0))
     }
 
-    /// When an activity check is next due. `None` while no device the scheduler could grant
-    /// an activity read has an active audio session: silence, an asleep device or one that
-    /// pushes its battery never wakes the device thread.
+    /// When an audio check is next due. `None` if no active session belongs to an eligible
+    /// device, including when only awake-signal devices share the containers.
     fn activity_deadline(&self) -> Option<Ms> {
         self.activity_candidates()
             .iter()
@@ -509,7 +507,7 @@ impl Device {
             }
             for (_, key) in due.iter().filter(|(of, _)| *of == container) {
                 // An earlier input of this pass may have changed what the scheduler allows.
-                let ready = self.hub.activity_ready_at(key);
+                let ready = self.hub.audio_ready_at(key);
                 if activity_due(ready, now, self.audio.active.contains(&container), level) {
                     self.feed(HubInput::Activity(key.clone()), now);
                 }
@@ -788,8 +786,7 @@ fn audible(peak: Option<f32>) -> bool {
 
 /// Whether a device may be handed an activity input at `now`: its container has an active
 /// audio session (`active`), its endpoints play something ([`audible`] `peak`) and the
-/// scheduler would grant it (`ready_at` reached; `None` while it refuses any, the device
-/// being asleep or pushing its battery).
+/// scheduler would grant it (`ready_at` reached; `None` when ineligible for audio).
 fn activity_due(ready_at: Option<Ms>, now: Ms, active: bool, peak: Option<f32>) -> bool {
     active && audible(peak) && ready_at.is_some_and(|at| now >= at)
 }
@@ -1889,6 +1886,23 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
     /// `headset_presence`) and a mouse that pushes its battery (group 2), each in its own
     /// container, both registered at 0 with audio playing to both; and their grant logs.
     fn audio_device(headset_presence: Option<Presence>) -> (Device, Grants, Grants) {
+        activity_device(
+            headset_presence,
+            Capabilities {
+                pushes_battery: false,
+                query_wakes: false,
+                min_query_gap_ms: GAP,
+                audio: true,
+                awake_signal: false,
+                charging: false,
+            },
+        )
+    }
+
+    fn activity_device(
+        headset_presence: Option<Presence>,
+        headset_caps: Capabilities,
+    ) -> (Device, Grants, Grants) {
         let headset_grants: Grants = Rc::default();
         let mouse_grants: Grants = Rc::default();
         let (h, m) = (Rc::clone(&headset_grants), Rc::clone(&mouse_grants));
@@ -1896,10 +1910,17 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
         device.hub = Hub::new(Catalog::builtin(), Policy::default()).with_engine_factory(Box::new(
             move |group, _| {
                 let headset = group.id == GroupId(1);
-                let caps = Capabilities {
-                    pushes_battery: !headset,
-                    query_wakes: false,
-                    min_query_gap_ms: if headset { GAP } else { 0 },
+                let caps = if headset {
+                    headset_caps
+                } else {
+                    Capabilities {
+                        pushes_battery: true,
+                        query_wakes: false,
+                        min_query_gap_ms: 0,
+                        audio: false,
+                        awake_signal: false,
+                        charging: false,
+                    }
                 };
                 Some(Box::new(Registering {
                     key: DeviceKey(if headset { "headset" } else { "mouse" }.into()),
@@ -2018,6 +2039,25 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
         let (mut device, headset_grants, _) = audio_device(Some(Presence::Asleep));
         assert_eq!(device.deadline(), None);
         device.check_activity(10 * GAP, |_| panic!("metered for an asleep device"));
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
+    }
+
+    #[test]
+    fn awake_only_device_sets_no_audio_deadline_or_meter_check() {
+        let (mut device, headset_grants, _) = activity_device(
+            None,
+            Capabilities {
+                pushes_battery: false,
+                query_wakes: true,
+                min_query_gap_ms: GAP,
+                audio: false,
+                awake_signal: true,
+                charging: false,
+            },
+        );
+
+        assert_eq!(device.deadline(), None);
+        device.check_activity(10 * GAP, |_| panic!("metered for an awake-only device"));
         assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
     }
 }

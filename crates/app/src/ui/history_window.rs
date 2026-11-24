@@ -787,6 +787,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::HardwareTested,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 
