@@ -342,7 +342,7 @@ fn c547_late_ping_reply() {
 
 /// The Superlight of the owner captures: it calls itself "PRO X Wireless"
 /// behind the C547 receiver; its unit id is replaced by a synthetic one.
-fn superlight(level: u8) -> Expect {
+fn superlight(level: u8, presence: Presence) -> Expect {
     Expect {
         key: "logi:unit:1A2B3C4D",
         name: "PRO X Wireless",
@@ -351,7 +351,7 @@ fn superlight(level: u8) -> Expect {
         level: Level::Percent(level),
         millivolts: None,
         charge: Charge::Discharging,
-        presence: Presence::Online,
+        presence,
     }
 }
 
@@ -377,18 +377,18 @@ fn c547_superlight_arrival() {
         include_str!("fixtures/hidpp/c547-superlight-arrival.txt"),
         receiver(),
     );
-    check(&hub, name, &superlight(80));
+    check(&hub, name, &superlight(80, Presence::Online));
 }
 
 #[test]
 fn c547_superlight_resume() {
     let name = "c547-superlight-resume.txt";
-    let hub = replay(
-        name,
-        include_str!("fixtures/hidpp/c547-superlight-resume.txt"),
-        receiver(),
-    );
-    check(&hub, name, &superlight(79));
+    let text = include_str!("fixtures/hidpp/c547-superlight-resume.txt");
+    // Link lost after the 80 % read and push: asleep, level kept.
+    let hub = replay(name, &until(text, "# +2669.168 s"), receiver());
+    check(&hub, name, &superlight(80, Presence::Asleep));
+    let hub = replay(name, text, receiver());
+    check(&hub, name, &superlight(79, Presence::Online));
 }
 
 #[test]
