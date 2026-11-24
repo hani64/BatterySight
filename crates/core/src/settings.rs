@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn bad_intervals_are_errors() {
-        for value in ["0", "1441", "\"10\"", "2.5"] {
+        for value in ["0", "-5", "1441", "\"10\"", "2.5"] {
             let text = format!("[intervals]\n\"logi:0ABA:255\" = {value}\n");
             match Settings::from_toml(&text) {
                 Err(SettingsError::Invalid(msg)) => {
@@ -580,6 +580,17 @@ mod tests {
         settings.set_interval(&k, 5000);
         assert_eq!(settings.interval(&k), Some(INTERVAL_MAX_MIN));
         assert_eq!(INTERVAL_MAX_MIN, 1440);
+    }
+
+    #[test]
+    fn intervals_out_of_range_are_clamped_never_saved() {
+        // Written directly into the map: the file still loads.
+        let mut settings = Settings::default();
+        settings.intervals.insert(key("low"), 0);
+        settings.intervals.insert(key("high"), 5000);
+        let loaded = Settings::from_toml(&settings.to_toml()).unwrap();
+        assert_eq!(loaded.interval(&key("low")), Some(1));
+        assert_eq!(loaded.interval(&key("high")), Some(INTERVAL_MAX_MIN));
     }
 
     #[test]

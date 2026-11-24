@@ -186,8 +186,9 @@ impl Scheduler {
         }
 
         slot.last_grant_ms = Some(now);
-        // Any grant reads the device, so its latest reading is no longer the wake reading,
-        // unless the grant is the link-up itself: its read is the wake reading.
+        // Any grant reads the device, so its latest reading is no longer the first reading
+        // after the wake, unless the grant is the link-up itself: its read is that first
+        // reading. Keeping `woke` there costs one earlier read, for consistency with a wake push.
         if trigger != Trigger::Connected {
             slot.woke = false;
         }
@@ -651,6 +652,23 @@ mod tests {
         assert_eq!(s.activity_ready_at(&key()), Some(MIN));
         assert!(s.request(&key(), Trigger::Activity, MIN).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
+    }
+
+    #[test]
+    fn re_registering_a_known_key_keeps_its_wake() {
+        // Registered again before its post-wake grant: still the minimum.
+        let mut s = scheduler_with(caps(false, false, MIN));
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.note_read(&key(), 0);
+        s.register(key(), caps(false, false, MIN));
+        assert_eq!(s.activity_ready_at(&key()), Some(MIN));
+
+        // Registered again after it: the user gap, a known key is no wake.
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.register(key(), caps(false, false, MIN));
+        s.note_read(&key(), 1_000_000);
+        assert_eq!(s.activity_ready_at(&key()), Some(2_800_000));
     }
 
     #[test]
