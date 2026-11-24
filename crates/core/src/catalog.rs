@@ -61,6 +61,8 @@ pub enum CatalogError {
     BadStatus(String),
     /// A family or device without a `source`; holds the device name or family identity.
     EmptySource(String),
+    /// A device with neither `pids` nor `wpids`; holds the device name.
+    NoIds(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -69,6 +71,7 @@ impl fmt::Display for CatalogError {
             Self::Toml(msg) => write!(f, "invalid catalog: {msg}"),
             Self::BadStatus(s) => write!(f, "invalid catalog status {s:?}"),
             Self::EmptySource(who) => write!(f, "catalog entry {who} has no source"),
+            Self::NoIds(who) => write!(f, "catalog entry {who} has neither pids nor wpids"),
         }
     }
 }
@@ -155,6 +158,9 @@ impl Catalog {
                 let status = parse_status(d.status)?;
                 if d.source.trim().is_empty() {
                     return Err(CatalogError::EmptySource(d.name));
+                }
+                if d.pids.is_empty() && d.wpids.is_empty() {
+                    return Err(CatalogError::NoIds(d.name));
                 }
                 Ok(DeviceEntry {
                     name: d.name,
@@ -305,6 +311,20 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     }
 
     #[test]
+    fn rejects_entry_without_ids() {
+        let toml = SAMPLE.replace("pids = [0x0AAA, 0x0ABA]\n", "");
+        assert_eq!(
+            Catalog::parse(&toml).unwrap_err(),
+            CatalogError::NoIds("PRO X Wireless Gaming Headset".into())
+        );
+        let empty = SAMPLE.replace("pids = [0x0AAA, 0x0ABA]", "pids = []\nwpids = []");
+        assert_eq!(
+            Catalog::parse(&empty).unwrap_err(),
+            CatalogError::NoIds("PRO X Wireless Gaming Headset".into())
+        );
+    }
+
+    #[test]
     fn rejects_empty_family_source() {
         let toml = SAMPLE.replace(
             "source = \"Linux drivers/hid/hid-logitech-hidpp.c; Solaar lib/logitech_receiver\"",
@@ -419,6 +439,11 @@ source = "test"
         assert_eq!(mouse.name, "PRO X Superlight");
         assert_eq!(mouse.kind, DeviceKind::Mouse);
         assert_eq!(mouse.status, Verification::HardwareTested);
+        // The same mouse on its cable: same name, cable path untested.
+        let cabled = cat.device(0x046D, 0xC094).unwrap();
+        assert_eq!(cabled.name, "PRO X Superlight");
+        assert_eq!(cabled.kind, DeviceKind::Mouse);
+        assert_eq!(cabled.status, Verification::SourceVerified);
         assert_eq!(cat.device(0x046D, 0xC547), None);
 
         let mut families = std::collections::HashSet::new();
@@ -432,11 +457,6 @@ source = "test"
         );
         for d in cat.devices() {
             assert!(!d.source.trim().is_empty(), "{} has no source", d.name);
-            assert!(
-                !d.pids.is_empty() || !d.wpids.is_empty(),
-                "{} has no pids",
-                d.name
-            );
             for &pid in &d.pids {
                 assert!(
                     pids.insert((d.vid, pid)),

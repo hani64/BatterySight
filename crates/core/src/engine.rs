@@ -20,8 +20,9 @@ pub enum Action {
         bytes: Vec<u8>,
     },
     /// Start tracking a device discovered behind this engine's group. `wpid` is the
-    /// wireless product id of a device behind a receiver, when the receiver reported one;
-    /// the hub then looks the device up by it instead of by the group's USB product id.
+    /// wireless product id of a device behind a receiver, when the receiver reported one.
+    /// The hub looks a device registered `via` a receiver up by `wpid` only (none: the
+    /// vendor family), any other device by the group's USB product id.
     Register {
         key: DeviceKey,
         caps: Capabilities,
