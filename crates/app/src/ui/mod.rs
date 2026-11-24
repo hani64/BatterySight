@@ -165,28 +165,72 @@ impl<'a> Tips<'a> {
 
 /// The devices to show: in the user's order, hidden devices left out. A disconnected
 /// device (offline: the hub keeps it only through its removal grace) shows `×`. Devices of
-/// a kind shown more than once get captions ([`caption`]). With `tips` (tray icons show
-/// them) they get their tooltips; without, those stay empty.
+/// a kind shown more than once get captions ([`captions_for`]). With `tips` (tray icons
+/// show them) they get their tooltips; without, those stay empty.
 fn views(states: &[DeviceState], settings: &Settings, tips: Option<&Tips>) -> Vec<DeviceView> {
     let shown: Vec<&DeviceState> = settings
         .ordered(states)
         .into_iter()
         .filter(|s| !settings.hidden.contains(&s.key))
         .collect();
+    let captions = captions_for(&shown);
     shown
         .iter()
-        .map(|s| {
+        .zip(captions)
+        .map(|(s, caption)| {
             let tooltip = tips.map(|t| t.text(s)).unwrap_or_default();
-            view(s, settings.threshold(&s.key), caption(s, &shown), tooltip)
+            view(s, settings.threshold(&s.key), caption, tooltip)
         })
         .collect()
 }
 
-/// What tells `s` apart from the other `shown` devices of its kind: the first 3 letters,
-/// in upper case, of the longest word of its name that none of their names has (the
-/// longest of all its words if they all do; the first on a tie). `None` when no other
-/// shown device is of its kind.
-fn caption(s: &DeviceState, shown: &[&DeviceState]) -> Option<String> {
+/// What tells each of `shown` apart from the other shown devices of its kind (`None` for
+/// a device alone of its kind): the first 3 letters, in upper case, of its distinguishing
+/// word ([`distinguishing_word`]). Where two of a kind would get the same, their words'
+/// last 3 letters instead; where those clash too (identical names), their places (1, 2, …)
+/// among that kind's clashing devices, in shown order.
+fn captions_for(shown: &[&DeviceState]) -> Vec<Option<String>> {
+    let words: Vec<Option<String>> = shown
+        .iter()
+        .map(|s| distinguishing_word(s, shown).map(str::to_uppercase))
+        .collect();
+    let mut captions: Vec<Option<String>> = words
+        .iter()
+        .map(|w| w.as_ref().map(|w| w.chars().take(3).collect()))
+        .collect();
+    for i in clashes(shown, &captions) {
+        captions[i] = words[i].as_ref().map(|w| {
+            // From the third character from the end (the whole word if shorter).
+            let from = w.char_indices().rev().nth(2).map_or(0, |(at, _)| at);
+            w[from..].to_owned()
+        });
+    }
+    let clashing = clashes(shown, &captions);
+    for &i in &clashing {
+        let before = clashing
+            .iter()
+            .filter(|&&j| j < i && shown[j].kind == shown[i].kind)
+            .count();
+        captions[i] = Some((before + 1).to_string());
+    }
+    captions
+}
+
+/// The indices of the `captions` equal to another's of the same kind.
+fn clashes(shown: &[&DeviceState], captions: &[Option<String>]) -> Vec<usize> {
+    (0..shown.len())
+        .filter(|&i| {
+            captions[i].is_some()
+                && (0..shown.len())
+                    .any(|j| j != i && shown[j].kind == shown[i].kind && captions[j] == captions[i])
+        })
+        .collect()
+}
+
+/// The word of `s`'s name that tells it apart from the other `shown` devices of its kind:
+/// the longest that none of their names has (the longest of all its words if they all do;
+/// the first on a tie). `None` when no other shown device is of its kind.
+fn distinguishing_word<'a>(s: &'a DeviceState, shown: &[&DeviceState]) -> Option<&'a str> {
     fn longest<'a>(words: impl Iterator<Item = &'a str>) -> Option<&'a str> {
         words.reduce(|best, w| {
             if w.chars().count() > best.chars().count() {
@@ -211,8 +255,7 @@ fn caption(s: &DeviceState, shown: &[&DeviceState]) -> Option<String> {
         })
     };
     let words = || s.name.split_whitespace();
-    let word = longest(words().filter(|w| !shared(w))).or_else(|| longest(words()))?;
-    Some(word.to_uppercase().chars().take(3).collect())
+    longest(words().filter(|w| !shared(w))).or_else(|| longest(words()))
 }
 
 /// One device; `threshold`: its low-battery threshold, which also colours it as low. A
@@ -268,8 +311,12 @@ fn level_text(level: Level) -> String {
     }
 }
 
-/// A device's one-line label in the menu: "Name — 70%", with " charging" while charging.
+/// A device's one-line label in the menu: "Name — 70%", with " charging" while charging;
+/// "Name — disconnected" for a disconnected device (its level and charge are stale).
 fn label(s: &DeviceState) -> String {
+    if s.presence == Presence::Offline {
+        return format!("{} — disconnected", s.name);
+    }
     let text = s.level.map_or_else(|| "?".to_owned(), level_text);
     let mut label = format!("{} — {text}", s.name);
     if s.charge == Charge::Charging {
@@ -1555,6 +1602,21 @@ mod tests {
     }
 
     #[test]
+    fn equal_captions_fall_back_to_last_letters_then_ordinals() {
+        let headset = |name: &str| state(name, DeviceKind::Headset, None);
+        let v = all(&[headset("G733"), headset("G735"), percent("G305", 50)]);
+        // "G73" twice: the words' last 3 letters; the lone mouse needs no caption.
+        assert_eq!(captions(&v), [Some("733"), Some("735"), None]);
+        // Identical names: ordinals in shown order, only for the devices that clash.
+        let twin = DeviceState {
+            key: DeviceKey("other".into()),
+            ..percent("G305", 50)
+        };
+        let v = all(&[percent("G305", 50), percent("PRO X Superlight", 50), twin]);
+        assert_eq!(captions(&v), [Some("1"), Some("SUP"), Some("2")]);
+    }
+
+    #[test]
     fn label_omits_verification_status() {
         let with = |verification| DeviceState {
             verification,
@@ -1568,6 +1630,16 @@ mod tests {
         ] {
             assert_eq!(label(&with(status)), "PRO X — 40%");
         }
+    }
+
+    #[test]
+    fn label_says_disconnected() {
+        let off = DeviceState {
+            presence: Presence::Offline,
+            charge: Charge::Charging,
+            ..percent("PRO X", 40)
+        };
+        assert_eq!(label(&off), "PRO X — disconnected");
     }
 
     #[test]
