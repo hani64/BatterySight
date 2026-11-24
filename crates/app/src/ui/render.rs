@@ -1,8 +1,11 @@
-//! GDI text rendering into 32-bit bitmaps with per-pixel alpha.
+//! Text rendering into 32-bit bitmaps with per-pixel alpha, for the widget's strip, the
+//! tray icons and the hover card.
 //!
-//! Text is drawn white on black with grayscale antialiasing; [`colorize`] then turns the
-//! coverage into alpha and applies each part's colour. The hover card ([`card`]) is drawn
-//! in its colours on an opaque background instead.
+//! DirectWrite draws the text (`dwrite`): grayscale antialiasing with correct premultiplied
+//! alpha, over a transparent background (the strip, the icons) or the card's opaque one.
+//! Without it, GDI draws: text white on black with grayscale antialiasing, [`colorize`]
+//! then turning the coverage into alpha and applying each part's colour (the card drawn in
+//! its colours on its opaque background instead).
 
 use std::ffi::c_void;
 
@@ -18,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINF
 use windows::core::{PCWSTR, w};
 
 use super::DeviceView;
+use super::dwrite::{self, Engine, Fill, FontSpec, Run};
 
 /// Icon fonts, best first: Windows 11 ships Segoe Fluent Icons, Windows 10 Segoe MDL2 Assets
 /// (same code points for the glyphs used here).
@@ -128,15 +132,95 @@ struct Layout {
     width: i32,
 }
 
+/// A painted strip, and each view's columns of it ([`device_columns`]).
+pub type Strip = (Painter, Vec<(i32, i32)>);
+
 /// The widget's strip for `views`: `dpi` scales it, `height` is the taskbar's client
 /// height. Every pixel gets at least alpha 1, so the whole strip takes clicks. Also returns
 /// each view's columns of the strip ([`device_columns`]), in view order.
-pub fn widget_strip(
+pub fn widget_strip(views: &[DeviceView], dpi: u32, height: i32, light: bool) -> Option<Strip> {
+    dwrite::with(|e| widget_strip_direct(e, views, dpi, height, light))
+        .or_else(|| widget_strip_gdi(views, dpi, height, light))
+}
+
+/// The fonts of the strip's faces, in [`face_index`] order: `dpi` scales them.
+fn strip_fonts(dpi: u32) -> [FontSpec; 4] {
+    let px = |v: f32| v * dpi as f32 / 96.0;
+    let spec = |faces, size, weight: i32| FontSpec {
+        faces,
+        size: px(size),
+        weight,
+    };
+    [
+        spec(&[TEXT_FACE], 12.0, FW_NORMAL.0 as i32),
+        spec(&ICON_FACES, 15.0, FW_NORMAL.0 as i32),
+        spec(&ICON_FACES, 11.0, FW_NORMAL.0 as i32),
+        spec(&[TEXT_FACE], 9.0, FW_SEMIBOLD.0 as i32),
+    ]
+}
+
+fn face_index(face: Face) -> usize {
+    match face {
+        Face::Text => 0,
+        Face::Icon => 1,
+        Face::Mark => 2,
+        Face::Caption => 3,
+    }
+}
+
+/// [`widget_strip`] by DirectWrite. `Ok(None)`: no DIB.
+fn widget_strip_direct(
+    e: &Engine,
     views: &[DeviceView],
     dpi: u32,
     height: i32,
     light: bool,
-) -> Option<(Painter, Vec<(i32, i32)>)> {
+) -> windows::core::Result<Option<Strip>> {
+    let fonts = e.fonts(&strip_fonts(dpi))?;
+    let height = height.max(1);
+    let mut failed = None;
+    let layout = layout(views, dpi, height, light, |face, text| {
+        e.measure(&fonts, face_index(face), text)
+            .unwrap_or_else(|err| {
+                failed.get_or_insert(err);
+                SIZE::default()
+            })
+    });
+    if let Some(err) = failed {
+        return Err(err);
+    }
+    let Some(mut p) = Painter::new() else {
+        return Ok(None);
+    };
+    if !p.begin(layout.width, height) {
+        return Ok(None);
+    }
+    let runs: Vec<Run> = layout
+        .parts
+        .iter()
+        .map(|part| Run {
+            font: face_index(part.face),
+            text: &part.text,
+            x: part.x,
+            y: part.y,
+            size: part.size,
+            rgb: part.rgb,
+            opacity: part.opacity,
+        })
+        .collect();
+    let size = SIZE {
+        cx: layout.width,
+        cy: height,
+    };
+    e.draw(p.dc, size, &fonts, None, &runs)?;
+    if let Some(pixels) = p.pixels() {
+        floor_alpha(pixels, 1);
+    }
+    Ok(Some((p, device_columns(&layout.drawn, layout.width))))
+}
+
+/// [`widget_strip`] by GDI.
+fn widget_strip_gdi(views: &[DeviceView], dpi: u32, height: i32, light: bool) -> Option<Strip> {
     let px = |v: i32| v * dpi as i32 / 96;
     let mut p = Painter::new()?;
     let text_font = p.font(&[TEXT_FACE], -px(12), FW_NORMAL.0 as i32)?;
@@ -288,15 +372,91 @@ fn device_columns(drawn: &[(i32, i32)], width: i32) -> Vec<(i32, i32)> {
 
 /// A `size`×`size` tray icon: the percentage as a number, else the device's glyph.
 pub fn tray_icon(view: Option<&DeviceView>, size: i32, light: bool) -> Option<HICON> {
+    dwrite::with(|e| tray_icon_direct(e, view, size, light))
+        .or_else(|| tray_icon_gdi(view, size, light))
+}
+
+/// A tray icon's number (the percentage without "%"; `None`: draw the glyph), colour and
+/// opacity.
+fn tray_look(view: Option<&DeviceView>, light: bool) -> (Option<String>, [u8; 3], u8) {
     let palette = Palette::new(light);
-    let (text, rgb, opacity) = match view {
+    match view {
         Some(v) => (
             v.text.strip_suffix('%').map(str::to_owned),
             if v.low { palette.low } else { palette.text },
             if v.dimmed { DIMMED } else { 255 },
         ),
         None => (None, palette.text, 255),
+    }
+}
+
+/// [`tray_icon`] by DirectWrite. `Ok(None)`: no DIB or icon.
+fn tray_icon_direct(
+    e: &Engine,
+    view: Option<&DeviceView>,
+    size: i32,
+    light: bool,
+) -> windows::core::Result<Option<HICON>> {
+    let (text, rgb, opacity) = tray_look(view, light);
+    let (fonts, wide, measured) = match text {
+        Some(number) => {
+            let wide: Vec<u16> = number.encode_utf16().collect();
+            // The largest font whose text fits the icon.
+            let mut height = size;
+            loop {
+                let spec = FontSpec {
+                    faces: &[TEXT_FACE],
+                    size: height as f32,
+                    weight: FW_SEMIBOLD.0 as i32,
+                };
+                let fonts = e.fonts(&[spec])?;
+                let measured = e.measure(&fonts, 0, &wide)?;
+                if measured.cx <= size || height <= 6 {
+                    break (fonts, wide, measured);
+                }
+                height -= 1;
+            }
+        }
+        None => {
+            let glyph = view.map_or(NO_DEVICE, |v| v.glyph);
+            let spec = FontSpec {
+                faces: &ICON_FACES,
+                size: (size * 7 / 8) as f32,
+                weight: FW_NORMAL.0 as i32,
+            };
+            let fonts = e.fonts(&[spec])?;
+            let wide: Vec<u16> = glyph.to_string().encode_utf16().collect();
+            let measured = e.measure(&fonts, 0, &wide)?;
+            (fonts, wide, measured)
+        }
     };
+    let Some(mut p) = Painter::new() else {
+        return Ok(None);
+    };
+    if !p.begin(size, size) {
+        return Ok(None);
+    }
+    let run = Run {
+        font: 0,
+        text: &wide,
+        x: (size - measured.cx) / 2,
+        y: (size - measured.cy) / 2,
+        size: measured,
+        rgb,
+        opacity,
+    };
+    let square = SIZE { cx: size, cy: size };
+    e.draw(p.dc, square, &fonts, None, &[run])?;
+    // Icons take straight alpha.
+    if let Some(pixels) = p.pixels() {
+        unpremultiply(pixels);
+    }
+    Ok(p.into_icon())
+}
+
+/// [`tray_icon`] by GDI.
+fn tray_icon_gdi(view: Option<&DeviceView>, size: i32, light: bool) -> Option<HICON> {
+    let (text, rgb, opacity) = tray_look(view, light);
     let mut p = Painter::new()?;
     let (font, wide) = match text {
         Some(number) => {
@@ -370,56 +530,177 @@ impl CardColors {
 /// The hover card, as compact as a tooltip: `lines` (the first in bold at a tooltip's
 /// size, the rest smaller and muted), opaque, in the taskbar's theme; `dpi` scales it.
 pub fn card(lines: &[String], dpi: u32, light: bool) -> Option<Painter> {
+    dwrite::with(|e| card_direct(e, lines, dpi, light)).or_else(|| card_gdi(lines, dpi, light))
+}
+
+/// One line of the card: in font 0 (the title's) or 1, at (`x`, `y`), `size` as measured.
+struct Row {
+    font: usize,
+    text: Vec<u16>,
+    x: i32,
+    y: i32,
+    size: SIZE,
+    rgb: [u8; 3],
+}
+
+/// The card's rows and size, `measure` giving a text's size in font 0 or 1.
+fn card_layout(
+    lines: &[String],
+    dpi: u32,
+    colors: &CardColors,
+    mut measure: impl FnMut(usize, &[u16]) -> SIZE,
+) -> (Vec<Row>, SIZE) {
     let px = |v: i32| v * dpi as i32 / 96;
-    let colors = CardColors::new(light);
-    let mut p = Painter::new()?;
-    // 9 pt, a tooltip's size; then 8 pt.
-    let title_font = p.font(&[TEXT_FACE], -px(12), FW_BOLD.0 as i32)?;
-    let text_font = p.font(&[TEXT_FACE], -px(11), FW_NORMAL.0 as i32)?;
     let (pad_x, pad_y) = (px(8), px(5));
-    // (font, text, y, colour)
     let mut rows = Vec::with_capacity(lines.len());
     let mut y = pad_y;
     let mut bottom = pad_y;
     let mut width = 0;
     for (i, line) in lines.iter().enumerate() {
         let (font, rgb) = if i == 0 {
-            (title_font, colors.title)
+            (0, colors.title)
         } else {
-            (text_font, colors.muted)
+            (1, colors.muted)
         };
-        let wide: Vec<u16> = line.encode_utf16().collect();
-        let size = p.measure(font, &wide);
+        let text: Vec<u16> = line.encode_utf16().collect();
+        let size = measure(font, &text);
         width = width.max(size.cx + 2 * pad_x);
-        rows.push((font, wide, y, rgb));
+        rows.push(Row {
+            font,
+            text,
+            x: pad_x,
+            y,
+            size,
+            rgb,
+        });
         bottom = y + size.cy;
         y = bottom + px(1);
     }
-    let height = bottom + pad_y;
-    if !p.begin(width, height) {
+    let size = SIZE {
+        cx: width.max(1),
+        cy: bottom + pad_y,
+    };
+    (rows, size)
+}
+
+/// The card's fonts: 9 pt bold, a tooltip's size; then 8 pt. `dpi` scales them.
+fn card_fonts(dpi: u32) -> [FontSpec; 2] {
+    let px = |v: f32| v * dpi as f32 / 96.0;
+    [
+        FontSpec {
+            faces: &[TEXT_FACE],
+            size: px(12.0),
+            weight: FW_BOLD.0 as i32,
+        },
+        FontSpec {
+            faces: &[TEXT_FACE],
+            size: px(11.0),
+            weight: FW_NORMAL.0 as i32,
+        },
+    ]
+}
+
+/// [`card`] by DirectWrite. `Ok(None)`: no DIB.
+fn card_direct(
+    e: &Engine,
+    lines: &[String],
+    dpi: u32,
+    light: bool,
+) -> windows::core::Result<Option<Painter>> {
+    let colors = CardColors::new(light);
+    let fonts = e.fonts(&card_fonts(dpi))?;
+    let mut failed = None;
+    let (rows, size) = card_layout(lines, dpi, &colors, |font, text| {
+        e.measure(&fonts, font, text).unwrap_or_else(|err| {
+            failed.get_or_insert(err);
+            SIZE::default()
+        })
+    });
+    if let Some(err) = failed {
+        return Err(err);
+    }
+    let Some(mut p) = Painter::new() else {
+        return Ok(None);
+    };
+    if !p.begin(size.cx, size.cy) {
+        return Ok(None);
+    }
+    let fill = Fill {
+        border: colors.border,
+        inside: colors.background,
+    };
+    let runs: Vec<Run> = rows
+        .iter()
+        .map(|row| Run {
+            font: row.font,
+            text: &row.text,
+            x: row.x,
+            y: row.y,
+            size: row.size,
+            rgb: row.rgb,
+            opacity: 255,
+        })
+        .collect();
+    e.draw(p.dc, size, &fonts, Some(&fill), &runs)?;
+    p.opaque();
+    Ok(Some(p))
+}
+
+/// [`card`] by GDI.
+fn card_gdi(lines: &[String], dpi: u32, light: bool) -> Option<Painter> {
+    let px = |v: i32| v * dpi as i32 / 96;
+    let colors = CardColors::new(light);
+    let mut p = Painter::new()?;
+    let title_font = p.font(&[TEXT_FACE], -px(12), FW_BOLD.0 as i32)?;
+    let text_font = p.font(&[TEXT_FACE], -px(11), FW_NORMAL.0 as i32)?;
+    let fonts = [title_font, text_font];
+    let (rows, size) = card_layout(lines, dpi, &colors, |font, text| {
+        p.measure(fonts[font], text)
+    });
+    if !p.begin(size.cx, size.cy) {
         return None;
     }
     let whole = RECT {
         left: 0,
         top: 0,
-        right: width,
-        bottom: height,
+        right: size.cx,
+        bottom: size.cy,
     };
     let inside = RECT {
         left: 1,
         top: 1,
-        right: width - 1,
-        bottom: height - 1,
+        right: size.cx - 1,
+        bottom: size.cy - 1,
     };
     p.fill(&whole, colors.border);
     p.fill(&inside, colors.background);
-    for (font, wide, y, rgb) in &rows {
+    for row in &rows {
         // SAFETY: the painter's DC is alive.
-        unsafe { SetTextColor(p.dc, colorref(*rgb)) };
-        p.draw(*font, pad_x, *y, wide);
+        unsafe { SetTextColor(p.dc, colorref(row.rgb)) };
+        p.draw(fonts[row.font], row.x, row.y, &row.text);
     }
     p.opaque();
     Some(p)
+}
+
+/// Raises every pixel's alpha to at least `floor` (premultiplied: the colour is 0 there).
+fn floor_alpha(pixels: &mut [u8], floor: u8) {
+    for px in pixels.as_chunks_mut::<4>().0 {
+        px[3] = px[3].max(floor);
+    }
+}
+
+/// Premultiplied BGRA pixels to straight alpha (icons take it).
+fn unpremultiply(pixels: &mut [u8]) {
+    for px in pixels.as_chunks_mut::<4>().0 {
+        let a = u32::from(px[3]);
+        if a == 0 {
+            continue;
+        }
+        for c in &mut px[..3] {
+            *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
 }
 
 fn colorref([r, g, b]: [u8; 3]) -> COLORREF {
@@ -802,5 +1083,98 @@ mod tests {
         assert_eq!((glyph.x, caption.x), (4, 4 + 10 + 2));
         assert_eq!(caption.y, (30 - 12) / 2);
         assert_eq!(part(&l, "50%").unwrap().x, 16 + 30 + 4);
+    }
+
+    #[test]
+    fn floor_raises_only_lower_alpha() {
+        let mut px = [0, 0, 0, 0, 10, 20, 30, 40, 0, 0, 0, 1];
+        floor_alpha(&mut px, 1);
+        assert_eq!(px, [0, 0, 0, 1, 10, 20, 30, 40, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn unpremultiply_restores_straight_colour() {
+        // Half-covered red, opaque grey, transparent.
+        let mut px = [0, 0, 128, 128, 90, 90, 90, 255, 0, 0, 0, 0];
+        unpremultiply(&mut px);
+        assert_eq!(px, [0, 0, 255, 128, 90, 90, 90, 255, 0, 0, 0, 0]);
+        // Rounded to the nearest, never above 255.
+        let mut px = [1, 2, 3, 3];
+        unpremultiply(&mut px);
+        assert_eq!(px, [85, 170, 255, 3]);
+    }
+
+    fn strip_pixels(dpi: u32, light: bool) -> Vec<u8> {
+        let views = [keyed("H", "43%"), keyed("M", "76%")];
+        let (mut p, columns) =
+            widget_strip(&views, dpi, 48 * dpi as i32 / 96, light).expect("a strip");
+        assert_eq!(columns.len(), 2);
+        p.pixels().expect("pixels").to_vec()
+    }
+
+    fn directwrite_on() -> bool {
+        dwrite::with(|_| Ok(Some(()))).is_some()
+    }
+
+    #[test]
+    fn direct_strip_is_premultiplied_and_clickable_everywhere() {
+        assert!(
+            directwrite_on(),
+            "DirectWrite is available on Windows 10 and 11"
+        );
+        for (dpi, light) in [(144, false), (96, true)] {
+            let px = strip_pixels(dpi, light);
+            let pixels = px.as_chunks::<4>().0;
+            assert!(pixels.iter().all(|p| p[3] >= 1), "every pixel takes clicks");
+            assert!(
+                pixels.iter().all(|p| p[..3].iter().all(|&c| c <= p[3])),
+                "premultiplied"
+            );
+            assert!(pixels.iter().any(|p| p[3] == 255), "text is drawn");
+            // Smooth edges: many partial coverages.
+            let partial: std::collections::BTreeSet<u8> = pixels
+                .iter()
+                .map(|p| p[3])
+                .filter(|&a| a > 1 && a < 255)
+                .collect();
+            assert!(partial.len() > 8, "{} partial alphas", partial.len());
+        }
+    }
+
+    #[test]
+    fn direct_card_is_opaque_and_icons_draw() {
+        assert!(directwrite_on());
+        let lines = [
+            "PRO X Wireless Gaming Headset · 43%".to_owned(),
+            "just now".to_owned(),
+        ];
+        let mut p = card(&lines, 144, false).expect("a card");
+        assert!(
+            p.pixels()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[3] == 255)
+        );
+        for view in [Some(keyed("H", "43%")), None] {
+            let icon = tray_icon(view.as_ref(), 16, false).expect("an icon");
+            // SAFETY: the icon was made here and is not used elsewhere.
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyIcon(icon) };
+        }
+    }
+
+    #[test]
+    fn gdi_draws_when_directwrite_is_off() {
+        // This test's thread only.
+        dwrite::shutdown();
+        assert!(!directwrite_on());
+        let px = strip_pixels(96, false);
+        assert!(px.as_chunks::<4>().0.iter().all(|p| p[3] >= 1));
+        let lines = ["G305 · 80%".to_owned(), "just now".to_owned()];
+        assert!(card(&lines, 96, true).is_some());
+        let icon = tray_icon(Some(&keyed("H", "43%")), 16, true).expect("an icon");
+        // SAFETY: the icon was made here and is not used elsewhere.
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyIcon(icon) };
     }
 }
