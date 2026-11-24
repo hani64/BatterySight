@@ -305,6 +305,16 @@ mod tests {
     }
 
     #[test]
+    fn adc_zero_payload_means_offline() {
+        // What the PRO X Wireless dongle broadcasts when the headset is switched off (owner
+        // capture 2026-11-23): 0 mV, flags 0x00.
+        let r = decode_1f20(&[0x00, 0x00, 0x00], VoltageCurve::ProXWirelessGhub);
+        assert!(!r.online);
+        assert_eq!(r.level, None);
+        assert_eq!(r.millivolts, None);
+    }
+
+    #[test]
     fn reg0d_charging() {
         assert_eq!(
             decode_reg_0d(&[55, 0, 0x40]),

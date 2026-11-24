@@ -10,7 +10,7 @@
 //! on a windowless MTA thread ([`uia_thread`]), queried again only on `TaskbarCreated`,
 //! `WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`, a new secondary taskbar or one that changed width.
 //!
-//! The only Explorer-directed calls made on the UI thread are `CreateWindowExW` /
+//! The only Explorer-directed calls this module makes on the UI thread are `CreateWindowExW` /
 //! `DestroyWindow` of the child, `SetWindowPos` on it and `UpdateLayeredWindow`, each
 //! measured to stay bounded. Everything else here reads window-manager state locally.
 
