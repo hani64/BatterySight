@@ -39,7 +39,8 @@ pub enum OsEvent {
         collection: CollectionId,
         bytes: Vec<u8>,
     },
-    /// A read failed (for example, the device was unplugged); no further reads are issued.
+    /// A read failed (for example, the device was unplugged, or something other than
+    /// `close_group` aborted it); no further reads are issued.
     ReadFailed { collection: CollectionId },
     /// A write could not be started or failed, or the collection is not open for writing.
     WriteFailed { collection: CollectionId },
@@ -255,7 +256,8 @@ impl Reactor {
                     out.push(OsEvent::ReadFailed { collection });
                 }
             }
-            (Kind::Read, Err(error)) if hid_io::is_cancelled(&error) => {}
+            // Includes a read aborted by anything but `close_where` (whose collections returned
+            // above): nothing would read the collection again, so the runtime must reopen it.
             (Kind::Read, Err(_)) => out.push(OsEvent::ReadFailed { collection }),
             (Kind::Write, Ok(_)) => {}
             (Kind::Write, Err(_)) => out.push(OsEvent::WriteFailed { collection }),
@@ -586,6 +588,22 @@ pub(crate) mod tests {
         let mut reactor = Reactor::new().unwrap();
         reactor.open(GroupId(1), &pipe).unwrap();
         drop(server);
+        assert_eq!(
+            reactor.wait(Some(1000), 0),
+            vec![OsEvent::ReadFailed { collection: id }]
+        );
+        assert_eq!(reactor.wait(Some(50), 0), Vec::new());
+    }
+
+    #[test]
+    fn read_aborted_from_outside_fails_without_reissue() {
+        let (_server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
+        let id = pipe.collection.id;
+        let mut reactor = Reactor::new().unwrap();
+        reactor.open(GroupId(1), &pipe).unwrap();
+        // Something other than `close_group` aborts the pending read.
+        // SAFETY: the reactor's handle is open.
+        unsafe { CancelIoEx(reactor.opens[&id].handle.0, None) }.unwrap();
         assert_eq!(
             reactor.wait(Some(1000), 0),
             vec![OsEvent::ReadFailed { collection: id }]
