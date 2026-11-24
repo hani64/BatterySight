@@ -38,7 +38,7 @@ For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` mak
 
 Start `batterysight.exe`. It shows each device's battery level on the taskbar, next to the notification area (and next to the clock on other monitors' taskbars). Click it for the device list, "Refresh now" and "Exit". Only one instance runs per session; starting another does nothing.
 
-- `batterysight --tray-only` shows one notification-area icon per device instead. Use it if the widget does not appear on your Windows build. The app also switches to tray icons by itself when Windows refuses the widget window or the widget cannot find its place on the taskbar; it then tries the widget again whenever Explorer restarts or the displays or settings change. If the widget stops responding (a stalled widget would freeze the taskbar's mouse input), it restarts itself with `--tray-only` (after about 1.5 s while Explorer is responsive, after about 5 s otherwise) and keeps tray icons until the next start.
+- `batterysight --tray-only` shows one notification-area icon per device instead. Use it if the widget does not appear on your Windows build. The app also switches to tray icons by itself when Windows refuses the widget window or the widget cannot find its place on the taskbar; it then tries the widget again 15 s, 1 min and 5 min later, and whenever Explorer restarts or the displays or settings change. If the widget stops responding (a stalled widget would freeze the taskbar's mouse input), it restarts itself with `--tray-only` (after about 1.5 s while Explorer is responsive, after about 5 s otherwise) and keeps tray icons until the next start.
 - `batterysight --list` prints the devices it finds, one per line, and exits.
 
 ## Building

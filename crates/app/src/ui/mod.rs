@@ -20,7 +20,8 @@
 //! - Messages from outside (`TaskbarCreated`, `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`,
 //!   `WM_CLOSE`, WinEvent callbacks, `WM_DPICHANGED_AFTERPARENT`, clicks and tray callbacks)
 //!   never touch the state where they arrive: they post one of our `WM_APP_*` messages.
-//!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`].
+//!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`] or
+//!   [`WM_APP_SELF_RETRY`].
 //! - Only `WM_APP_*` handlers borrow the state. One that arrives while the state is borrowed
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
@@ -36,7 +37,7 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use batterysight_core::model::{Charge, CoarseLevel, DeviceKind, DeviceState, Level, Presence};
 use batterysight_win::runtime::{self, RuntimeHandle};
@@ -144,6 +145,8 @@ const WM_APP_EXIT: u32 = WM_APP + 8;
 const WM_APP_MENU: u32 = WM_APP + 9;
 /// Tray icon callbacks (`NOTIFYICON_VERSION_4`).
 const WM_APP_TRAY: u32 = WM_APP + 10;
+/// Try the widget again on the self-retry schedule (posted by [`SELF_RETRY_TIMER`]).
+const WM_APP_SELF_RETRY: u32 = WM_APP + 11;
 
 /// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
@@ -152,6 +155,9 @@ const HEARTBEAT_TIMER: usize = 1;
 /// the widget once more ([`Ui::retry_widget`]).
 const WIDGET_CHECK_TIMER: usize = 2;
 const WIDGET_CHECK_MS: u32 = 5_000;
+/// One-shot: in tray mode after a failure that may pass, the next self-retry of the widget
+/// ([`fallback::next_self_retry`]).
+const SELF_RETRY_TIMER: usize = 3;
 const MENU_REFRESH: usize = 1;
 const MENU_EXIT: usize = 2;
 
@@ -218,16 +224,17 @@ pub fn run(options: &Options) -> i32 {
             (Surface::Tray(tray), Some(reason))
         }
     };
-    UI.with(|ui| {
-        *ui.borrow_mut() = Some(Ui {
-            host,
-            runtime,
-            views,
-            light,
-            surface,
-            tray_reason,
-        });
-    });
+    let mut ui = Ui {
+        host,
+        runtime,
+        views,
+        light,
+        surface,
+        tray_reason,
+        self_retry: None,
+    };
+    ui.schedule_self_retry();
+    UI.with(|cell| *cell.borrow_mut() = Some(ui));
     let mut msg = MSG::default();
     // SAFETY: `msg` outlives each call. GetMessageW returns -1 on error, 0 on WM_QUIT.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -242,6 +249,7 @@ pub fn run(options: &Options) -> i32 {
     unsafe {
         let _ = KillTimer(Some(host), HEARTBEAT_TIMER);
         let _ = KillTimer(Some(host), WIDGET_CHECK_TIMER);
+        let _ = KillTimer(Some(host), SELF_RETRY_TIMER);
         let _ = DestroyWindow(host);
     }
     0
@@ -263,6 +271,16 @@ struct Ui {
     surface: Surface,
     /// Why tray icons show the devices; `None` while the widgets do.
     tray_reason: Option<TrayReason>,
+    /// The self-retry schedule since the widget fell back. Kept until a widget check
+    /// passes, so a widget that falls back again right after a retry continues the schedule
+    /// instead of starting it anew.
+    self_retry: Option<SelfRetry>,
+}
+
+/// When the widget fell back, and how many self-retries have run since.
+struct SelfRetry {
+    since: Instant,
+    done: u8,
 }
 
 impl Ui {
@@ -323,9 +341,20 @@ impl Ui {
                 if let Surface::Widgets(w) = &self.surface {
                     if take_debug_no_anchor() || w.missing() {
                         self.fall_back_to_tray(TrayReason::NoAnchor);
+                    } else {
+                        // The widget holds: a later fallback starts the schedule anew.
+                        self.self_retry = None;
                     }
                 } else {
                     self.retry_widget(false);
+                }
+            }
+            WM_APP_SELF_RETRY if self.tray_reason.is_some_and(should_retry_widget) => {
+                if let Some(s) = &mut self.self_retry {
+                    s.done = s.done.saturating_add(1);
+                }
+                if !self.retry_widget(false) {
+                    self.schedule_self_retry();
                 }
             }
             _ => {}
@@ -347,9 +376,8 @@ impl Ui {
     }
 
     /// Windows refused a widget window, or none is shown: tray icons, until a taskbar or
-    /// display change brings the widget back ([`Ui::retry_widget`]).
+    /// display change or a self-retry brings the widget back ([`Ui::retry_widget`]).
     fn fall_back_to_tray(&mut self, reason: TrayReason) {
-        fallback::trace(reason);
         self.tray_reason = Some(reason);
         watchdog::arm(false);
         // SAFETY: our own window and timers; nothing reads the heartbeat in tray mode.
@@ -361,6 +389,28 @@ impl Ui {
         tray.show(&self.views, self.light);
         // Dropping the widgets destroys their windows and hooks.
         self.surface = Surface::Tray(tray);
+        // Only now: the widgets no longer share Explorer's input queue.
+        fallback::trace(reason);
+        self.schedule_self_retry();
+    }
+
+    /// In tray mode after a failure that may pass ([`should_retry_widget`]), sets
+    /// [`SELF_RETRY_TIMER`] for the next self-retry, counted from the fallback
+    /// ([`fallback::self_retry_delay`]); after the last one, only taskbar and display
+    /// changes try again.
+    fn schedule_self_retry(&mut self) {
+        if !self.tray_reason.is_some_and(should_retry_widget) {
+            return;
+        }
+        let s = self.self_retry.get_or_insert_with(|| SelfRetry {
+            since: Instant::now(),
+            done: 0,
+        });
+        let elapsed = u64::try_from(s.since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(delay) = fallback::self_retry_delay(s.done, elapsed) {
+            // SAFETY: our own window; setting an existing timer id restarts it.
+            unsafe { SetTimer(Some(self.host), SELF_RETRY_TIMER, delay, None) };
+        }
     }
 
     /// In tray mode after a failure that may pass ([`should_retry_widget`]), tries the
@@ -368,21 +418,29 @@ impl Ui {
     /// failed try keeps tray mode and its reason. With `again_later` (a taskbar or display
     /// change: Explorer may lay its taskbars out only after it), a failed try is repeated
     /// once, [`WIDGET_CHECK_MS`] later; then the next change tries again. Returns whether it
-    /// switched.
+    /// switched. Taskbar and display changes leave the self-retry schedule as it is.
     fn retry_widget(&mut self, again_later: bool) -> bool {
         if !self.tray_reason.is_some_and(should_retry_widget) {
             return false;
         }
-        // Dropping widgets that do not show destroys their windows and hooks.
-        let Some(widgets) = Widgets::new(&self.views, self.light)
-            .ok()
-            .filter(Widgets::shown)
-        else {
+        // A widget shows at once only next to the primary taskbar's notification area;
+        // without it, the widgets built (secondary windows, a UI Automation walk) would be
+        // thrown away. Dropping widgets that do not show destroys their windows and hooks.
+        let widgets = if widget::primary_anchor_ready() {
+            Widgets::new(&self.views, self.light)
+                .ok()
+                .filter(Widgets::shown)
+        } else {
+            None
+        };
+        let Some(widgets) = widgets else {
             if again_later {
                 check_widget_later(self.host);
             }
             return false;
         };
+        // SAFETY: our own window and timer (killing one that is not set fails harmlessly).
+        let _ = unsafe { KillTimer(Some(self.host), SELF_RETRY_TIMER) };
         start_widget_checks(self.host);
         self.tray_reason = None;
         // Dropping the tray removes its icons.
@@ -532,6 +590,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let _ = unsafe { KillTimer(Some(hwnd), WIDGET_CHECK_TIMER) };
             post(WM_APP_CHECK_WIDGET);
         }
+        WM_TIMER if wp.0 == SELF_RETRY_TIMER => {
+            // SAFETY: our own window and timer; each self-retry runs once.
+            let _ = unsafe { KillTimer(Some(hwnd), SELF_RETRY_TIMER) };
+            post(WM_APP_SELF_RETRY);
+        }
         WM_TIMER => watchdog::beat(),
         // Never handled where they arrive (see the module doc); WM_SETTINGCHANGE's string
         // is not needed, every change is re-read.
@@ -547,7 +610,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 post(WM_APP_MENU);
             }
         }
-        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET => {
+        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET | WM_APP_SELF_RETRY => {
             if ui_busy() {
                 // SAFETY: no pointers involved.
                 let _ = unsafe { PostMessageW(Some(hwnd), msg, wp, lp) };

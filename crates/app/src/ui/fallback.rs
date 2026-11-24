@@ -24,11 +24,31 @@ pub enum TrayReason {
     NoAnchor,
 }
 
-/// Whether a taskbar or display change should try the widget again. Only for the failures
-/// that may pass (Explorer or the displays were not ready); never after a watchdog relaunch,
-/// or a widget that stalls again would loop.
+/// Whether the widget should be tried again: on a taskbar or display change, and on the
+/// self-retry schedule ([`next_self_retry`]). Only for the failures that may pass (Explorer
+/// or the displays were not ready); never after a watchdog relaunch, or a widget that stalls
+/// again would loop.
 pub fn should_retry_widget(reason: TrayReason) -> bool {
     matches!(reason, TrayReason::CreateFailed | TrayReason::NoAnchor)
+}
+
+/// When self-retry number `attempts_done + 1` is due, in milliseconds after the fallback:
+/// the widget is tried again 15 s, 60 s and 300 s after it, without waiting for a taskbar
+/// or display change, then no more.
+pub fn next_self_retry(attempts_done: u8) -> Option<u32> {
+    match attempts_done {
+        0 => Some(15_000),
+        1 => Some(60_000),
+        2 => Some(300_000),
+        _ => None,
+    }
+}
+
+/// How long from now the next self-retry is due, `elapsed_ms` after the fallback; 0 when
+/// it is already due.
+pub fn self_retry_delay(attempts_done: u8, elapsed_ms: u64) -> Option<u32> {
+    let elapsed = u32::try_from(elapsed_ms).unwrap_or(u32::MAX);
+    next_self_retry(attempts_done).map(|at| at.saturating_sub(elapsed))
 }
 
 /// The reason to start in tray mode, from the flags: `--tray-only`, which the watchdog's
@@ -79,5 +99,26 @@ mod tests {
             trace_text(TrayReason::CreateFailed),
             "fallback CreateFailed"
         );
+    }
+
+    #[test]
+    fn self_retries_at_15_60_and_300_s_then_stop() {
+        assert_eq!(next_self_retry(0), Some(15_000));
+        assert_eq!(next_self_retry(1), Some(60_000));
+        assert_eq!(next_self_retry(2), Some(300_000));
+        assert_eq!(next_self_retry(3), None);
+        assert_eq!(next_self_retry(u8::MAX), None);
+    }
+
+    #[test]
+    fn self_retry_delay_counts_from_the_fallback() {
+        assert_eq!(self_retry_delay(0, 0), Some(15_000));
+        // Attempt 1 ran 15 s after the fallback: the next is 60 s after it, not after now.
+        assert_eq!(self_retry_delay(1, 15_000), Some(45_000));
+        assert_eq!(self_retry_delay(2, 61_000), Some(239_000));
+        // Already due (the machine slept, or the thread was busy): at once.
+        assert_eq!(self_retry_delay(1, 90_000), Some(0));
+        assert_eq!(self_retry_delay(2, u64::MAX), Some(0));
+        assert_eq!(self_retry_delay(3, 0), None);
     }
 }
