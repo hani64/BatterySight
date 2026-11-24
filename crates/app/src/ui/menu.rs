@@ -126,8 +126,7 @@ impl Model {
             items.push(b.device(s, settings, at, shown.len()));
         }
         items.push(Item::Separator);
-        // There is no history window yet.
-        items.push(b.entry("Battery history…", MenuCommand::History, false, false));
+        items.push(b.entry("Battery history…", MenuCommand::History, false, true));
         items.push(Item::Submenu {
             label: "Show on".into(),
             items: b.monitors(&settings.monitors, monitors),
@@ -563,7 +562,7 @@ mod tests {
         expected.extend(
             [
                 "---",
-                "Battery history… (disabled)",
+                "Battery history…",
                 "Show on ▸",
                 "  All monitors ✓",
                 "  Main monitor",
@@ -691,7 +690,8 @@ mod tests {
             [
                 "No devices found (disabled)",
                 "---",
-                "Battery history… (disabled)"
+                // History is kept for devices not connected now.
+                "Battery history…"
             ]
         );
     }

@@ -1,17 +1,20 @@
-//! The app's UI: the taskbar widget, the tray-icon fallback and their menu.
+//! The app's UI: the taskbar widget, the tray-icon fallback, their menu and the battery
+//! history window.
 //!
 //! # Threads
 //!
 //! The UI thread (the main thread) owns a hidden host window, the widget windows (children
 //! of Explorer's taskbars, so Explorer's taskbar thread shares this thread's input queue),
-//! the tray icons in tray mode and a low-battery notification's temporary icon. It only
-//! paints, positions, shows notifications and handles menu and mouse input; its calls to
-//! Explorer are the ones `widget` and `tray` list. The device runtime's `on_change` runs on
-//! the device thread and only posts [`WM_APP_CHANGED`] here; the menu reads the snapshot,
-//! the in-memory settings and the monitor list, and sends no device traffic. Settings are
-//! loaded before the UI starts; changes are saved, and the Run value written, by the
-//! store's writer thread ([`Store`]). UI Automation runs on its own windowless thread
-//! (`widget`), and the [`watchdog`] on another.
+//! the tray icons in tray mode, a low-battery notification's temporary icon and the history
+//! window (a normal top-level window). It only paints, positions, shows notifications and
+//! handles menu and mouse input; its calls to Explorer are the ones `widget` and `tray`
+//! list. The device runtime's `on_change` runs on the device thread and only posts
+//! [`WM_APP_CHANGED`] here; the menu reads the snapshot, the in-memory settings and the
+//! monitor list, and sends no device traffic. Settings and the last 30 days of battery
+//! history are loaded before the UI starts; changes are saved, history samples (recorded
+//! from snapshot changes, never from device traffic of their own) appended, and the Run
+//! value written, by the store's writer thread ([`Store`]). UI Automation runs on its own
+//! windowless thread (`widget`), and the [`watchdog`] on another.
 //!
 //! # Re-entrancy
 //!
@@ -29,8 +32,13 @@
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
 //!   tracked with the state released; the chosen command borrows it again afterwards.
+//! - The history window keeps its own copy of the samples, handed over by `WM_APP_*`
+//!   handlers; its procedure works on that copy only and never borrows the UI state
+//!   (see `history_window`).
 
+mod chart;
 pub mod fallback;
+mod history_window;
 mod menu;
 mod notify;
 pub mod render;
@@ -39,12 +47,14 @@ pub mod watchdog;
 mod widget;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError, TryLockError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use batterysight_core::history::{self, Recorder, Sample};
 use batterysight_core::model::{
     Charge, CoarseLevel, DeviceKey, DeviceKind, DeviceState, Level, Presence,
 };
@@ -57,11 +67,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IDC_ARROW,
-    KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -141,6 +151,7 @@ fn view(s: &DeviceState, threshold: Threshold) -> DeviceView {
 
 const HOST_CLASS: PCWSTR = w!("BatterySightHost");
 const WIDGET_CLASS: PCWSTR = w!("BatterySightWidget");
+const HISTORY_CLASS: PCWSTR = w!("BatterySightHistory");
 
 /// The snapshot changed (posted by the device thread).
 const WM_APP_CHANGED: u32 = WM_APP + 1;
@@ -215,8 +226,8 @@ pub struct Options {
 }
 
 /// Runs the UI on this thread until "Exit". Returns the process exit code. `store` has
-/// loaded `settings`; it is stopped before this returns.
-pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
+/// loaded `settings` and `samples` (the history); it is stopped before this returns.
+pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sample>) -> i32 {
     *STORE.lock().unwrap_or_else(PoisonError::into_inner) = Some(store);
     DEBUG_STALL_ARMED.store(options.debug_stall, Ordering::Relaxed);
     DEBUG_NO_ANCHOR_ARMED.store(options.debug_no_anchor, Ordering::Relaxed);
@@ -236,7 +247,8 @@ pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
         }
     };
     let light = light_theme();
-    let views = views(&read_snapshot(&runtime), &settings);
+    let states = read_snapshot(&runtime);
+    let views = views(&states, &settings);
     let widgets = match options.tray {
         Some(reason) => Err(reason),
         None => {
@@ -255,6 +267,8 @@ pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
             (Surface::Tray(tray), Some(reason))
         }
     };
+    let mut history = HashMap::new();
+    history::add(&mut history, samples, unix_now_ms());
     let mut ui = Ui {
         host,
         runtime,
@@ -267,19 +281,27 @@ pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
         self_retry: None,
         alerts: Alerts::default(),
         notifier: Notifier::new(host),
+        history,
+        recorder: Recorder::default(),
     };
+    ui.record(&states);
     ui.schedule_self_retry();
     UI.with(|cell| *cell.borrow_mut() = Some(ui));
     let mut msg = MSG::default();
     // SAFETY: `msg` outlives each call. GetMessageW returns -1 on error, 0 on WM_QUIT.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
         watchdog::beat();
+        // The history window's keyboard input (Tab, arrows, Esc) is dispatched by it.
+        if history_window::dialog_message(&msg) {
+            continue;
+        }
         // SAFETY: `msg` came from GetMessageW.
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+    history_window::close();
     // SAFETY: our own window and timers (killing one that is not set fails harmlessly).
     unsafe {
         let _ = KillTimer(Some(host), HEARTBEAT_TIMER);
@@ -321,6 +343,10 @@ struct Ui {
     /// Which devices may raise a low-battery notification; in memory only.
     alerts: Alerts,
     notifier: Notifier,
+    /// Each device's samples of the last 30 days, in time order: loaded at startup, then
+    /// those recorded since.
+    history: HashMap<DeviceKey, Vec<Sample>>,
+    recorder: Recorder,
 }
 
 /// When the widget fell back, and how many self-retries have run since.
@@ -408,10 +434,11 @@ impl Ui {
         }
     }
 
-    /// A new snapshot: shows it, and notifies the devices whose fresh readings reached
-    /// their low-battery threshold ([`Alerts::check`]).
+    /// A new snapshot: records its history samples, shows it, and notifies the devices
+    /// whose fresh readings reached their low-battery threshold ([`Alerts::check`]).
     fn changed(&mut self) {
         let states = read_snapshot(&self.runtime);
+        self.record(&states);
         self.update_views(&states);
         let alerts = self.alerts.check(&states, &self.settings);
         let Some(first) = alerts.first() else {
@@ -424,6 +451,32 @@ impl Ui {
         };
         let view = self.views.iter().find(|v| v.key == first.key);
         self.notifier.show(&alerts, on, view, self.light);
+    }
+
+    /// Records the samples `states` give (hidden devices too): appended to `history.tsv` by
+    /// the store's writer, kept in [`Ui::history`] and handed to an open history window.
+    fn record(&mut self, states: &[DeviceState]) {
+        let now = unix_now_ms();
+        let samples = self.recorder.observe(states, now);
+        if !samples.is_empty() {
+            with_store(|store| {
+                for s in &samples {
+                    store.append_history(s.to_line());
+                }
+            });
+            history::add(&mut self.history, samples.iter().cloned(), now);
+        }
+        if history_window::is_open() {
+            let devices = history_window::devices(states, &self.settings, &self.history);
+            history_window::update(devices, &samples);
+        }
+    }
+
+    /// "Battery history…": opens the history window with a copy of the history.
+    fn open_history(&self) {
+        let states = read_snapshot(&self.runtime);
+        let devices = history_window::devices(&states, &self.settings, &self.history);
+        history_window::open(devices, &self.history);
     }
 
     /// Shows the views of `states` if they changed.
@@ -583,6 +636,10 @@ impl Ui {
                 self.runtime.refresh_now();
                 return;
             }
+            MenuCommand::History => {
+                self.open_history();
+                return;
+            }
             MenuCommand::Exit => {
                 post(WM_APP_EXIT);
                 return;
@@ -624,7 +681,7 @@ impl Ui {
                     with_store(|store| store.run(Box::new(move || write_autostart(&exe, on))));
                 }
             }
-            // No setting; disabled in the menu while there is no history window.
+            // Not settings; carried out above.
             MenuCommand::History | MenuCommand::Refresh | MenuCommand::Exit => {}
         }
         if changed {
@@ -643,13 +700,14 @@ impl Ui {
         with_store(|store| store.save_settings(settings));
     }
 
-    /// Removes the widgets or tray icons and a notification's temporary icon, finishes the
-    /// queued writes (at most 1 s), then stops the runtime (bounded by its 2 s limit) and
-    /// ends the message loop.
+    /// Removes the widgets or tray icons, a notification's temporary icon and the history
+    /// window, finishes the queued writes (at most 1 s), then stops the runtime (bounded by
+    /// its 2 s limit) and ends the message loop.
     fn exit(self) {
         watchdog::arm(false);
         drop(self.surface);
         drop(self.notifier);
+        history_window::close();
         stop_store();
         self.runtime.stop();
         // SAFETY: no pointers involved.
@@ -787,6 +845,15 @@ fn hinstance() -> HINSTANCE {
         .map_or_else(|_| HINSTANCE::default(), |m| HINSTANCE(m.0))
 }
 
+/// The wall-clock time in unix milliseconds, for history samples (0 before 1970).
+pub fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// Registers the window classes and creates the hidden host window. It is a top-level
 /// window rather than a message-only one, which would not receive broadcasts such as
 /// `TaskbarCreated`.
@@ -809,7 +876,20 @@ fn create_host() -> Option<HWND> {
             lpszClassName: WIDGET_CLASS,
             ..Default::default()
         };
-        if RegisterClassExW(&host_class) == 0 || RegisterClassExW(&widget_class) == 0 {
+        let history_class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            // Repainted whole on resize: the chart scales with the window.
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(history_window::window_proc),
+            hInstance: instance,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: HISTORY_CLASS,
+            ..Default::default()
+        };
+        if RegisterClassExW(&host_class) == 0
+            || RegisterClassExW(&widget_class) == 0
+            || RegisterClassExW(&history_class) == 0
+        {
             return None;
         }
         TASKBAR_CREATED.store(

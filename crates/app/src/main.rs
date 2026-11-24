@@ -35,10 +35,11 @@ fn main() {
     let Some(instance) = SingleInstance::acquire(takeover) else {
         return;
     };
-    // Before any window exists: both block this thread briefly (disk, registry).
+    // Before any window exists: these block this thread briefly (disk, registry).
     let store = Store::start();
     let mut settings = store.load_settings();
     settings.autostart = std::env::current_exe().is_ok_and(|exe| autostart::is_enabled(&exe));
+    let samples = store.load_history(ui::unix_now_ms());
     let options = ui::Options {
         tray: ui::fallback::start_reason(
             has("--tray-only"),
@@ -48,7 +49,7 @@ fn main() {
         debug_stall: cfg!(debug_assertions) && has("--debug-stall-widget"),
         debug_no_anchor: cfg!(debug_assertions) && has("--debug-force-no-anchor"),
     };
-    let code = ui::run(&options, store, settings);
+    let code = ui::run(&options, store, settings, samples);
     drop(instance);
     std::process::exit(code);
 }

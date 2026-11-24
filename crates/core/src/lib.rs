@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod engine;
 pub mod engines;
 pub mod hid;
+pub mod history;
 pub mod hub;
 pub mod model;
 pub mod scheduler;
