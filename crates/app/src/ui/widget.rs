@@ -291,9 +291,9 @@ impl Drop for Widgets {
 }
 
 /// Lays out again (posted, so it never runs inside whatever call this event interrupted)
-/// when, on a taskbar's thread, a taskbar or its notification area moves or resizes, a
-/// taskbar's direct child appears, or a taskbar's children change z-order: either can cover
-/// the widget, and a layout raises it again.
+/// for the events [`is_layout_trigger`] accepts: on a taskbar's thread, a taskbar or its
+/// notification area moves, resizes or appears, a taskbar's direct child appears (it can
+/// cover the widget), or a taskbar's children change z-order.
 unsafe extern "system" fn on_win_event(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -307,45 +307,42 @@ unsafe extern "system" fn on_win_event(
         return;
     }
     let window = object == OBJID_WINDOW.0 && child == CHILDID_SELF as i32;
-    let relevant = match event {
-        EVENT_OBJECT_LOCATIONCHANGE => {
-            window
-                && class_is(
-                    hwnd,
-                    &["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "TrayNotifyWnd"],
-                )
-        }
-        EVENT_OBJECT_SHOW => {
-            window && {
-                // SAFETY: plain handle query.
-                let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
-                class_is(hwnd, &["TrayNotifyWnd"]) || is_taskbar(parent)
-            }
-        }
-        EVENT_OBJECT_REORDER => is_taskbar(hwnd),
-        _ => false,
-    };
-    if relevant {
+    // SAFETY: plain handle query.
+    let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+    if is_layout_trigger(event, window, &class_name(hwnd), &class_name(parent)) {
         super::schedule_layout();
     }
 }
 
-fn is_taskbar(hwnd: HWND) -> bool {
-    class_is(hwnd, &["Shell_TrayWnd", "Shell_SecondaryTrayWnd"])
+const TASKBAR_CLASSES: [&str; 2] = ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+const TRAY_NOTIFY_CLASS: &str = "TrayNotifyWnd";
+
+/// Whether a WinEvent asks for a layout. `window`: the event is about a whole window
+/// (`OBJID_WINDOW`, `CHILDID_SELF`); `class` and `parent_class`: of the event's window and
+/// of its parent.
+fn is_layout_trigger(event: u32, window: bool, class: &str, parent_class: &str) -> bool {
+    let taskbar = |c: &str| TASKBAR_CLASSES.contains(&c);
+    match event {
+        EVENT_OBJECT_LOCATIONCHANGE => window && (taskbar(class) || class == TRAY_NOTIFY_CLASS),
+        // A taskbar shown again (its tray's visibility follows it without an event of its
+        // own), its notification area, or any direct child of a taskbar (it may cover us).
+        EVENT_OBJECT_SHOW => {
+            window && (taskbar(class) || class == TRAY_NOTIFY_CLASS || taskbar(parent_class))
+        }
+        EVENT_OBJECT_REORDER => taskbar(class),
+        _ => false,
+    }
 }
 
-/// Whether `hwnd`'s window class is one of `names` (a local lookup, no message).
-fn class_is(hwnd: HWND, names: &[&str]) -> bool {
+/// The window class of `hwnd` (a local lookup, no message); empty for no window.
+fn class_name(hwnd: HWND) -> String {
     if hwnd.is_invalid() {
-        return false;
+        return String::new();
     }
     let mut buf = [0u16; 32];
     // SAFETY: `buf` outlives the call.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
-    let class = &buf[..usize::try_from(n).unwrap_or(0)];
-    names
-        .iter()
-        .any(|name| name.encode_utf16().eq(class.iter().copied()))
+    String::from_utf16_lossy(&buf[..usize::try_from(n).unwrap_or(0)])
 }
 
 /// The window procedure of the widget. Clicks open the menu on the host window; nothing
@@ -653,4 +650,97 @@ fn secondary_clocks(
         }
     }
     (clocks, missing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_HIDE;
+
+    const NOT_TASKBAR: &str = "#32769";
+
+    #[test]
+    fn show_of_a_taskbar_its_tray_or_its_child_triggers() {
+        for (class, parent) in [
+            ("Shell_TrayWnd", NOT_TASKBAR),
+            ("Shell_SecondaryTrayWnd", NOT_TASKBAR),
+            ("TrayNotifyWnd", "Shell_TrayWnd"),
+            (
+                "Windows.UI.Composition.DesktopWindowContentBridge",
+                "Shell_TrayWnd",
+            ),
+            ("WorkerW", "Shell_SecondaryTrayWnd"),
+        ] {
+            assert!(
+                is_layout_trigger(EVENT_OBJECT_SHOW, true, class, parent),
+                "{class} in {parent}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_of_other_windows_or_parts_does_not_trigger() {
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_SHOW,
+            true,
+            "CabinetWClass",
+            NOT_TASKBAR
+        ));
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_SHOW,
+            true,
+            "MSTaskListWClass",
+            "MSTaskSwWClass"
+        ));
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_SHOW,
+            false,
+            "Shell_TrayWnd",
+            NOT_TASKBAR
+        ));
+    }
+
+    #[test]
+    fn location_change_of_a_taskbar_or_its_tray_triggers() {
+        let moved = |class, window| {
+            is_layout_trigger(EVENT_OBJECT_LOCATIONCHANGE, window, class, NOT_TASKBAR)
+        };
+        assert!(moved("Shell_TrayWnd", true));
+        assert!(moved("Shell_SecondaryTrayWnd", true));
+        assert!(moved("TrayNotifyWnd", true));
+        assert!(!moved("ReBarWindow32", true));
+        assert!(!moved("Shell_TrayWnd", false));
+    }
+
+    #[test]
+    fn reorder_of_a_taskbar_triggers_whatever_the_object() {
+        assert!(is_layout_trigger(
+            EVENT_OBJECT_REORDER,
+            false,
+            "Shell_TrayWnd",
+            NOT_TASKBAR
+        ));
+        assert!(is_layout_trigger(
+            EVENT_OBJECT_REORDER,
+            false,
+            "Shell_SecondaryTrayWnd",
+            NOT_TASKBAR
+        ));
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_REORDER,
+            false,
+            "ReBarWindow32",
+            "Shell_TrayWnd"
+        ));
+    }
+
+    #[test]
+    fn other_events_do_not_trigger() {
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_HIDE,
+            true,
+            "Shell_TrayWnd",
+            NOT_TASKBAR
+        ));
+    }
 }
