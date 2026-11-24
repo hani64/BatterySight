@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod alerts;
 mod autostart;
 mod list;
 mod ui;

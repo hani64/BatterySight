@@ -4,11 +4,13 @@
 //! Runs on the UI thread. `Shell_NotifyIconW` is one of the bounded Explorer calls allowed
 //! on that thread (measured at up to 32 ms during an Explorer restart).
 
+use batterysight_core::model::DeviceKey;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-    NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIM_SETVERSION, NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON, SM_CXSMICON};
 
@@ -59,6 +61,11 @@ impl Tray {
     pub fn remove(&mut self) {
         remove_all(&mut self.icons, &mut self.shell);
     }
+
+    /// The id of the icon that shows the device `key`, if the notification area has it.
+    pub fn icon_id(&self, key: &DeviceKey) -> Option<u32> {
+        icon_id(&self.icons, key)
+    }
 }
 
 impl Drop for Tray {
@@ -69,7 +76,7 @@ impl Drop for Tray {
 
 /// What [`sync`] asks of the notification area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action {
+pub(super) enum Action {
     /// Add the icon (and set its version).
     Add,
     Modify,
@@ -77,9 +84,11 @@ enum Action {
 }
 
 /// Drawing and showing icons; [`NotifyArea`] in the app.
-trait Shell {
+pub(super) trait Shell {
     fn render(&mut self, view: Option<&DeviceView>, light: bool) -> Option<HICON>;
     fn notify(&mut self, action: Action, id: u32, content: Option<(HICON, &str)>) -> bool;
+    /// Shows a warning balloon (a toast on Windows 10 and 11) from icon `id`.
+    fn balloon(&mut self, id: u32, title: &str, text: &str) -> bool;
     fn destroy(&mut self, icon: HICON);
 }
 
@@ -149,9 +158,16 @@ fn remove_all(icons: &mut Vec<Icon>, shell: &mut impl Shell) {
     }
 }
 
+fn icon_id(icons: &[Icon], key: &DeviceKey) -> Option<u32> {
+    let at = icons
+        .iter()
+        .position(|i| i.added && i.view.as_ref().is_some_and(|v| &v.key == key))?;
+    Some(at as u32 + 1)
+}
+
 /// The real notification area, with icons for `host`.
-struct NotifyArea {
-    host: HWND,
+pub(super) struct NotifyArea {
+    pub(super) host: HWND,
 }
 
 impl Shell for NotifyArea {
@@ -168,6 +184,21 @@ impl Shell for NotifyArea {
             Action::Modify => self.shell_notify(NIM_MODIFY, id, content),
             Action::Delete => self.shell_notify(NIM_DELETE, id, None),
         }
+    }
+
+    fn balloon(&mut self, id: u32, title: &str, text: &str) -> bool {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.host,
+            uID: id,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_WARNING,
+            ..Default::default()
+        };
+        copy_wide(&mut data.szInfoTitle, title);
+        copy_wide(&mut data.szInfo, text);
+        // SAFETY: `data` outlives the call.
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool()
     }
 
     fn destroy(&mut self, icon: HICON) {
@@ -193,11 +224,7 @@ impl NotifyArea {
             data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE;
             data.uCallbackMessage = WM_APP_TRAY;
             data.hIcon = icon;
-            // Truncated to the buffer, keeping the terminating NUL.
-            let room = data.szTip.len() - 1;
-            for (d, c) in data.szTip[..room].iter_mut().zip(tip.encode_utf16()) {
-                *d = c;
-            }
+            copy_wide(&mut data.szTip, tip);
         }
         if action == NIM_SETVERSION {
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -207,29 +234,41 @@ impl NotifyArea {
     }
 }
 
+/// Copies `s` into the fixed buffer `dst`, truncated to keep its terminating NUL.
+fn copy_wide(dst: &mut [u16], s: &str) {
+    let room = dst.len().saturating_sub(1);
+    for (d, c) in dst[..room].iter_mut().zip(s.encode_utf16()) {
+        *d = c;
+    }
+}
+
 /// Small-icon size at the system DPI, the DPI the notification area uses.
-fn icon_size() -> i32 {
+pub(super) fn icon_size() -> i32 {
     // SAFETY: no pointers involved.
     unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::ffi::c_void;
 
     use batterysight_core::model::{
-        Charge, DeviceKey, DeviceKind, DeviceState, Level, Presence, Source, Verification, Via,
+        Charge, DeviceKind, DeviceState, Level, Presence, Source, Verification, Via,
     };
     use batterysight_core::settings::Settings;
 
-    /// Records calls; icons are numbered handles; `fail` lists views that cannot be drawn.
+    /// Records calls; icons are numbered handles; `fail` lists views that cannot be drawn;
+    /// the notification area refuses every call for the icon ids in `refused`.
     #[derive(Default)]
-    struct FakeShell {
-        fail: Vec<String>,
-        next: usize,
-        calls: Vec<(Action, u32, Option<String>)>,
-        destroyed: Vec<usize>,
+    pub(in crate::ui) struct FakeShell {
+        pub(in crate::ui) fail: Vec<String>,
+        pub(in crate::ui) refused: Vec<u32>,
+        pub(in crate::ui) next: usize,
+        pub(in crate::ui) calls: Vec<(Action, u32, Option<String>)>,
+        /// Balloons shown: icon id and text.
+        pub(in crate::ui) balloons: Vec<(u32, String)>,
+        pub(in crate::ui) destroyed: Vec<usize>,
     }
 
     impl Shell for FakeShell {
@@ -244,6 +283,14 @@ mod tests {
         fn notify(&mut self, action: Action, id: u32, content: Option<(HICON, &str)>) -> bool {
             self.calls
                 .push((action, id, content.map(|(_, tip)| tip.to_owned())));
+            !self.refused.contains(&id)
+        }
+
+        fn balloon(&mut self, id: u32, _title: &str, text: &str) -> bool {
+            if self.refused.contains(&id) {
+                return false;
+            }
+            self.balloons.push((id, text.to_owned()));
             true
         }
 
@@ -253,15 +300,37 @@ mod tests {
     }
 
     fn view(text: &str) -> DeviceView {
+        keyed("M", text)
+    }
+
+    /// A view of device `key` showing `text`.
+    pub(in crate::ui) fn keyed(key: &str, text: &str) -> DeviceView {
         DeviceView {
-            key: DeviceKey("M".into()),
+            key: DeviceKey(key.into()),
             glyph: '\u{E962}',
             text: text.into(),
             dimmed: false,
             charging: false,
             low: false,
-            tooltip: format!("M — {text}"),
+            tooltip: format!("{key} — {text}"),
         }
+    }
+
+    #[test]
+    fn icon_id_finds_the_shown_icon_of_a_device() {
+        let mut shell = FakeShell::default();
+        let mut icons = Vec::new();
+        sync(
+            &mut icons,
+            &mut shell,
+            &[keyed("A", "10%"), keyed("B", "20%")],
+            false,
+        );
+        assert_eq!(icon_id(&icons, &DeviceKey("B".into())), Some(2));
+        assert_eq!(icon_id(&icons, &DeviceKey("C".into())), None);
+        // An icon the notification area does not have cannot carry a balloon.
+        icons[0].added = false;
+        assert_eq!(icon_id(&icons, &DeviceKey("A".into())), None);
     }
 
     #[test]
