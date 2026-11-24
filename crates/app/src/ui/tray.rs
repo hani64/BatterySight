@@ -419,6 +419,7 @@ pub(super) mod tests {
             updated_ms: 0,
             source: Source::Query,
             verification: Verification::HardwareTested,
+            poll_min_ms: None,
         };
         let states = [state("A"), state("B")];
         let mut settings = Settings::default();
