@@ -140,12 +140,12 @@ impl Sample {
         self.level == other.level && self.charge == other.charge && self.presence == other.presence
     }
 
-    /// A session break for `key` at `at_unix_ms`: nothing was observed from the device's
-    /// previous sample until now (BatterySight was not running, or the PC was off or
-    /// asleep). Written as an offline sample with nothing known (no level or millivolts,
-    /// charge unknown, source OS), it ends discharge spans and chart lines like any offline
-    /// sample. A real reading of an offline device that knows nothing reads the same, and
-    /// means the same.
+    /// A session break for `key` at `at_unix_ms`: the device was not observed for a time
+    /// around it — before it when BatterySight starts or the PC resumes, after it when the
+    /// PC is going to sleep. Written as an offline sample with nothing known (no level or
+    /// millivolts, charge unknown, source OS), it ends discharge spans and chart lines like
+    /// any offline sample. A real reading of an offline device that knows nothing reads the
+    /// same, and means the same.
     pub fn session_break(key: DeviceKey, at_unix_ms: u64) -> Sample {
         Sample {
             at_unix_ms,
@@ -796,6 +796,42 @@ mod tests {
         assert_eq!(breaks.len(), 1);
         add(&mut history, breaks, resume + HOUR);
         assert!(r.session_break(&history, resume + 2 * HOUR).is_empty());
+    }
+
+    #[test]
+    fn resume_break_separates_a_reading_taken_as_the_pc_went_to_sleep() {
+        let mut r = Recorder::default();
+        let mut history = HashMap::new();
+        add(&mut history, r.observe(&[state(80, 1)], T0), T0);
+        // The suspend notice at 23:00, then a reading at 23:00:01 before the PC sleeps.
+        let suspend = T0 + HOUR;
+        let breaks = r.session_break(&history, suspend);
+        add(&mut history, breaks, suspend);
+        let late = suspend + 1_000;
+        let read = r.observe(&[state(80, 2)], late);
+        assert_eq!(read.len(), 1);
+        add(&mut history, read, late);
+        // Resume at 08:00: the break comes again, then the resume reading.
+        let resume = T0 + 10 * HOUR;
+        let breaks = r.session_break(&history, resume);
+        assert_eq!(breaks.len(), 1);
+        add(&mut history, breaks, resume);
+        let read = r.observe(&[state(80, 3)], resume);
+        add(&mut history, read, resume);
+        let at: Vec<(u64, bool)> = history[&key("logi:4082:1")]
+            .iter()
+            .map(|s| (s.at_unix_ms, s.is_break()))
+            .collect();
+        assert_eq!(
+            at,
+            [
+                (T0, false),
+                (suspend, true),
+                (late, false),
+                (resume, true),
+                (resume, false)
+            ]
+        );
     }
 
     #[test]
