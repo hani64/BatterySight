@@ -5,12 +5,13 @@
 //!
 //! The UI thread (the main thread) owns a hidden host window, the widget windows (children
 //! of Explorer's taskbars, so Explorer's taskbar thread shares this thread's input queue),
-//! the tray icons in tray mode and a low-battery notification's temporary icon. It only
-//! paints, positions, shows notifications and handles menu and mouse input; its calls to
-//! Explorer are the ones `widget` and `tray` list. The device runtime's `on_change` runs on
-//! the device thread and only posts [`WM_APP_CHANGED`] here; the menu reads the snapshot,
-//! the in-memory settings and the monitor list, and sends no device traffic. Settings and
-//! the last 30 days of battery history are loaded before the UI starts; changes are saved,
+//! the tray icons in tray mode, a low-battery notification's temporary icon and the hover
+//! card (a top-level popup, `card`). It only paints, positions, shows notifications and
+//! handles menu and mouse input; its calls to Explorer are the ones `widget` and `tray`
+//! list. The device runtime's `on_change` runs on the device thread and only posts
+//! [`WM_APP_CHANGED`] here; the menu and the hover card read the snapshot, the in-memory
+//! settings and history and the monitor list, and send no device traffic. Settings and the
+//! last 30 days of battery history are loaded before the UI starts; changes are saved,
 //! history samples (recorded from snapshot changes, never from device traffic of their
 //! own, and a session break at start and as the PC sleeps) appended, and the Run value
 //! written, by the store's writer thread ([`Store`]). The history window (a normal
@@ -27,15 +28,16 @@
 //!
 //! - Messages from outside (`TaskbarCreated`, `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`,
 //!   `WM_POWERBROADCAST`, `WM_CLOSE`, WinEvent callbacks, `WM_DPICHANGED_AFTERPARENT`,
-//!   clicks and tray callbacks) never touch the state where they arrive: they post one of
-//!   our `WM_APP_*` messages.
+//!   clicks, the cursor moving on or leaving a widget, and tray callbacks) never touch the
+//!   state where they arrive: they post one of our `WM_APP_*` messages.
 //!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`],
-//!   [`WM_APP_SELF_RETRY`] or [`WM_APP_NOTIFY_DONE`].
+//!   [`WM_APP_SELF_RETRY`], [`WM_APP_NOTIFY_DONE`] or [`WM_APP_HOVER_DUE`].
 //! - Only `WM_APP_*` handlers borrow the state. One that arrives while the state is borrowed
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
 //!   tracked with the state released; the chosen command borrows it again afterwards.
 
+mod card;
 mod chart;
 pub mod fallback;
 mod history_window;
@@ -52,6 +54,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError, TryLockError};
+use std::thread::LocalKey;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use batterysight_core::history::{self, Recorder, Sample};
@@ -59,27 +62,31 @@ use batterysight_core::model::{
     Charge, CoarseLevel, DeviceKey, DeviceKind, DeviceState, Level, Presence,
 };
 use batterysight_core::settings::{DisplayMode, Settings, Threshold};
+use batterysight_core::time::Ms;
 use batterysight_win::runtime::{self, RuntimeHandle};
 use batterysight_win::store::Store;
 use batterysight_win::trace::ui_line;
-use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION,
-    WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetCursorPos, GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SetTimer, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION,
+    WM_MOUSEMOVE, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
+use card::Card;
 use fallback::{TrayReason, should_retry_widget};
 use menu::{MenuCommand, Model};
 use notify::Notifier;
 use tray::Tray;
-use widget::Widgets;
+use widget::{Hover, Widgets};
 
 use crate::alerts::Alerts;
 
@@ -95,21 +102,56 @@ pub struct DeviceView {
     pub dimmed: bool,
     pub charging: bool,
     pub low: bool,
+    /// The hover card's text ([`card::card_text`]), one line each, for tray icons.
     pub tooltip: String,
 }
 
-/// The devices to show: in the user's order, hidden and offline devices left out.
-pub fn views(states: &[DeviceState], settings: &Settings) -> Vec<DeviceView> {
+impl DeviceView {
+    /// Whether `self` draws like `other` (the tooltip aside).
+    fn looks_like(&self, other: &DeviceView) -> bool {
+        (
+            &self.key,
+            self.glyph,
+            &self.text,
+            self.dimmed,
+            self.charging,
+            self.low,
+        ) == (
+            &other.key,
+            other.glyph,
+            &other.text,
+            other.dimmed,
+            other.charging,
+            other.low,
+        )
+    }
+}
+
+/// The devices to show: in the user's order, hidden and offline devices left out. `kept`:
+/// the history, for the time left; `now`: the monotonic time of the readings; `unix_now`:
+/// the wall-clock time of the samples.
+pub fn views(
+    states: &[DeviceState],
+    settings: &Settings,
+    kept: &HashMap<DeviceKey, Vec<Sample>>,
+    now: Ms,
+    unix_now: u64,
+) -> Vec<DeviceView> {
     settings
         .ordered(states)
         .into_iter()
         .filter(|s| s.presence != Presence::Offline && !settings.hidden.contains(&s.key))
-        .map(|s| view(s, settings.threshold(&s.key)))
+        .map(|s| {
+            let samples = kept.get(&s.key).map_or(&[][..], Vec::as_slice);
+            let left = history::time_left(samples, unix_now);
+            let tooltip = card::card_text(s, left, now).join("\n");
+            view(s, settings.threshold(&s.key), tooltip)
+        })
         .collect()
 }
 
 /// One device; `threshold`: its low-battery threshold, which also colours it as low.
-fn view(s: &DeviceState, threshold: Threshold) -> DeviceView {
+fn view(s: &DeviceState, threshold: Threshold, tooltip: String) -> DeviceView {
     // Segoe Fluent Icons code points (the same in Segoe MDL2 Assets).
     let glyph = match s.kind {
         DeviceKind::Mouse => '\u{E962}',
@@ -118,22 +160,6 @@ fn view(s: &DeviceState, threshold: Threshold) -> DeviceView {
         DeviceKind::Controller => '\u{E7FC}',
         DeviceKind::Other => '\u{E83F}',
     };
-    let text = match s.level {
-        Some(Level::Percent(p)) => format!("{p}%"),
-        Some(Level::Coarse(c)) => match c {
-            CoarseLevel::Critical => "Critical",
-            CoarseLevel::Low => "Low",
-            CoarseLevel::Good => "Good",
-            CoarseLevel::Full => "Full",
-        }
-        .to_owned(),
-        None => "?".to_owned(),
-    };
-    let charging = s.charge == Charge::Charging;
-    let mut tooltip = format!("{} — {text}", s.name);
-    if charging {
-        tooltip.push_str(" charging");
-    }
     let low = match (s.level, threshold) {
         (Some(Level::Percent(p)), Threshold::Percent(t)) => p <= t,
         _ => false,
@@ -141,17 +167,42 @@ fn view(s: &DeviceState, threshold: Threshold) -> DeviceView {
     DeviceView {
         key: s.key.clone(),
         glyph,
-        text,
+        text: s.level.map_or_else(|| "?".to_owned(), level_text),
         dimmed: s.presence != Presence::Online,
-        charging,
+        charging: s.charge == Charge::Charging,
         low,
         tooltip,
     }
 }
 
+/// "70%", or the word of a coarse level.
+fn level_text(level: Level) -> String {
+    match level {
+        Level::Percent(p) => format!("{p}%"),
+        Level::Coarse(c) => match c {
+            CoarseLevel::Critical => "Critical",
+            CoarseLevel::Low => "Low",
+            CoarseLevel::Good => "Good",
+            CoarseLevel::Full => "Full",
+        }
+        .to_owned(),
+    }
+}
+
+/// A device's one-line label in the menu: "Name — 70%", with " charging" while charging.
+fn label(s: &DeviceState) -> String {
+    let text = s.level.map_or_else(|| "?".to_owned(), level_text);
+    let mut label = format!("{} — {text}", s.name);
+    if s.charge == Charge::Charging {
+        label.push_str(" charging");
+    }
+    label
+}
+
 const HOST_CLASS: PCWSTR = w!("BatterySightHost");
 const WIDGET_CLASS: PCWSTR = w!("BatterySightWidget");
 const HISTORY_CLASS: PCWSTR = w!("BatterySightHistory");
+const CARD_CLASS: PCWSTR = w!("BatterySightCard");
 
 /// The snapshot changed (posted by the device thread).
 const WM_APP_CHANGED: u32 = WM_APP + 1;
@@ -183,6 +234,15 @@ const WM_APP_NOTIFY_DONE: u32 = WM_APP + 12;
 const WM_APP_RESUMED: u32 = WM_APP + 13;
 /// The PC is going to sleep (`WM_POWERBROADCAST`, `PBT_APMSUSPEND`).
 const WM_APP_SUSPENDING: u32 = WM_APP + 14;
+/// The cursor moved on a widget (queued once however many moves, [`schedule_hover`]).
+const WM_APP_HOVER: u32 = WM_APP + 15;
+/// The cursor rested [`HOVER_MS`] on a device: show its card (posted by [`HOVER_TIMER`]).
+const WM_APP_HOVER_DUE: u32 = WM_APP + 16;
+/// The cursor left a widget (`WM_MOUSELEAVE`): hide the card.
+const WM_APP_HOVER_END: u32 = WM_APP + 17;
+/// The cursor moved on a tray icon: bring the tooltips' ages up to date (queued once
+/// however many moves).
+const WM_APP_TIPS: u32 = WM_APP + 18;
 
 /// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
@@ -197,6 +257,10 @@ const SELF_RETRY_TIMER: usize = 3;
 /// One-shot: removes the notification's temporary icon ([`notify::TEMP_ICON_MS`] after the
 /// last notification), through [`WM_APP_NOTIFY_DONE`].
 const NOTIFY_TIMER: usize = 4;
+/// One-shot: [`HOVER_MS`] after the cursor came to a device on a widget, shows its card,
+/// through [`WM_APP_HOVER_DUE`].
+const HOVER_TIMER: usize = 5;
+const HOVER_MS: u32 = 400;
 
 /// Sleep of the widget thread after the first click with `--debug-stall-widget`.
 const DEBUG_STALL: Duration = Duration::from_secs(10);
@@ -218,6 +282,12 @@ thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
     /// A `WM_APP_LAYOUT` is queued.
     static LAYOUT_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// A `WM_APP_HOVER` is queued.
+    static HOVER_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// A `WM_APP_TIPS` is queued.
+    static TIPS_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// The menu's modal loop runs: no card shows meanwhile.
+    static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
 pub struct Options {
@@ -252,7 +322,10 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
     };
     let light = light_theme();
     let states = read_snapshot(&runtime);
-    let views = views(&states, &settings);
+    let unix_now = unix_now_ms();
+    let mut history = HashMap::new();
+    history::add(&mut history, samples, unix_now);
+    let views = views(&states, &settings, &history, tick_ms(), unix_now);
     let widgets = match options.tray {
         Some(reason) => Err(reason),
         None => {
@@ -271,8 +344,6 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
             (Surface::Tray(tray), Some(reason))
         }
     };
-    let mut history = HashMap::new();
-    history::add(&mut history, samples, unix_now_ms());
     let mut ui = Ui {
         host,
         runtime,
@@ -287,6 +358,8 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         notifier: Notifier::new(host),
         history,
         recorder: Recorder::default(),
+        card: Card::new(host),
+        hover: None,
     };
     // Nothing was observed while the app was not running.
     ui.session_break();
@@ -313,6 +386,7 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         let _ = KillTimer(Some(host), WIDGET_CHECK_TIMER);
         let _ = KillTimer(Some(host), SELF_RETRY_TIMER);
         let _ = KillTimer(Some(host), NOTIFY_TIMER);
+        let _ = KillTimer(Some(host), HOVER_TIMER);
         let _ = DestroyWindow(host);
     }
     0
@@ -350,6 +424,11 @@ struct Ui {
     /// those recorded since.
     history: HashMap<DeviceKey, Vec<Sample>>,
     recorder: Recorder,
+    /// The hover card, shown in widget mode.
+    card: Card,
+    /// The device under the cursor on a widget, while it is there: its card shows, or is
+    /// due when [`HOVER_TIMER`] fires.
+    hover: Option<Hover>,
 }
 
 /// When the widget fell back, and how many self-retries have run since.
@@ -370,6 +449,8 @@ impl Ui {
                 self.show();
             }
             WM_APP_TASKBAR_CREATED => {
+                // The taskbar the card sat above is gone.
+                self.end_hover();
                 // The old Explorer took the temporary icon with it.
                 self.notifier.remove();
                 if self.retry_widget(true) {
@@ -389,6 +470,8 @@ impl Ui {
                 }
             }
             WM_APP_ENVIRONMENT => {
+                // Monitors, DPI or theme may have changed under the card.
+                self.end_hover();
                 self.light = light_theme();
                 if self.retry_widget(true) {
                     return;
@@ -438,6 +521,11 @@ impl Ui {
             // covers a reading taken between the suspend notice and the sleep (a no-op for
             // devices not read since the first).
             WM_APP_SUSPENDING | WM_APP_RESUMED => self.session_break(),
+            WM_APP_HOVER => self.hover(),
+            WM_APP_HOVER_DUE => self.hover_due(),
+            WM_APP_HOVER_END => self.end_hover(),
+            // Ages in the tooltips ("updated N min ago") move on without a new snapshot.
+            WM_APP_TIPS => self.update_views(&read_snapshot(&self.runtime)),
             _ => {}
         }
     }
@@ -448,6 +536,9 @@ impl Ui {
         let states = read_snapshot(&self.runtime);
         self.record(&states);
         self.update_views(&states);
+        if self.card.shown().is_some() {
+            self.show_card(&states);
+        }
         let alerts = self.alerts.check(&states, &self.settings);
         let Some(first) = alerts.first() else {
             return;
@@ -501,21 +592,111 @@ impl Ui {
         history_window::open(devices, &self.history);
     }
 
-    /// Shows the views of `states` if they changed.
+    /// Shows the views of `states` if they changed; the widgets only if they look
+    /// different (they show no tooltips).
     fn update_views(&mut self, states: &[DeviceState]) {
-        let views = views(states, &self.settings);
-        if views != self.views {
-            self.views = views;
-            if let Surface::Widgets(w) = &mut self.surface {
-                w.invalidate();
-            }
-            self.show();
+        let views = views(
+            states,
+            &self.settings,
+            &self.history,
+            tick_ms(),
+            unix_now_ms(),
+        );
+        if views == self.views {
+            return;
+        }
+        let looks = views.len() != self.views.len()
+            || views.iter().zip(&self.views).any(|(a, b)| !a.looks_like(b));
+        self.views = views;
+        match &mut self.surface {
+            Surface::Widgets(_) if !looks => return,
+            Surface::Widgets(w) => w.invalidate(),
+            Surface::Tray(_) => {}
+        }
+        self.show();
+    }
+
+    /// The cursor moved on a widget. On a device other than the one hovered so far, the
+    /// card switches to it at once if one shows, else shows [`HOVER_MS`] later.
+    fn hover(&mut self) {
+        let Some(hover) = self.hit() else {
+            self.end_hover();
+            return;
+        };
+        if self.hover.as_ref().is_some_and(|h| h.key == hover.key) {
+            return;
+        }
+        self.hover = Some(hover);
+        if self.card.shown().is_some() {
+            self.show_card(&read_snapshot(&self.runtime));
+        } else {
+            // SAFETY: our own window; setting an existing timer id restarts it.
+            unsafe { SetTimer(Some(self.host), HOVER_TIMER, HOVER_MS, None) };
         }
     }
 
+    /// [`HOVER_TIMER`] fired: shows the card if the cursor is still on the device.
+    fn hover_due(&mut self) {
+        let Some(hover) = self.hit() else {
+            self.end_hover();
+            return;
+        };
+        if self.hover.as_ref().is_some_and(|h| h.key == hover.key) {
+            self.hover = Some(hover);
+            self.show_card(&read_snapshot(&self.runtime));
+        }
+    }
+
+    /// The device under the cursor on a widget; none while the menu is open. Reads
+    /// window-manager state only.
+    fn hit(&self) -> Option<Hover> {
+        let Surface::Widgets(w) = &self.surface else {
+            return None;
+        };
+        if MENU_OPEN.get() {
+            return None;
+        }
+        let mut at = POINT::default();
+        // SAFETY: `at` outlives the call.
+        unsafe { GetCursorPos(&mut at) }.ok()?;
+        w.hit(at)
+    }
+
+    /// Shows (or repaints) the card of the hovered device from `states` and the history in
+    /// memory; a device no longer shown ends the hover.
+    fn show_card(&mut self, states: &[DeviceState]) {
+        let Some(hover) = &self.hover else {
+            return;
+        };
+        let shown = self.views.iter().any(|v| v.key == hover.key);
+        let Some(state) = states.iter().find(|s| shown && s.key == hover.key) else {
+            self.end_hover();
+            return;
+        };
+        let samples = self.history.get(&hover.key).map_or(&[][..], Vec::as_slice);
+        let left = history::time_left(samples, unix_now_ms());
+        let lines = card::card_text(state, left, tick_ms());
+        self.card.show(hover, &lines, samples, self.light);
+        if self.card.shown().is_none() {
+            // Not drawn: the next move on the device tries again.
+            self.hover = None;
+        }
+    }
+
+    /// Hides the card and forgets the hovered device (the cursor left, the menu opens,
+    /// the surface or the taskbars change, or the app exits).
+    fn end_hover(&mut self) {
+        // SAFETY: our own window and timer (killing one that is not set fails harmlessly).
+        let _ = unsafe { KillTimer(Some(self.host), HOVER_TIMER) };
+        self.hover = None;
+        self.card.hide();
+    }
+
     /// Replaces what shows the devices; dropping the old surface removes its windows or
-    /// icons. A notification's temporary icon goes too: it belongs to the old surface.
+    /// icons. A notification's temporary icon goes too: it belongs to the old surface, and
+    /// so does the hover card.
     fn set_surface(&mut self, surface: Surface) {
+        self.end_hover();
         self.notifier.remove();
         self.surface = surface;
     }
@@ -722,11 +903,12 @@ impl Ui {
         with_store(|store| store.save_settings(settings));
     }
 
-    /// Removes the widgets or tray icons and a notification's temporary icon, finishes the
-    /// queued writes (at most 1 s), closes the history window (at most 1 s), then stops
-    /// the runtime (bounded by its 2 s limit) and ends the message loop.
+    /// Removes the hover card, the widgets or tray icons and a notification's temporary
+    /// icon, finishes the queued writes (at most 1 s), closes the history window (at most
+    /// 1 s), then stops the runtime (bounded by its 2 s limit) and ends the message loop.
     fn exit(self) {
         watchdog::arm(false);
+        drop(self.card);
         drop(self.surface);
         drop(self.notifier);
         // First: a window that does not close in time must not hold up the writes.
@@ -831,8 +1013,18 @@ fn post_with(msg: u32, wparam: usize) {
 
 /// Queues one `WM_APP_LAYOUT`, however many events ask for it.
 fn schedule_layout() {
-    if !LAYOUT_PENDING.replace(true) {
-        post(WM_APP_LAYOUT);
+    post_once(&LAYOUT_PENDING, WM_APP_LAYOUT);
+}
+
+/// Queues one `WM_APP_HOVER`, however many moves ask for it.
+fn schedule_hover() {
+    post_once(&HOVER_PENDING, WM_APP_HOVER);
+}
+
+/// Posts `msg` unless `pending` says it is queued; its handler clears `pending`.
+fn post_once(pending: &'static LocalKey<Cell<bool>>, msg: u32) {
+    if !pending.replace(true) {
+        post(msg);
     }
 }
 
@@ -877,6 +1069,12 @@ pub fn unix_now_ms() -> u64 {
         })
 }
 
+/// The monotonic time of the readings (`DeviceState::updated_ms`).
+fn tick_ms() -> Ms {
+    // SAFETY: no arguments.
+    unsafe { GetTickCount64() }
+}
+
 /// Registers the window classes and creates the hidden host window. It is a top-level
 /// window rather than a message-only one, which would not receive broadcasts such as
 /// `TaskbarCreated`.
@@ -909,9 +1107,17 @@ fn create_host() -> Option<HWND> {
             lpszClassName: HISTORY_CLASS,
             ..Default::default()
         };
+        let card_class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(card::window_proc),
+            hInstance: instance,
+            lpszClassName: CARD_CLASS,
+            ..Default::default()
+        };
         if RegisterClassExW(&host_class) == 0
             || RegisterClassExW(&widget_class) == 0
             || RegisterClassExW(&history_class) == 0
+            || RegisterClassExW(&card_class) == 0
         {
             return None;
         }
@@ -957,6 +1163,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let _ = unsafe { KillTimer(Some(hwnd), NOTIFY_TIMER) };
             post(WM_APP_NOTIFY_DONE);
         }
+        WM_TIMER if wp.0 == HOVER_TIMER => {
+            // SAFETY: our own window and timer; the card is due once.
+            let _ = unsafe { KillTimer(Some(hwnd), HOVER_TIMER) };
+            post(WM_APP_HOVER_DUE);
+        }
         WM_TIMER => watchdog::beat(),
         // Never handled where they arrive (see the module doc); WM_SETTINGCHANGE's string
         // is not needed, every change is re-read.
@@ -978,20 +1189,24 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let event = (lp.0 & 0xFFFF) as u32;
             if matches!(event, WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT) {
                 post(WM_APP_MENU);
+            } else if event == WM_MOUSEMOVE {
+                post_once(&TIPS_PENDING, WM_APP_TIPS);
             }
         }
         WM_APP_CHANGED..=WM_APP_CHECK_WIDGET
         | WM_APP_SELF_RETRY
         | WM_APP_NOTIFY_DONE
-        | WM_APP_RESUMED
-        | WM_APP_SUSPENDING => {
+        | WM_APP_RESUMED..=WM_APP_TIPS => {
             if ui_busy() {
                 // SAFETY: no pointers involved.
                 let _ = unsafe { PostMessageW(Some(hwnd), msg, wp, lp) };
                 return LRESULT(0);
             }
-            if msg == WM_APP_LAYOUT {
-                LAYOUT_PENDING.set(false);
+            match msg {
+                WM_APP_LAYOUT => LAYOUT_PENDING.set(false),
+                WM_APP_HOVER => HOVER_PENDING.set(false),
+                WM_APP_TIPS => TIPS_PENDING.set(false),
+                _ => {}
             }
             with_ui(|ui| ui.handle(msg, wp));
         }
@@ -1012,17 +1227,23 @@ fn exit() {
     }
 }
 
-/// Shows the menu at the cursor and carries out the command chosen.
+/// Hides the hover card, shows the menu at the cursor and carries out the command chosen.
 fn menu(host: HWND) {
     if ui_busy() {
         post(WM_APP_MENU);
         return;
     }
-    let Some(model) = with_ui(|ui| ui.menu_model()) else {
+    let Some(model) = with_ui(|ui| {
+        ui.end_hover();
+        ui.menu_model()
+    }) else {
         return;
     };
-    // The state is not borrowed while the menu's modal loop runs.
-    if let Some(command) = menu::track(&model, host) {
+    // The state is not borrowed while the menu's modal loop runs; no card shows meanwhile.
+    MENU_OPEN.set(true);
+    let command = menu::track(&model, host);
+    MENU_OPEN.set(false);
+    if let Some(command) = command {
         with_ui(|ui| ui.apply(command));
     }
 }
@@ -1052,8 +1273,13 @@ mod tests {
     use batterysight_core::model::{Source, Verification, Via};
     use batterysight_core::settings::Threshold;
 
+    /// The views of `states` with `settings`, without history, at time 0.
+    fn shown(states: &[DeviceState], settings: &Settings) -> Vec<DeviceView> {
+        views(states, settings, &HashMap::new(), 0, 0)
+    }
+
     fn all(states: &[DeviceState]) -> Vec<DeviceView> {
-        views(states, &Settings::default())
+        shown(states, &Settings::default())
     }
 
     fn state(name: &str, kind: DeviceKind, level: Option<Level>) -> DeviceState {
@@ -1088,9 +1314,9 @@ mod tests {
             ..Settings::default()
         };
         // User order first; devices it does not list follow in snapshot order.
-        assert_eq!(texts(&views(&states, &settings)), ["30%", "10%", "20%"]);
+        assert_eq!(texts(&shown(&states, &settings)), ["30%", "10%", "20%"]);
         settings.set_hidden(&DeviceKey("A".into()), true);
-        let v = views(&states, &settings);
+        let v = shown(&states, &settings);
         assert_eq!(texts(&v), ["30%", "20%"]);
         assert_eq!(v[0].key, DeviceKey("C".into()));
     }
@@ -1100,11 +1326,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.set_threshold(&DeviceKey("A".into()), Threshold::Percent(30));
         settings.set_threshold(&DeviceKey("B".into()), Threshold::Off);
-        let v = views(&[percent("A", 25), percent("B", 5)], &settings);
+        let v = shown(&[percent("A", 25), percent("B", 5)], &settings);
         assert!(v[0].low, "25 % at a 30 % threshold");
         assert!(!v[1].low, "Off is never low");
         // A device without a threshold keeps the 15 % default.
-        let v = views(&[percent("A", 25), percent("C", 15)], &Settings::default());
+        let v = shown(&[percent("A", 25), percent("C", 15)], &Settings::default());
         assert!(!v[0].low);
         assert!(v[1].low);
     }
@@ -1143,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_omits_verification_status() {
+    fn label_omits_verification_status() {
         let with = |verification| DeviceState {
             verification,
             ..percent("PRO X", 40)
@@ -1154,36 +1380,86 @@ mod tests {
             Verification::CommunityTested,
             Verification::Generic,
         ] {
-            assert_eq!(all(&[with(status)])[0].tooltip, "PRO X — 40%");
+            assert_eq!(label(&with(status)), "PRO X — 40%");
         }
     }
 
     #[test]
-    fn charging_in_flag_and_tooltip() {
+    fn charging_in_flag_and_label() {
         let s = DeviceState {
             charge: Charge::Charging,
             ..percent("M", 70)
         };
-        let v = &all(&[s])[0];
-        assert!(v.charging);
-        assert_eq!(v.tooltip, "M — 70% charging");
+        assert!(all(std::slice::from_ref(&s))[0].charging);
+        assert_eq!(label(&s), "M — 70% charging");
         assert!(!all(&[percent("M", 70)])[0].charging);
     }
 
     #[test]
     fn coarse_level_is_a_word_and_unknown_is_a_question_mark() {
-        let v = all(&[
-            state(
-                "K",
-                DeviceKind::Keyboard,
-                Some(Level::Coarse(CoarseLevel::Good)),
-            ),
-            state("P", DeviceKind::Controller, None),
-        ]);
+        let k = state(
+            "K",
+            DeviceKind::Keyboard,
+            Some(Level::Coarse(CoarseLevel::Good)),
+        );
+        let v = all(&[k.clone(), state("P", DeviceKind::Controller, None)]);
         assert_eq!(v[0].text, "Good");
-        assert_eq!(v[0].tooltip, "K — Good");
+        assert_eq!(label(&k), "K — Good");
         assert!(!v[0].low);
         assert_eq!(v[1].text, "?");
+    }
+
+    #[test]
+    fn tooltip_is_the_card_text() {
+        const HOUR: u64 = 3_600_000;
+        /// 2026-11-24 00:00 UTC.
+        const T: u64 = 1_795_478_400_000;
+        let s = percent("M", 80);
+        let sample = |at, p| Sample {
+            at_unix_ms: at,
+            key: s.key.clone(),
+            level: Some(Level::Percent(p)),
+            charge: Charge::Discharging,
+            presence: Presence::Online,
+            millivolts: None,
+            source: Source::Query,
+        };
+        let mut kept = HashMap::new();
+        kept.insert(
+            s.key.clone(),
+            vec![
+                sample(T, 90),
+                sample(T + HOUR, 85),
+                sample(T + 2 * HOUR, 80),
+            ],
+        );
+        let v = views(
+            std::slice::from_ref(&s),
+            &Settings::default(),
+            &kept,
+            5 * 60_000,
+            T + 2 * HOUR,
+        );
+        // 10 % in 2 h: 80 % lasts 16 h.
+        assert_eq!(
+            v[0].tooltip,
+            "M\nBattery: 80%\nUpdated 5 min ago\nTime left: about 16 h"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_alone_does_not_change_the_look() {
+        let a = &all(&[percent("M", 80)])[0];
+        let b = DeviceView {
+            tooltip: "other".into(),
+            ..a.clone()
+        };
+        assert!(a.looks_like(&b));
+        let c = DeviceView {
+            text: "79%".into(),
+            ..a.clone()
+        };
+        assert!(!a.looks_like(&c));
     }
 
     #[test]

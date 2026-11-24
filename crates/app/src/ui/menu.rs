@@ -266,7 +266,7 @@ impl Builder {
             items: alerts,
         });
         Item::Submenu {
-            label: super::view(s, threshold).tooltip,
+            label: super::label(s),
             items,
         }
     }

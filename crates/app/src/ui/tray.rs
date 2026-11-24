@@ -353,7 +353,7 @@ pub(super) mod tests {
         let mut settings = Settings::default();
         settings.set_hidden(&DeviceKey("A".into()), true);
         settings.set_hidden(&DeviceKey("B".into()), true);
-        let views = super::super::views(&states, &settings);
+        let views = super::super::views(&states, &settings, &Default::default(), 0, 0);
         // The widget draws its own placeholder for no views (`render::widget_strip`).
         assert!(views.is_empty());
         let mut shell = FakeShell::default();
