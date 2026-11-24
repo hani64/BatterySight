@@ -6,10 +6,10 @@ BatterySight is a free, open-source (GPLv3) Windows app that shows the battery l
 
 Milestone 1: Logitech devices that speak HID++ only. The goal is to cover wireless mice, keyboards, headsets and controllers of other vendors too; none is supported yet.
 
-Runs on the maintainer's hardware (Windows 11 build 26300 only); the accuracy check against G HUB is pending:
+Tested on the maintainer's hardware (Windows 11 build 26300 only); the levels shown matched G HUB's within 1 point (BatterySight rounds down):
 
 - Logitech PRO X Wireless Gaming Headset (USB dongle 046D:0ABA)
-- Logitech PRO X Superlight on its LIGHTSPEED receiver (046D:C547); the mouse names itself "PRO X Wireless"
+- Logitech PRO X Superlight on its LIGHTSPEED receiver (046D:C547)
 
 Other Logitech HID++ devices are expected to work from the protocol sources but are untested.
 
