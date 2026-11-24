@@ -191,7 +191,8 @@ impl Shell for NotifyArea {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: self.host,
             uID: id,
-            uFlags: NIF_INFO,
+            // NIF_SHOWTIP again: a call without it turns the icon's tooltip off.
+            uFlags: NIF_INFO | NIF_SHOWTIP,
             dwInfoFlags: NIIF_WARNING,
             ..Default::default()
         };
@@ -243,7 +244,7 @@ fn copy_wide(dst: &mut [u16], s: &str) {
 }
 
 /// Small-icon size at the system DPI, the DPI the notification area uses.
-pub(super) fn icon_size() -> i32 {
+fn icon_size() -> i32 {
     // SAFETY: no pointers involved.
     unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16)
 }

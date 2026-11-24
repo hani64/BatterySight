@@ -176,11 +176,14 @@ fn explorer_answers() -> bool {
     }
 }
 
-/// Finishes the settings writes (at most 1 s, normally none are queued), starts the
-/// tray-only replacement and ends this process at once. The replacement waits for this
-/// process to end before it loads the settings.
+/// Finishes the settings writes (at most 1 s, normally none are queued), deletes a
+/// notification's temporary icon if Explorer answers, starts the tray-only replacement and
+/// ends this process at once. The replacement waits for this process to end before it
+/// loads the settings.
 fn trip() -> ! {
     super::stop_store();
+    // Asks Explorer only with the icon shown: the delete waits on its taskbar thread.
+    super::notify::delete_on_trip(super::host(), explorer_answers);
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe)
             .args(["--tray-only", "--takeover"])
