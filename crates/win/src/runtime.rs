@@ -162,7 +162,7 @@ struct Device {
     hub: Hub,
     reactor: Reactor,
     groups: Vec<Opened>,
-    /// Product strings by lowercased path; each is read from the device once.
+    /// Product strings by lowercased path; each is read from the device until a read succeeds.
     products: HashMap<String, String>,
     /// Keeps a group closed after back-to-back read failures until the next arrival,
     /// resume or refresh.
@@ -265,15 +265,23 @@ impl Device {
     /// Enumerates the HID groups engines want, closes the opened ones no longer present
     /// and opens the new ones, except those the read-failure guard keeps closed.
     fn rescan(&mut self) {
-        let scanned: Vec<(HidGroup, Vec<HidInterface>, PathSet)> =
-            hid_enum::group(hid_enum::enumerate())
-                .into_iter()
-                .filter(|(group, _)| engines::wants(group))
-                .map(|(group, members)| {
-                    let paths = members.iter().map(|m| path_key(&m.path)).collect();
-                    (group, members, paths)
-                })
-                .collect();
+        self.apply_scan(hid_enum::enumerate());
+    }
+
+    /// [`Device::rescan`] on the interfaces `scanned`. `None` (the enumeration failed) says
+    /// nothing about which devices are present, so every group stays as it is.
+    fn apply_scan(&mut self, scanned: Option<Vec<HidInterface>>) {
+        let Some(scanned) = scanned else {
+            return;
+        };
+        let scanned: Vec<(HidGroup, Vec<HidInterface>, PathSet)> = hid_enum::group(scanned)
+            .into_iter()
+            .filter(|(group, _)| engines::wants(group))
+            .map(|(group, members)| {
+                let paths = members.iter().map(|m| path_key(&m.path)).collect();
+                (group, members, paths)
+            })
+            .collect();
         let known: Vec<&PathSet> = self.groups.iter().map(|group| &group.paths).collect();
         let found: Vec<&PathSet> = scanned.iter().map(|(_, _, paths)| paths).collect();
         let gone = unmatched(&known, &found);
@@ -288,31 +296,24 @@ impl Device {
         }
     }
 
-    /// Fills in the product strings, opens the group's collections and hands the opened
-    /// ones to the hub.
-    fn arrive(&mut self, mut group: HidGroup, mut members: Vec<HidInterface>, paths: PathSet) {
-        for member in &mut members {
-            let product = self
-                .products
-                .entry(path_key(&member.path))
-                .or_insert_with(|| hid_enum::product_string(&member.path));
-            if let Some(collection) = group
-                .collections
-                .iter_mut()
-                .find(|collection| collection.id == member.collection.id)
-            {
-                collection.product.clone_from(product);
+    /// Fills in the product strings of the collections an engine reads, opens those and
+    /// hands them to the hub. The group's other collections (such as a headset's consumer
+    /// control) are never opened, so their reports never reach the process.
+    fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet) {
+        let mut opened = Vec::new();
+        for mut member in members
+            .into_iter()
+            .filter(|member| engines::reads(&member.collection))
+        {
+            member.collection.product =
+                cached_product(&mut self.products, path_key(&member.path), || {
+                    hid_enum::product_string(&member.path)
+                });
+            if self.reactor.open(group.id, &member).is_ok() {
+                opened.push(member.collection);
             }
-            member.collection.product.clone_from(product);
         }
-        let opened: Vec<CollectionId> = members
-            .iter()
-            .filter(|member| self.reactor.open(group.id, member).is_ok())
-            .map(|member| member.collection.id)
-            .collect();
-        group
-            .collections
-            .retain(|collection| opened.contains(&collection.id));
+        group.collections = opened;
         if !engines::wants(&group) {
             // None of its HID++ collections opened; the next rescan tries again.
             self.reactor.close_group(group.id);
@@ -321,7 +322,7 @@ impl Device {
         self.groups.push(Opened {
             id: group.id,
             paths,
-            collections: opened,
+            collections: group.collections.iter().map(|c| c.id).collect(),
         });
         self.feed(HubInput::GroupArrived(group), now_ms());
     }
@@ -366,6 +367,24 @@ fn path_key(path: &[u16]) -> String {
         .position(|&unit| unit == 0)
         .unwrap_or(path.len());
     String::from_utf16_lossy(&path[..end]).to_lowercase()
+}
+
+/// The product string cached under `key`, read with `read` when missing. An empty string
+/// (the read failed) is not cached: HID++ receiver detection depends on the product
+/// string, so the next arrival asks again.
+fn cached_product(
+    products: &mut HashMap<String, String>,
+    key: String,
+    read: impl FnOnce() -> String,
+) -> String {
+    if let Some(product) = products.get(&key) {
+        return product.clone();
+    }
+    let product = read();
+    if !product.is_empty() {
+        products.insert(key, product.clone());
+    }
+    product
 }
 
 /// Indices of the sets in `sets` that `others` does not contain.
@@ -430,6 +449,10 @@ impl ReadFailureGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use batterysight_core::hid::Collection;
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+
+    use crate::reactor::tests::Server;
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain([0]).collect()
@@ -508,5 +531,91 @@ mod tests {
         guard.clear();
         assert!(!guard.is_closed(&group));
         assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
+    }
+
+    fn device() -> Device {
+        Device {
+            hub: Hub::new(Catalog::builtin(), Policy::default()),
+            reactor: Reactor::new().unwrap(),
+            groups: Vec::new(),
+            products: HashMap::new(),
+            guard: ReadFailureGuard::default(),
+            trace: None,
+            states: Arc::new(Mutex::new(Vec::new())),
+            on_change: Box::new(|| {}),
+        }
+    }
+
+    /// A collection of the PRO X Wireless dongle (046D:0ABA) served by a named pipe.
+    fn dongle_member(pipe: HidInterface, usage_page: u16, usage: u16, len: u16) -> HidInterface {
+        HidInterface {
+            path: pipe.path,
+            collection: Collection {
+                id: pipe.collection.id,
+                vid: 0x046D,
+                pid: 0x0ABA,
+                usage_page,
+                usage,
+                input_len: len,
+                output_len: len,
+                feature_len: 0,
+                product: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn only_collections_an_engine_reads_are_opened() {
+        let (_hidpp_server, hidpp) = Server::new(PIPE_ACCESS_DUPLEX);
+        let (_consumer_server, consumer) = Server::new(PIPE_ACCESS_DUPLEX);
+        let hidpp = dongle_member(hidpp, 0xFF43, 0x0202, 20);
+        let consumer = dongle_member(consumer, 0x000C, 0x0001, 3);
+        let (hidpp_id, consumer_id) = (hidpp.collection.id, consumer.collection.id);
+        let mut device = device();
+        // A single-instance pipe takes one open only: keep `product_string` off the pipes.
+        for member in [&hidpp, &consumer] {
+            let product = "PRO X Wireless Gaming Headset".to_owned();
+            device.products.insert(path_key(&member.path), product);
+        }
+
+        device.apply_scan(Some(vec![consumer, hidpp]));
+
+        assert_eq!(device.groups.len(), 1);
+        assert_eq!(device.groups[0].collections, [hidpp_id]);
+        assert!(
+            !device.reactor.write(consumer_id, &[0x03]),
+            "consumer control opened"
+        );
+    }
+
+    #[test]
+    fn failed_enumeration_keeps_every_group() {
+        let mut device = device();
+        device.groups.push(Opened {
+            id: GroupId(u32::MAX),
+            paths: set(&["a"]),
+            collections: Vec::new(),
+        });
+
+        device.apply_scan(None);
+        assert_eq!(device.groups.len(), 1);
+
+        device.apply_scan(Some(Vec::new()));
+        assert!(device.groups.is_empty());
+    }
+
+    #[test]
+    fn empty_product_string_is_not_cached() {
+        let mut products = HashMap::new();
+        let key = || "path".to_owned();
+        assert_eq!(cached_product(&mut products, key(), String::new), "");
+        assert_eq!(
+            cached_product(&mut products, key(), || "USB Receiver".into()),
+            "USB Receiver"
+        );
+        assert_eq!(
+            cached_product(&mut products, key(), || panic!("read again")),
+            "USB Receiver"
+        );
     }
 }
