@@ -12,11 +12,11 @@
 //! the in-memory settings and the monitor list, and sends no device traffic. Settings and
 //! the last 30 days of battery history are loaded before the UI starts; changes are saved,
 //! history samples (recorded from snapshot changes, never from device traffic of their
-//! own, and a session break at start and on resume) appended, and the Run value written,
-//! by the store's writer thread ([`Store`]). The history window (a normal top-level window)
-//! runs on its own thread, which this thread only sends data to (`history_window`). UI
-//! Automation runs on its own windowless thread (`widget`), and the [`watchdog`] on
-//! another.
+//! own, and a session break at start and as the PC sleeps) appended, and the Run value
+//! written, by the store's writer thread ([`Store`]). The history window (a normal
+//! top-level window) runs on its own thread, which this thread only sends data to
+//! (`history_window`). UI Automation runs on its own windowless thread (`widget`), and the
+//! [`watchdog`] on another.
 //!
 //! # Re-entrancy
 //!
@@ -68,10 +68,10 @@ use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegG
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
+    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION,
+    WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -181,6 +181,8 @@ const WM_APP_SELF_RETRY: u32 = WM_APP + 11;
 const WM_APP_NOTIFY_DONE: u32 = WM_APP + 12;
 /// The PC resumed from sleep (`WM_POWERBROADCAST`, `PBT_APMRESUMEAUTOMATIC`).
 const WM_APP_RESUMED: u32 = WM_APP + 13;
+/// The PC is going to sleep (`WM_POWERBROADCAST`, `PBT_APMSUSPEND`).
+const WM_APP_SUSPENDING: u32 = WM_APP + 14;
 
 /// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
@@ -285,6 +287,7 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         notifier: Notifier::new(host),
         history,
         recorder: Recorder::default(),
+        suspended: false,
     };
     // Nothing was observed while the app was not running.
     ui.session_break();
@@ -347,6 +350,8 @@ struct Ui {
     /// those recorded since.
     history: HashMap<DeviceKey, Vec<Sample>>,
     recorder: Recorder,
+    /// A session break was recorded as the PC went to sleep, and it has not resumed since.
+    suspended: bool,
 }
 
 /// When the widget fell back, and how many self-retries have run since.
@@ -430,8 +435,14 @@ impl Ui {
                 }
             }
             WM_APP_NOTIFY_DONE => self.notifier.remove(),
-            // Nothing was observed while the PC slept.
-            WM_APP_RESUMED => self.session_break(),
+            // Nothing is observed while the PC sleeps. Recorded here, the break is queued
+            // ahead of whatever the resume brings (the device thread posts its readings
+            // only once the PC is awake again).
+            WM_APP_SUSPENDING => {
+                self.session_break();
+                self.suspended = true;
+            }
+            WM_APP_RESUMED => self.resumed(),
             _ => {}
         }
     }
@@ -462,12 +473,21 @@ impl Ui {
         self.keep(samples, states, now);
     }
 
-    /// Records a session break for every known device ([`Recorder::session_break`]): the
-    /// time since each one's last sample was not observed.
+    /// Records a session break for every device read since its last one
+    /// ([`Recorder::session_break`]): what follows was not observed from it.
     fn session_break(&mut self) {
         let now = unix_now_ms();
         let samples = self.recorder.session_break(&self.history, now);
         self.keep(samples, &read_snapshot(&self.runtime), now);
+    }
+
+    /// The PC resumed: the fallback break, when none was recorded as it went to sleep (the
+    /// suspend notice was missed). One recorded now could follow a resume reading posted
+    /// before this message.
+    fn resumed(&mut self) {
+        if !std::mem::take(&mut self.suspended) {
+            self.session_break();
+        }
     }
 
     /// Appends `samples` to `history.tsv` (by the store's writer), keeps them in
@@ -716,15 +736,16 @@ impl Ui {
         with_store(|store| store.save_settings(settings));
     }
 
-    /// Removes the widgets or tray icons, a notification's temporary icon and the history
-    /// window, finishes the queued writes (at most 1 s), then stops the runtime (bounded by
-    /// its 2 s limit) and ends the message loop.
+    /// Removes the widgets or tray icons and a notification's temporary icon, finishes the
+    /// queued writes (at most 1 s), closes the history window (at most 1 s), then stops
+    /// the runtime (bounded by its 2 s limit) and ends the message loop.
     fn exit(self) {
         watchdog::arm(false);
         drop(self.surface);
         drop(self.notifier);
-        history_window::close();
+        // First: a window that does not close in time must not hold up the writes.
         stop_store();
+        history_window::close();
         self.runtime.stop();
         // SAFETY: no pointers involved.
         unsafe { PostQuitMessage(0) };
@@ -955,8 +976,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         // is not needed, every change is re-read.
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => post(WM_APP_ENVIRONMENT),
         WM_POWERBROADCAST => {
-            if wp.0 == PBT_APMRESUMEAUTOMATIC as usize {
-                post(WM_APP_RESUMED);
+            match wp.0 as u32 {
+                PBT_APMSUSPEND => post(WM_APP_SUSPENDING),
+                PBT_APMRESUMEAUTOMATIC => post(WM_APP_RESUMED),
+                _ => {}
             }
             return LRESULT(1);
         }
@@ -974,7 +997,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_APP_CHANGED..=WM_APP_CHECK_WIDGET
         | WM_APP_SELF_RETRY
         | WM_APP_NOTIFY_DONE
-        | WM_APP_RESUMED => {
+        | WM_APP_RESUMED
+        | WM_APP_SUSPENDING => {
             if ui_busy() {
                 // SAFETY: no pointers involved.
                 let _ = unsafe { PostMessageW(Some(hwnd), msg, wp, lp) };
