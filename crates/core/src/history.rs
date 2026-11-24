@@ -460,6 +460,9 @@ mod tests {
     /// 2026-11-24 00:00 UTC.
     const T0: u64 = 1_795_478_400_000;
 
+    // The post-wake minimum keeps wake readings off the chart only while it fits in the window.
+    const _: () = assert!(crate::engines::hidpp::engine::ACTIVITY_GAP_MS <= PROVISIONAL_MS);
+
     fn sample(at: u64, percent: u8) -> Sample {
         Sample {
             at_unix_ms: at,
