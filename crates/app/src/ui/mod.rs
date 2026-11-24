@@ -393,18 +393,13 @@ const NOTIFY_TIMER: usize = 4;
 const HOVER_TIMER: usize = 5;
 
 /// How long the cursor rests on a device before its card shows: Windows' tooltip delay,
-/// read each time a hover starts, so a changed setting applies at once.
+/// read each time a hover starts, so a changed setting applies at once. A tooltip's
+/// initial delay (`TTDT_INITIAL`) is by default the double-click time ("The default delay
+/// times are based on the double-click time … initial = GetDoubleClickTime()", 500 ms by
+/// default: <https://learn.microsoft.com/windows/win32/controls/ttm-setdelaytime>).
 fn hover_delay() -> u32 {
     // SAFETY: no arguments.
-    tooltip_initial_delay(unsafe { GetDoubleClickTime() })
-}
-
-/// A tooltip's initial delay (`TTDT_INITIAL`) by default: the double-click time
-/// `double_click_ms` ("The default delay times are based on the double-click time … initial
-/// = GetDoubleClickTime()", 500 ms by default:
-/// <https://learn.microsoft.com/windows/win32/controls/ttm-setdelaytime>).
-fn tooltip_initial_delay(double_click_ms: u32) -> u32 {
-    double_click_ms
+    unsafe { GetDoubleClickTime() }
 }
 
 /// Sleep of the widget thread after the first click with `--debug-stall-widget`.
@@ -1747,14 +1742,6 @@ mod tests {
         assert_eq!(v[0].tooltip, "M · 80%\n5 min ago · about 16 h left");
         // The widget shows no tooltips: none is made for it.
         assert_eq!(views(one, &Settings::default(), None)[0].tooltip, "");
-    }
-
-    #[test]
-    fn hover_delay_is_the_tooltip_initial_delay() {
-        // The double-click time, as the user set it: 500 ms by default.
-        assert_eq!(tooltip_initial_delay(500), 500);
-        assert_eq!(tooltip_initial_delay(900), 900);
-        assert_eq!(tooltip_initial_delay(200), 200);
     }
 
     #[test]

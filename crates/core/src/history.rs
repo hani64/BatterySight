@@ -434,14 +434,20 @@ pub fn provisional(samples: &[Sample], i: usize) -> bool {
         .any(|(j, s)| s.presence == Presence::Online && s.level.is_some() && !woke(j))
 }
 
-/// "Time left: about N h" (to the nearest hour), "Time left: less than 1 h" or "Time
-/// left: not enough data".
+/// "Time left: about N h" (to the nearest hour, [`left_hours`]), "Time left: less than 1 h"
+/// or "Time left: not enough data".
 pub fn time_left_text(left: Option<Duration>) -> String {
-    match left.map(|d| (d.as_secs() + 1800) / 3600) {
+    match left.map(left_hours) {
         None => "Time left: not enough data".to_owned(),
         Some(0) => "Time left: less than 1 h".to_owned(),
         Some(hours) => format!("Time left: about {hours} h"),
     }
+}
+
+/// A time left in whole hours, to the nearest hour (half an hour rounds up); 0 is "less
+/// than 1 h".
+pub fn left_hours(left: Duration) -> u64 {
+    (left.as_secs() + 1800) / 3600
 }
 
 #[cfg(test)]
@@ -772,6 +778,15 @@ mod tests {
         assert_eq!(time_left_text(h(45 * 60 + 10)), "Time left: about 45 h");
         assert_eq!(time_left_text(h(45 * 60 + 30)), "Time left: about 46 h");
         assert_eq!(time_left_text(h(20)), "Time left: less than 1 h");
+    }
+
+    #[test]
+    fn left_hours_rounds_to_the_nearest_hour() {
+        let m = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(left_hours(m(29)), 0);
+        assert_eq!(left_hours(m(30)), 1);
+        assert_eq!(left_hours(m(9 * 60 + 29)), 9);
+        assert_eq!(left_hours(m(9 * 60 + 30)), 10);
     }
 
     fn key(k: &str) -> DeviceKey {

@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use batterysight_core::history;
 use batterysight_core::model::{Charge, DeviceKey, DeviceState, Presence};
 use batterysight_core::time::Ms;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -198,8 +199,7 @@ pub fn card_text(state: &DeviceState, time_left: Option<Duration>, now: Ms) -> V
             Charge::Charging | Charge::Full | Charge::NotCharging
         );
     if let Some(left) = time_left.filter(|_| !on_power) {
-        // To the nearest hour, as `history::time_left_text`.
-        match (left.as_secs() + 1800) / 3600 {
+        match history::left_hours(left) {
             0 => status.push_str(" · less than 1 h left"),
             hours => status.push_str(&format!(" · about {hours} h left")),
         }
