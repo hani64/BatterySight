@@ -345,6 +345,7 @@ impl HidppEngine {
             collection: self.out,
             kind: ReportKind::Output,
             bytes: request.bytes(self.report_id, index),
+            deadline: None,
         });
         let deadline = now.saturating_add(Ms::from(self.timeout(index)));
         self.in_flight.insert(
@@ -1348,6 +1349,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                     collection: SHORT_C,
                     kind: ReportKind::Output,
                     bytes: s(&[0x10, 0xFF, 0x81, 0x00]),
+                    deadline: None,
                 }]
             );
             assert_eq!(e.next_deadline(), Some(1_000));
@@ -1489,6 +1491,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             collection: LONG_C,
             kind: ReportKind::Output,
             bytes,
+            deadline: None,
         };
         let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
         assert_eq!(
@@ -2101,6 +2104,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 collection: SHORT_C,
                 kind: ReportKind::Output,
                 bytes: s(&[0x10, 2, 0x00, 0x1B, 0x00, 0x00, 0x5A]),
+                deadline: None,
             }]
         );
         assert_eq!(e.next_deadline(), Some(4_012));
@@ -2186,6 +2190,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 collection: SHORT_C,
                 kind: ReportKind::Output,
                 bytes: read,
+                deadline: None,
             }]
         );
         assert_eq!(e.next_deadline(), Some(8_100));
@@ -2297,6 +2302,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 collection: SHORT_C,
                 kind: ReportKind::Output,
                 bytes: notify_devices(),
+                deadline: None,
             }]
         );
         // The acknowledgement asks nothing more: the receiver now reports its slots.

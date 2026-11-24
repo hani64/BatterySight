@@ -198,6 +198,7 @@ fn sends(out: Vec<HubOutput>) -> Vec<(CollectionId, Vec<u8>)> {
                 collection,
                 kind: ReportKind::Output,
                 bytes,
+                deadline: None,
             } => Some((collection, bytes)),
             HubOutput::Send { kind, .. } => panic!("unexpected HID++ operation: {kind:?}"),
             HubOutput::WriteRefused {

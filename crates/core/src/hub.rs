@@ -44,6 +44,8 @@ pub enum HubOutput {
         collection: CollectionId,
         kind: ReportKind,
         bytes: Vec<u8>,
+        /// For feature operations, the transaction deadline capped by its grant expiry.
+        deadline: Option<Ms>,
     },
     /// A request was denied without exposing its payload or the device identity.
     WriteRefused {
@@ -67,6 +69,14 @@ pub enum WriteRefusal {
     Width,
     Rule,
     Grant,
+    Deadline,
+}
+
+struct SendRequest<'a> {
+    collection: CollectionId,
+    kind: ReportKind,
+    bytes: &'a [u8],
+    deadline: Option<Ms>,
 }
 
 type EngineFactory = Box<dyn Fn(&HidGroup, &Catalog) -> Option<Box<dyn Engine>>>;
@@ -617,11 +627,15 @@ impl Hub {
         &mut self,
         gid: GroupId,
         grant: GrantId,
-        collection: CollectionId,
-        kind: ReportKind,
-        bytes: &[u8],
+        request: SendRequest<'_>,
         now: Ms,
-    ) -> Result<(), WriteRefusal> {
+    ) -> Result<Option<Ms>, WriteRefusal> {
+        let SendRequest {
+            collection,
+            kind,
+            bytes,
+            deadline,
+        } = request;
         let route = self
             .routes
             .get(&collection)
@@ -669,8 +683,17 @@ impl Hub {
             WriteDestination::Group if subject != &slot.key => return Err(WriteRefusal::Grant),
             WriteDestination::Group => {}
         }
+        let deadline = match kind {
+            ReportKind::Output => None,
+            ReportKind::SetFeature | ReportKind::GetFeature => Some(
+                deadline
+                    .map(|deadline| deadline.min(permit.expires_ms()))
+                    .filter(|&deadline| deadline > now)
+                    .ok_or(WriteRefusal::Deadline)?,
+            ),
+        };
         permit.spend();
-        Ok(())
+        Ok(deadline)
     }
 
     /// Carries out `actions` from `gid`'s engine. Actions on devices or
@@ -690,12 +713,20 @@ impl Hub {
                     collection,
                     kind,
                     bytes,
+                    deadline,
                 } => {
-                    match self.admit_write(gid, grant, collection, kind, &bytes, now) {
-                        Ok(()) => pass.out.push(HubOutput::Send {
+                    let request = SendRequest {
+                        collection,
+                        kind,
+                        bytes: &bytes,
+                        deadline,
+                    };
+                    match self.admit_write(gid, grant, request, now) {
+                        Ok(deadline) => pass.out.push(HubOutput::Send {
                             collection,
                             kind,
                             bytes,
+                            deadline,
                         }),
                         Err(reason) => pass.out.push(HubOutput::WriteRefused {
                             kind,
@@ -992,6 +1023,12 @@ mod tests {
                     wire_len: 4,
                     pattern: BytePattern::ZeroPadded(&[0xA5, 0x42]),
                 },
+                WriteRule::Bytes {
+                    role: COMMAND,
+                    kind: ReportKind::GetFeature,
+                    wire_len: 4,
+                    pattern: BytePattern::Exact(&[0x31, 0, 0, 0]),
+                },
             ];
             RULES
         }
@@ -1156,6 +1193,7 @@ quirks = { query_wakes = true }
             collection,
             kind: ReportKind::Output,
             bytes: vec![byte],
+            deadline: None,
         }
     }
 
@@ -1281,11 +1319,13 @@ quirks = { query_wakes = true }
                     collection: coll(1),
                     kind: ReportKind::Output,
                     bytes: vec![0xA1],
+                    deadline: None,
                 },
                 HubOutput::Send {
                     collection: coll(1),
                     kind: ReportKind::Output,
                     bytes: vec![0xA2],
+                    deadline: None,
                 },
             ]
         );
@@ -1332,6 +1372,7 @@ quirks = { query_wakes = true }
             collection,
             kind,
             bytes: bytes.to_vec(),
+            deadline: None,
         };
         f.borrow_mut().on_grant.push_back(vec![
             request(CollectionId(99), ReportKind::Output, &valid),
@@ -1370,10 +1411,60 @@ quirks = { query_wakes = true }
                     collection: coll(1),
                     kind: ReportKind::Output,
                     bytes: valid.to_vec(),
+                    deadline: None,
                 },
                 refused(ReportKind::Output, coll(1), WriteRefusal::Grant),
             ]
         );
+    }
+
+    #[test]
+    fn feature_deadline_uses_the_request_not_an_earlier_timer_and_is_capped_by_grant() {
+        for (requested, expected) in [(180, 180), (500, 200)] {
+            let f = fake();
+            f.borrow_mut().deadline = Some(105); // The same engine also has an earlier timer.
+            let request = |deadline| Action::Send {
+                grant: THIS_GRANT,
+                collection: coll(1),
+                kind: ReportKind::GetFeature,
+                bytes: vec![0x31, 0, 0, 0],
+                deadline,
+            };
+            f.borrow_mut().on_grant.push_back(vec![
+                request(None),
+                request(Some(100)),
+                request(Some(requested)),
+            ]);
+            let mut g = group(1, 0x046D, 0xC547);
+            g.collections[0].feature_len = 4;
+            let mut hub = hub_with(
+                Policy {
+                    discovery_budget: 1,
+                    discovery_ms: 100,
+                    ..Policy::default()
+                },
+                &[(1, &f)],
+            );
+            let refused = HubOutput::WriteRefused {
+                collection: coll(1),
+                kind: ReportKind::GetFeature,
+                reason: WriteRefusal::Deadline,
+            };
+            assert_eq!(
+                hub.handle(HubInput::GroupArrived(g), 100),
+                [
+                    refused.clone(),
+                    refused,
+                    HubOutput::Send {
+                        collection: coll(1),
+                        kind: ReportKind::GetFeature,
+                        bytes: vec![0x31, 0, 0, 0],
+                        deadline: Some(expected),
+                    }
+                ]
+            );
+            assert_eq!(hub.next_deadline(), Some(105));
+        }
     }
 
     #[test]
@@ -1498,6 +1589,7 @@ quirks = { query_wakes = true }
                 collection: coll(group),
                 kind: ReportKind::Output,
                 bytes: hidpp_frame(head),
+                deadline: None,
             }],
             None,
             1,
@@ -1789,6 +1881,7 @@ quirks = { query_wakes = true }
                 collection: short,
                 kind: ReportKind::Output,
                 bytes: vec![0x10, 0xFF, 0x81, 0, 0, 0, 0],
+                deadline: None,
             }]
         );
     }

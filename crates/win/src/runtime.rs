@@ -26,13 +26,12 @@ use batterysight_core::model::{DeviceKey, DeviceState};
 use batterysight_core::scheduler::Policy;
 use batterysight_core::time::Ms;
 use windows::Win32::Foundation::E_UNEXPECTED;
-use windows::Win32::System::SystemInformation::GetTickCount64;
 
 use crate::audio::{self, Mta};
 use crate::hid_enum::{self, ContainerId, HidInterface};
 use crate::notify::register_hid_notifications;
 use crate::power::register_power;
-use crate::reactor::{OsEvent, Poster, Reactor};
+use crate::reactor::{FeatureFailure, OsEvent, Poster, Reactor, clock_ms as now_ms};
 use crate::trace::{Direction, Trace};
 
 /// How long [`RuntimeHandle::stop`] waits for the device thread to finish.
@@ -173,12 +172,6 @@ fn device_thread(
         on_change,
     }
     .run(commands);
-}
-
-/// Monotonic milliseconds since boot.
-fn now_ms() -> Ms {
-    // SAFETY: no arguments, no preconditions.
-    unsafe { GetTickCount64() }
 }
 
 /// The lowercased interface paths of one group: its identity across enumerations, which
@@ -357,6 +350,45 @@ impl Device {
                     },
                     now_ms(),
                 );
+                false
+            }
+            OsEvent::FeatureReply {
+                collection,
+                bytes,
+                deadline,
+            } => {
+                let now = now_ms();
+                if now >= deadline {
+                    if let Some(trace) = &mut self.trace {
+                        trace.feature_failed(
+                            collection,
+                            ReportKind::GetFeature,
+                            FeatureFailure::TimedOut,
+                        );
+                    }
+                    return false;
+                }
+                if let Some(trace) = &mut self.trace {
+                    trace.record(Direction::FeatureReply, collection, &bytes);
+                }
+                self.feed(
+                    HubInput::Report {
+                        collection,
+                        origin: ReportOrigin::FeatureReply,
+                        bytes,
+                    },
+                    now,
+                );
+                false
+            }
+            OsEvent::FeatureFailed {
+                collection,
+                kind,
+                reason,
+            } => {
+                if let Some(trace) = &mut self.trace {
+                    trace.feature_failed(collection, kind, reason);
+                }
                 false
             }
             OsEvent::ReadFailed { collection } => {
@@ -699,20 +731,30 @@ impl Device {
             match output {
                 HubOutput::Send {
                     collection,
-                    kind: ReportKind::Output,
+                    kind,
                     bytes,
+                    deadline,
                 } => {
-                    if self.reactor.write(collection, &bytes)
+                    let (started, direction) = match (kind, deadline) {
+                        (ReportKind::Output, _) => {
+                            (self.reactor.write(collection, &bytes), Direction::Out)
+                        }
+                        (ReportKind::SetFeature, Some(at)) => (
+                            self.reactor.feature(collection, kind, &bytes, at),
+                            Direction::FeatureSet,
+                        ),
+                        (ReportKind::GetFeature, Some(at)) => (
+                            self.reactor.feature(collection, kind, &bytes, at),
+                            Direction::FeatureGet,
+                        ),
+                        (_, None) => unreachable!("admitted feature requests have a deadline"),
+                    };
+                    if started
                         && let Some(trace) = &mut self.trace
                     {
-                        trace.record(Direction::Out, collection, &bytes);
+                        trace.record(direction, collection, &bytes);
                     }
                 }
-                // The reactor only implements Output; never downgrade a feature operation.
-                HubOutput::Send {
-                    kind: ReportKind::SetFeature | ReportKind::GetFeature,
-                    ..
-                } => {}
                 HubOutput::WriteRefused {
                     kind,
                     collection,

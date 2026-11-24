@@ -157,6 +157,10 @@ impl PendingSend<'_> {
         &self.0.get().subject
     }
 
+    pub(crate) fn expires_ms(&self) -> Ms {
+        self.0.get().expires_ms
+    }
+
     pub(crate) fn spend(mut self) {
         let remaining = &mut self.0.get_mut().remaining;
         *remaining -= 1;

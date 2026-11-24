@@ -14,12 +14,14 @@ use crate::time::Ms;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Write `bytes` to `collection`, charged to `grant`; dropped if the grant does not admit it.
-    /// The engine keeps its own deadline for the answer (see [`Engine::next_deadline`]).
+    /// For feature operations, `deadline` is the absolute end of this transaction. Output
+    /// reports use `None`; their engine tracks any answer in its own state.
     Send {
         grant: GrantId,
         collection: CollectionId,
         kind: ReportKind,
         bytes: Vec<u8>,
+        deadline: Option<Ms>,
     },
     /// Start tracking a device discovered behind this engine's group. `wpid` is the
     /// wireless product id of a device behind a receiver, when the receiver reported one.
