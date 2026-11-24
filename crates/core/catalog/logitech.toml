@@ -1,4 +1,10 @@
 # Logitech (vid 0x046D). Devices without an entry below are covered by the HID++ family.
+#
+# A device entry lists USB product ids in `pids` (the device itself, or a dongle that is the
+# device, like a headset's) and/or wireless product ids in `wpids` (a device paired to a
+# receiver, matched by the id the receiver reports for its slot; the receiver's own USB id
+# says nothing about the devices paired to it). The entry's `name` replaces the name the
+# device reports.
 
 [[family]]
 engine = "hidpp"
@@ -9,9 +15,28 @@ source = "Linux drivers/hid/hid-logitech-hidpp.c; Solaar lib/logitech_receiver"
 [[device]]
 name = "PRO X Wireless Gaming Headset"
 vid = 0x046D
-pids = [0x0AAA, 0x0ABA]
+pids = [0x0ABA]
+kind = "headset"
+engine = "hidpp"
+status = "hardware-tested"
+source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live); owner hardware test 2026-11-23: discovery, power on/off broadcasts, resume, Refresh now, G HUB comparison 77/77 and 76/77"
+quirks = { voltage_curve = "pro-x-wireless-ghub" }
+
+[[device]]
+name = "PRO X Wireless Gaming Headset"
+vid = 0x046D
+pids = [0x0AAA]
 kind = "headset"
 engine = "hidpp"
 status = "source-verified"
 source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live)"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
+
+[[device]]
+name = "PRO X Superlight"
+vid = 0x046D
+wpids = [0x4093]
+kind = "mouse"
+engine = "hidpp"
+status = "hardware-tested"
+source = "G HUB core/data/devices/devices_0001.json (pro_x_wireless_mouse: displayName PRO X SUPERLIGHT, interfaces 046d_4093 and 046d_c094); its own HID++ name is PRO X Wireless (Solaar lib/logitech_receiver/descriptors.py, wpid 4093, usbid C094); owner hardware test 2026-11-23 on a C547 receiver: discovery on link-up, link-lost and resume, Refresh now, G HUB comparison 79/79 twice"
