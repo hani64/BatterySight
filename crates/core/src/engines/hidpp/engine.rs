@@ -488,7 +488,12 @@ impl HidppEngine {
             self.on_link(index, frame, actions);
             return;
         }
-        if self.receiver && report == SHORT && sub == CONNECT_DISCONNECT && address == UNPAIRED {
+        if self.receiver
+            && report == SHORT
+            && sub == CONNECT_DISCONNECT
+            && address == UNPAIRED
+            && RECEIVER_SLOTS.contains(&index)
+        {
             self.forget(index, actions);
             return;
         }
@@ -1902,6 +1907,20 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
         assert_eq!(a, vec![Action::Unregister(mouse_key())]);
         assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn unpair_frame_on_receiver_index_keeps_arrival_conversation() {
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+
+        let a = e.on_report(SHORT_C, &[0x10, 0xFF, 0x40, 0x02, 0x00, 0x00, 0x00], 1);
+
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), Some(1_000));
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 2);
+        assert_eq!(sent(&a), vec![notify_devices()]);
     }
 
     #[test]
