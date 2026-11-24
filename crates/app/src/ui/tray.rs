@@ -80,6 +80,8 @@ pub(super) enum Action {
     /// Add the icon (and set its version).
     Add,
     Modify,
+    /// Change the tooltip only (the icon is unchanged).
+    Tip,
     Delete,
 }
 
@@ -93,7 +95,7 @@ pub(super) trait Shell {
 }
 
 /// Makes `icons` match `views`: changed icons are redrawn, missing ones added, surplus ones
-/// removed.
+/// removed; an icon whose tooltip alone changed gets the new tooltip only.
 fn sync(icons: &mut Vec<Icon>, shell: &mut impl Shell, views: &[DeviceView], light: bool) {
     let wanted: Vec<Option<&DeviceView>> = if views.is_empty() {
         vec![None]
@@ -116,7 +118,9 @@ fn sync(icons: &mut Vec<Icon>, shell: &mut impl Shell, views: &[DeviceView], lig
         if same && current.is_some_and(|c| c.added) {
             continue;
         }
-        if !same {
+        let redraw =
+            !current.is_some_and(|c| c.light == light && looks_alike(c.view.as_ref(), view));
+        if redraw {
             // Icon `i` must sit at index `i`: one that cannot be drawn ends the pass, so no
             // later icon takes its place (the next change tries again).
             let Some(handle) = shell.render(view, light) else {
@@ -136,16 +140,29 @@ fn sync(icons: &mut Vec<Icon>, shell: &mut impl Shell, views: &[DeviceView], lig
         let Some(icon) = icons.get_mut(i) else {
             break;
         };
+        if !redraw {
+            icon.view = view.cloned();
+        }
         let tip = icon
             .view
             .as_ref()
             .map_or(NO_DEVICES, |v| v.tooltip.as_str());
-        let action = if icon.added {
-            Action::Modify
-        } else {
-            Action::Add
+        let action = match (icon.added, redraw) {
+            (false, _) => Action::Add,
+            (true, true) => Action::Modify,
+            (true, false) => Action::Tip,
         };
         icon.added = shell.notify(action, id, Some((icon.handle, tip)));
+    }
+}
+
+/// Whether two icons' views draw alike (their tooltips aside); both `None` is the
+/// placeholder.
+fn looks_alike(a: Option<&DeviceView>, b: Option<&DeviceView>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.looks_like(b),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -182,6 +199,7 @@ impl Shell for NotifyArea {
                     && self.shell_notify(NIM_SETVERSION, id, None)
             }
             Action::Modify => self.shell_notify(NIM_MODIFY, id, content),
+            Action::Tip => self.shell_notify_tip(id, content.map_or("", |(_, tip)| tip)),
             Action::Delete => self.shell_notify(NIM_DELETE, id, None),
         }
     }
@@ -225,7 +243,7 @@ impl NotifyArea {
             data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE;
             data.uCallbackMessage = WM_APP_TRAY;
             data.hIcon = icon;
-            copy_wide(&mut data.szTip, tip);
+            set_tip(&mut data.szTip, tip);
         }
         if action == NIM_SETVERSION {
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -233,6 +251,27 @@ impl NotifyArea {
         // SAFETY: `data` outlives the call.
         unsafe { Shell_NotifyIconW(action, &data) }.as_bool()
     }
+
+    /// Changes icon `id`'s tooltip only.
+    fn shell_notify_tip(&self, id: u32, tip: &str) -> bool {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.host,
+            uID: id,
+            // NIF_SHOWTIP again: a call without it turns the icon's tooltip off.
+            uFlags: NIF_TIP | NIF_SHOWTIP,
+            ..Default::default()
+        };
+        set_tip(&mut data.szTip, tip);
+        // SAFETY: `data` outlives the call.
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool()
+    }
+}
+
+/// Copies `tip` into `szTip`, cut to fit ([`fit_tip`]).
+fn set_tip(dst: &mut [u16], tip: &str) {
+    let room = dst.len().saturating_sub(1);
+    copy_wide(dst, &fit_tip(tip, room));
 }
 
 /// Copies `s` into the fixed buffer `dst`, truncated to keep its terminating NUL.
@@ -241,6 +280,34 @@ fn copy_wide(dst: &mut [u16], s: &str) {
     for (d, c) in dst[..room].iter_mut().zip(s.encode_utf16()) {
         *d = c;
     }
+}
+
+/// `tip` in at most `room` UTF-16 units: a tooltip too long is cut in its first line (the
+/// device's name, ending in "…"), so its last line, the time left, stays.
+fn fit_tip(tip: &str, room: usize) -> String {
+    if tip.encode_utf16().count() <= room {
+        return tip.to_owned();
+    }
+    let Some((name, rest)) = tip.split_once('\n') else {
+        return tip.to_owned();
+    };
+    // The name's room: everything but the other lines, their line break and the "…".
+    let Some(name_room) = room.checked_sub(rest.encode_utf16().count() + 2) else {
+        return tip.to_owned();
+    };
+    let mut out = String::with_capacity(tip.len());
+    let mut used = 0;
+    for c in name.chars() {
+        used += c.len_utf16();
+        if used > name_room {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out.push('\n');
+    out.push_str(rest);
+    out
 }
 
 /// Small-icon size at the system DPI, the DPI the notification area uses.
@@ -353,7 +420,7 @@ pub(super) mod tests {
         let mut settings = Settings::default();
         settings.set_hidden(&DeviceKey("A".into()), true);
         settings.set_hidden(&DeviceKey("B".into()), true);
-        let views = super::super::views(&states, &settings, &Default::default(), 0, 0);
+        let views = super::super::views(&states, &settings, None);
         // The widget draws its own placeholder for no views (`render::widget_strip`).
         assert!(views.is_empty());
         let mut shell = FakeShell::default();
@@ -419,5 +486,51 @@ pub(super) mod tests {
             ]
         );
         assert_eq!(shell.destroyed, [1]);
+    }
+
+    #[test]
+    fn a_new_tooltip_alone_changes_only_the_tip() {
+        let mut shell = FakeShell::default();
+        let mut icons = Vec::new();
+        sync(&mut icons, &mut shell, &[view("10%")], false);
+        let aged = DeviceView {
+            tooltip: "M — 10%, later".into(),
+            ..view("10%")
+        };
+        sync(&mut icons, &mut shell, std::slice::from_ref(&aged), false);
+        assert_eq!(
+            shell.calls,
+            [
+                (Action::Add, 1, Some("M — 10%".into())),
+                (Action::Tip, 1, Some("M — 10%, later".into())),
+            ]
+        );
+        // Not drawn again.
+        assert_eq!(shell.next, 1);
+        assert!(shell.destroyed.is_empty());
+        assert_eq!(icons[0].view.as_ref(), Some(&aged));
+        // Unchanged since: nothing to do.
+        sync(&mut icons, &mut shell, &[aged], false);
+        assert_eq!(shell.calls.len(), 2);
+    }
+
+    #[test]
+    fn a_long_name_is_cut_to_keep_the_time_left() {
+        let tip = |name: &str| format!("{name}\nBattery: 80%\nTime left: about 9 h");
+        let rest = "\nBattery: 80%\nTime left: about 9 h"
+            .encode_utf16()
+            .count();
+        // Fits: unchanged.
+        assert_eq!(fit_tip(&tip("G305"), 127), tip("G305"));
+        let long = "N".repeat(200);
+        let fitted = fit_tip(&tip(&long), 127);
+        assert_eq!(fitted.encode_utf16().count(), 127);
+        assert_eq!(fitted, tip(&format!("{}…", "N".repeat(127 - rest - 1))));
+        // A character outside the BMP (two units) is not split.
+        let emoji = "😀".repeat(100);
+        let fitted = fit_tip(&tip(&emoji), 127);
+        assert!(fitted.encode_utf16().count() <= 127);
+        assert!(fitted.ends_with("Time left: about 9 h"));
+        assert!(fitted.starts_with("😀"));
     }
 }
