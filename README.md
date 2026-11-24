@@ -6,6 +6,13 @@ BatterySight is a free, open-source (GPLv3) Windows app that shows the battery l
 
 BatterySight collects no telemetry. Its only network call is the update check (arriving in milestone 4).
 
+## Usage
+
+Start `batterysight.exe`. It shows each device's battery level on the taskbar, next to the notification area (and next to the clock on other monitors' taskbars). Click it for the device list, "Refresh now" and "Exit". Only one instance runs per session; starting another does nothing.
+
+- `batterysight --tray-only` shows one notification-area icon per device instead. Use it if the widget does not appear on your Windows build. The app also switches to tray icons by itself when Windows refuses the widget window, and restarts itself with `--tray-only` when the widget stops responding for 1.5 s (a stalled widget would freeze the taskbar's mouse input).
+- `batterysight --list` prints the devices it finds, one per line, and exits.
+
 ## Building
 
 ```
