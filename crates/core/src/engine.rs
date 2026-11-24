@@ -13,11 +13,11 @@ use crate::time::Ms;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Write `bytes` to `collection`, charged to `grant`; dropped if the grant does not admit it.
+    /// The engine keeps its own deadline for the answer (see [`Engine::next_deadline`]).
     Send {
         grant: GrantId,
         collection: CollectionId,
         bytes: Vec<u8>,
-        timeout_ms: u32,
     },
     /// Start tracking a device discovered behind this engine's group.
     Register {

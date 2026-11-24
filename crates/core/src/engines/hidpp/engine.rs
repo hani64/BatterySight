@@ -281,19 +281,18 @@ impl HidppEngine {
         if !self.spend(c.grant, now) {
             return;
         }
-        let timeout_ms = self.timeout(index);
         actions.push(Action::Send {
             grant: c.grant,
             collection: self.out,
             bytes: request.bytes(self.report_id, index),
-            timeout_ms,
         });
+        let deadline = now.saturating_add(Ms::from(self.timeout(index)));
         self.in_flight.insert(
             index,
             InFlight {
                 conversation: c,
                 request,
-                deadline: now.saturating_add(Ms::from(timeout_ms)),
+                deadline,
             },
         );
     }
@@ -1061,9 +1060,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                     grant: GrantId(1),
                     collection: SHORT_C,
                     bytes: s(&[0x10, 0xFF, 0x81, 0x00]),
-                    timeout_ms: 1_000,
                 }]
             );
+            assert_eq!(e.next_deadline(), Some(1_000));
 
             let a = e.on_report(
                 SHORT_C,
@@ -1151,13 +1150,14 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             grant: GrantId(5),
             collection: LONG_C,
             bytes,
-            timeout_ms: 4_000,
         };
         let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
         assert_eq!(
             a,
             vec![send(l(&[0x11, 0xFF, 0x00, 0x1B, 0x00, 0x00, 0x5A]))]
         );
+        // A direct device gets the device timeout.
+        assert_eq!(e.next_deadline(), Some(4_000));
         for (i, (reply, want)) in headset_script().into_iter().enumerate() {
             let a = e.on_report(LONG_C, &reply, 1);
             assert_eq!(a, vec![send(want)], "step {i}");
@@ -1523,9 +1523,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 grant: GrantId(9),
                 collection: SHORT_C,
                 bytes: s(&[0x10, 2, 0x00, 0x1B, 0x00, 0x00, 0x5A]),
-                timeout_ms: 4_000,
             }]
         );
+        assert_eq!(e.next_deadline(), Some(4_012));
     }
 
     #[test]
@@ -1607,7 +1607,6 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 grant: GrantId(2),
                 collection: SHORT_C,
                 bytes: read,
-                timeout_ms: 4_000,
             }]
         );
         assert_eq!(e.next_deadline(), Some(8_100));
@@ -1690,43 +1689,17 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = HidppEngine::new(&receiver_group(), &catalog());
         let gk = e.group_key();
         let a = e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
-        assert!(
-            matches!(
-                a.as_slice(),
-                [Action::Send {
-                    timeout_ms: 1_000,
-                    ..
-                }]
-            ),
-            "{a:?}"
-        );
+        assert_eq!(sent(&a), vec![s(&[0x10, 0xFF, 0x81, 0x00])]);
         assert_eq!(e.next_deadline(), Some(1_000));
 
         // No answer from the receiver: still ask it to report its slots.
         let a = e.on_tick(1_000);
         assert_eq!(sent(&a), vec![notify_devices()]);
-        assert!(matches!(
-            a.as_slice(),
-            [Action::Send {
-                timeout_ms: 1_000,
-                ..
-            }]
-        ));
         assert_eq!(e.next_deadline(), Some(2_000));
 
         // No answer again: fall back to pinging every slot, at the device timeout.
         let a = e.on_tick(2_000);
-        assert_eq!(a.len(), 6, "{a:?}");
-        assert!(
-            a.iter().all(|a| matches!(
-                a,
-                Action::Send {
-                    timeout_ms: 4_000,
-                    ..
-                }
-            )),
-            "{a:?}"
-        );
+        assert_eq!(sent(&a).len(), 6, "{a:?}");
         assert_eq!(e.next_deadline(), Some(6_000));
     }
 
@@ -1744,7 +1717,6 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 grant: GrantId(1),
                 collection: SHORT_C,
                 bytes: notify_devices(),
-                timeout_ms: 1_000,
             }]
         );
         // The acknowledgement asks nothing more: the receiver now reports its slots.
