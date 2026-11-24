@@ -10,8 +10,8 @@ use std::slice;
 
 use batterysight_core::hid::CollectionId;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ,
-    GENERIC_WRITE, HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE,
+    HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
@@ -28,30 +28,19 @@ pub(crate) fn is_exclusive(usage_page: u16, usage: u16) -> bool {
     usage_page == 0x01 && matches!(usage, 0x02 | 0x06)
 }
 
-/// Opens a collection for overlapped I/O, shared read/write, never exclusively.
-///
-/// Asks for read and write access, and for read access alone when that is denied. Returns the
-/// handle and whether it is writable. A `path` that is not NUL-terminated is refused with
-/// `ERROR_INVALID_PARAMETER`.
-pub(crate) fn open(path: &[u16]) -> windows::core::Result<(OwnedHandle, bool)> {
+/// Opens a collection with the selected access rights, shared read/write, never exclusively.
+/// A path that is not NUL-terminated is refused with `ERROR_INVALID_PARAMETER`.
+pub(crate) fn open(path: &[u16], read: bool, write: bool) -> windows::core::Result<OwnedHandle> {
     if path.last() != Some(&0) {
         return Err(ERROR_INVALID_PARAMETER.into());
     }
-    match create(path, GENERIC_READ.0 | GENERIC_WRITE.0) {
-        Ok(handle) => Ok((handle, true)),
-        Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {
-            Ok((create(path, GENERIC_READ.0)?, false))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn create(path: &[u16], access: u32) -> windows::core::Result<OwnedHandle> {
+    let read = if read { GENERIC_READ.0 } else { 0 };
+    let write = if write { GENERIC_WRITE.0 } else { 0 };
     // SAFETY: `path` is NUL-terminated and outlives the call.
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
-            access,
+            read | write,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -179,7 +168,7 @@ fn queues_completion(result: &windows::core::Result<()>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED};
 
     #[test]
     fn only_mouse_and_keyboard_are_exclusive() {

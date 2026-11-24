@@ -26,19 +26,24 @@ impl Selection {
     }
 
     pub fn opens(&self, id: CollectionId) -> bool {
-        id == self.command || self.reads(id)
+        self.sends(id) || self.reads(id)
+    }
+
+    pub fn sends(&self, id: CollectionId) -> bool {
+        id == self.command
     }
 
     pub fn kind(&self) -> EngineKind {
         self.kind
     }
 
-    pub(crate) fn direct(&self) -> Option<usize> {
+    /// The selected entry's stable index within the hub's immutable catalog, if direct.
+    pub fn direct(&self) -> Option<usize> {
         self.direct
     }
 
     pub(crate) fn send_role(&self, id: CollectionId) -> Option<CollectionRole> {
-        if id != self.command {
+        if !self.sends(id) {
             return None;
         }
         Some(match self.kind {
@@ -129,7 +134,7 @@ pub(crate) fn select_with(
 
 enum Match {
     Absent,
-    /// The descriptors were plausible but identity or the command role is not unique.
+    /// A plausible entry whose identity or explicit collection role is not unique.
     Denied,
     Unique(Selection),
 }
@@ -202,7 +207,7 @@ fn match_roles(
     let Some((command, report_id)) = command else {
         return Match::Absent;
     };
-    if tied {
+    if tied || (receive.is_some() && receiving.len() > 1) {
         return Match::Denied;
     }
     Match::Unique(Selection {
@@ -327,6 +332,18 @@ source = "Linux hid-logitech-hidpp"
             !wants(&g, &catalog),
             "wrong product does not fall back to family"
         );
+    }
+
+    #[test]
+    fn equally_eligible_explicit_receive_collections_deny_selection() {
+        let catalog = Catalog::parse(&format!("{FAMILY}{DIRECT}")).unwrap();
+        let mut g = gated_group();
+        g.collections[1].product = "Fixture USB device".into();
+        assert!(wants(&g, &catalog));
+        let mut second_rx = g.collections[0].clone();
+        second_rx.id = CollectionId(3);
+        g.collections.push(second_rx);
+        assert!(!wants(&g, &catalog), "an explicit RX role must be unique");
     }
 
     #[test]

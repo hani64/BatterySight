@@ -6,7 +6,7 @@
 //! read or written here. [`product_string`] is a legacy HID request made only after
 //! Logitech admission, never to resolve a catalog selector.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -135,21 +135,47 @@ enum PhysicalIdentity {
     Path(String),
 }
 
-/// Groups a VID/PID by its non-system PnP container when available, otherwise by
-/// [`physical_key`]. A path fallback cannot join two different known containers.
+/// Groups a VID/PID by its non-system PnP container. An interface without a container
+/// joins its [`physical_key`] siblings only if they agree on one known container.
 /// Groups and their members keep first-seen order. Every call assigns fresh `GroupId`s.
 pub fn group(interfaces: Vec<HidInterface>) -> Vec<(HidGroup, Vec<HidInterface>)> {
-    let mut slots: HashMap<(u16, u16, PhysicalIdentity), usize> = HashMap::new();
+    let missing: HashSet<_> = interfaces
+        .iter()
+        .filter(|interface| interface.container.is_none())
+        .map(vid_pid)
+        .collect();
+    let mut fallback = HashMap::new();
+    for interface in interfaces.iter().filter(|i| missing.contains(&vid_pid(i))) {
+        if let Some(container) = interface.container {
+            let path = physical_key(&path_string(&interface.path));
+            if path.is_empty() {
+                continue;
+            }
+            fallback
+                .entry((vid_pid(interface), path))
+                .and_modify(|known| {
+                    if *known != Some(container) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(container));
+        }
+    }
+    let mut slots = HashMap::new();
     let mut groups: Vec<(HidGroup, Vec<HidInterface>)> = Vec::new();
     for interface in interfaces {
-        let key = (
-            interface.collection.vid,
-            interface.collection.pid,
-            interface.container.map_or_else(
-                || PhysicalIdentity::Path(physical_key(&path_string(&interface.path))),
-                PhysicalIdentity::Container,
-            ),
-        );
+        let ids = vid_pid(&interface);
+        let identity = if let Some(container) = interface.container {
+            PhysicalIdentity::Container(container)
+        } else {
+            let key = (ids, physical_key(&path_string(&interface.path)));
+            if let Some(Some(container)) = fallback.get(&key) {
+                PhysicalIdentity::Container(*container)
+            } else {
+                PhysicalIdentity::Path(key.1)
+            }
+        };
+        let key = (ids, identity);
         let slot = *slots.entry(key).or_insert_with(|| {
             let id = GroupId(NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed));
             let collections = Vec::new();
@@ -161,6 +187,10 @@ pub fn group(interfaces: Vec<HidInterface>) -> Vec<(HidGroup, Vec<HidInterface>)
         members.push(interface);
     }
     groups
+}
+
+fn vid_pid(interface: &HidInterface) -> (u16, u16) {
+    (interface.collection.vid, interface.collection.pid)
 }
 
 /// Decodes a UTF-16 path up to its first NUL.
@@ -621,6 +651,49 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(usages(&groups[0].1), [1]);
         assert_eq!(usages(&groups[1].1), [2]);
+    }
+
+    #[test]
+    fn group_joins_a_missing_container_to_the_unique_known_path_sibling() {
+        let mut known = iface(C547_COL01, 0x046D, 0xC547, 1);
+        let unknown = iface(C547_COL02, 0x046D, 0xC547, 2);
+        known.container = Some([1; 16]);
+        for interfaces in [vec![known.clone(), unknown.clone()], vec![unknown, known]] {
+            let expected = usages(&interfaces);
+            let groups = group(interfaces);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(usages(&groups[0].1), expected);
+        }
+    }
+
+    #[test]
+    fn group_leaves_a_missing_container_separate_when_known_siblings_conflict() {
+        let mut first = iface(C547_COL01, 0x046D, 0xC547, 1);
+        let mut second = iface(C547_COL02, 0x046D, 0xC547, 2);
+        let missing_path = C547_COL02.replace("col02", "col03").replace("0001", "0002");
+        let missing = iface(&missing_path, 0x046D, 0xC547, 3);
+        first.container = Some([1; 16]);
+        second.container = Some([2; 16]);
+        for interfaces in [
+            vec![missing.clone(), first.clone(), second.clone()],
+            vec![second, missing, first],
+        ] {
+            let expected = usages(&interfaces);
+            let groups = group(interfaces);
+            assert_eq!(groups.len(), 3);
+            for ((_, members), usage) in groups.iter().zip(expected) {
+                assert_eq!(usages(members), [usage]);
+            }
+        }
+    }
+
+    #[test]
+    fn group_does_not_attach_empty_path_keys_to_known_containers() {
+        let mut known = iface("odd-a", 0x1234, 0x5678, 1);
+        let unknown = iface("odd-b", 0x1234, 0x5678, 2);
+        known.container = Some([1; 16]);
+        let groups = group(vec![known, unknown]);
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]

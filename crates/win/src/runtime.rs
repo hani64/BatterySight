@@ -184,10 +184,33 @@ fn now_ms() -> Ms {
 /// re-mint every `CollectionId` and `GroupId`.
 type PathSet = BTreeSet<String>;
 
+/// A selection independent of the fresh IDs minted by each enumeration.
+#[derive(PartialEq, Eq)]
+struct SelectionSignature {
+    kind: EngineKind,
+    direct: Option<usize>,
+    /// Receive/send flags in the same sorted path order as the group's `PathSet`.
+    roles: Vec<(bool, bool)>,
+}
+
+struct PendingArrival {
+    group: HidGroup,
+    members: Vec<HidInterface>,
+    selection: Selection,
+    signature: SelectionSignature,
+}
+
+struct ScannedGroup {
+    paths: PathSet,
+    pending: Option<PendingArrival>,
+    replacement: bool,
+}
+
 /// A group opened in the reactor and handed to the hub.
 struct Opened {
     id: GroupId,
     paths: PathSet,
+    signature: SelectionSignature,
     /// The collections opened, as the hub knows them.
     collections: Vec<CollectionId>,
     /// The physical device's container id, which its audio endpoints share.
@@ -484,40 +507,93 @@ impl Device {
     /// [`Device::rescan`] on the interfaces `scanned` at `now`. `None` (the enumeration
     /// failed) says nothing about which devices are present, so every group stays as it is.
     fn apply_scan(&mut self, scanned: Option<Vec<HidInterface>>, now: Ms) {
+        self.apply_scan_with(scanned, now, hid_enum::cached_product_name);
+    }
+
+    fn apply_scan_with(
+        &mut self,
+        scanned: Option<Vec<HidInterface>>,
+        now: Ms,
+        mut cached_name: impl FnMut(&HidInterface) -> Option<String>,
+    ) {
         let Some(scanned) = scanned else {
             return;
         };
-        let scanned: Vec<_> = hid_enum::group(scanned)
+        let mut scanned: Vec<_> = hid_enum::group(scanned)
             .into_iter()
-            .filter_map(|(group, members)| {
+            .map(|(group, members)| {
                 let mut names = HashMap::new();
                 let selection = self.hub.select_group(&group, |index, selector| {
                     let name = names
                         .entry(index)
-                        .or_insert_with(|| hid_enum::cached_product_name(&members[index]))
+                        .or_insert_with(|| cached_name(&members[index]))
                         .as_deref()?;
                     Some(selector.matches_product(name))
-                })?;
-                let paths = members.iter().map(|m| path_key(&m.path)).collect();
-                Some((group, members, selection, paths))
+                });
+                let mut paths: Vec<_> = members
+                    .iter()
+                    .map(|member| (path_key(&member.path), member.collection.id))
+                    .collect();
+                paths.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                let pending = selection.map(|selection| {
+                    let signature = SelectionSignature {
+                        kind: selection.kind(),
+                        direct: selection.direct(),
+                        roles: paths
+                            .iter()
+                            .map(|&(_, id)| (selection.reads(id), selection.sends(id)))
+                            .collect(),
+                    };
+                    PendingArrival {
+                        group,
+                        members,
+                        selection,
+                        signature,
+                    }
+                });
+                ScannedGroup {
+                    paths: paths.into_iter().map(|(path, _)| path).collect(),
+                    pending,
+                    replacement: false,
+                }
             })
             .collect();
-        let known: Vec<&PathSet> = self.groups.iter().map(|group| &group.paths).collect();
-        let found: Vec<&PathSet> = scanned.iter().map(|(_, _, _, paths)| paths).collect();
-        let gone = unmatched(&known, &found);
-        let new = unmatched(&found, &known);
-        for &index in gone.iter().rev() {
-            let gone = self.remove(index);
-            self.guard.on_removed(gone.paths, now);
+        // Close every stale route before admitting any replacement. A physically present
+        // group whose selection changed (or was denied) was not disconnected.
+        for index in (0..self.groups.len()).rev() {
+            let old = &self.groups[index];
+            let Some(scan) = scanned.iter_mut().find(|scan| scan.paths == old.paths) else {
+                let gone = self.remove(index);
+                self.guard.on_removed(gone.paths, now);
+                continue;
+            };
+            if scan
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.signature == old.signature)
+            {
+                scan.pending = None;
+            } else {
+                self.remove(index);
+                scan.replacement = true;
+            }
         }
         self.release_at = None;
         let mut held = BTreeMap::new();
-        for (index, (group, members, selection, paths)) in scanned.into_iter().enumerate() {
-            if !new.contains(&index) {
+        for ScannedGroup {
+            paths,
+            pending,
+            replacement,
+        } in scanned
+        {
+            let Some(pending) = pending else { continue };
+            if replacement {
+                // Already live: change routing without spending or checking the I/O cap.
+                self.arrive(pending, paths, true, now);
                 continue;
             }
             match self.guard.admission(&paths, now) {
-                Admission::Open => self.arrive(group, members, selection, paths, now),
+                Admission::Open => self.arrive(pending, paths, false, now),
                 Admission::Closed => {}
                 Admission::HeldUntil(at) => {
                     if self.held.get(&paths) != Some(&at)
@@ -535,14 +611,13 @@ impl Device {
 
     /// Opens only the preselected roles, preserving their identity through a failure or
     /// the legacy Logitech product request. Traces a failed open or release after a hold.
-    fn arrive(
-        &mut self,
-        mut group: HidGroup,
-        members: Vec<HidInterface>,
-        selection: Selection,
-        paths: PathSet,
-        now: Ms,
-    ) {
+    fn arrive(&mut self, pending: PendingArrival, paths: PathSet, replacement: bool, now: Ms) {
+        let PendingArrival {
+            mut group,
+            members,
+            selection,
+            signature,
+        } = pending;
         let container = members.iter().find_map(|member| member.container);
         group.collections.clear();
         for mut member in members
@@ -556,7 +631,12 @@ impl Device {
                     });
             }
             let read = selection.reads(member.collection.id);
-            if self.reactor.open(group.id, &member, read).is_ok() {
+            let write = selection.sends(member.collection.id);
+            if self
+                .reactor
+                .open(group.id, &member, read, write)
+                .unwrap_or(false)
+            {
                 group.collections.push(member.collection);
             }
         }
@@ -573,10 +653,13 @@ impl Device {
         {
             trace.released(&paths);
         }
-        self.guard.on_open(&paths, now);
+        if !replacement {
+            self.guard.on_open(&paths, now);
+        }
         self.groups.push(Opened {
             id: group.id,
             paths,
+            signature,
             collections: group.collections.iter().map(|c| c.id).collect(),
             container,
         });
@@ -664,15 +747,6 @@ fn cached_product(
     product
 }
 
-/// Indices of the sets in `sets` that `others` does not contain.
-fn unmatched(sets: &[&PathSet], others: &[&PathSet]) -> Vec<usize> {
-    sets.iter()
-        .enumerate()
-        .filter(|(_, set)| !others.contains(set))
-        .map(|(index, _)| index)
-        .collect()
-}
-
 /// How long an active container found silent first waits before it is looked at again: a
 /// pause between two tracks must not cost a whole activity gap.
 const SILENT_RECHECK_MS: Ms = 15_000;
@@ -740,13 +814,13 @@ fn in_window(at: Ms, now: Ms) -> bool {
 /// - Removing an open group counts as a failure for the window, though not towards the
 ///   back-to-back rule, so the cap does not depend on whether a device's removal or its
 ///   read failure is handled first.
-/// - Every open of a group that failed or was removed within the window counts as a
-///   reopen ([`on_open`]), whatever caused it. While the window holds [`REOPEN_LIMIT`]
-///   reopens, the group is held back ([`admission`]) until the oldest of them leaves the
-///   window, when the device thread rescans once, or until a resume or refresh. An arrival
-///   does not lift this, so a device that re-enumerates after each failure is not reopened
-///   in a loop, and one replugged more than [`REOPEN_LIMIT`] times a minute waits for the
-///   window.
+/// - Opening after a failure or removal in the window counts as a reopen ([`on_open`]);
+///   changing a still-present group's selection does not. While the window holds
+///   [`REOPEN_LIMIT`] reopens, the group is held back ([`admission`]) until the oldest of
+///   them leaves the window, when the device thread rescans once, or until a resume or refresh.
+///   An arrival does not lift this, so a device that re-enumerates after each failure is
+///   not reopened in a loop, and one replugged more than [`REOPEN_LIMIT`] times a minute
+///   waits for the window.
 /// - A group with no failure or removal in the window is always opened.
 ///
 /// [`on_arrival`]: ReadFailureGuard::on_arrival
@@ -862,7 +936,7 @@ mod tests {
     use batterysight_core::hid::Collection;
     use batterysight_core::model::{DeviceUpdate, Presence, Source};
     use batterysight_core::scheduler::{Capabilities, DEFAULT_INTERVAL_MS, Grant, Trigger};
-    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, PIPE_ACCESS_OUTBOUND};
 
     use crate::reactor::tests::Server;
 
@@ -883,33 +957,6 @@ mod tests {
         );
         let unterminated: Vec<u16> = "AbC".encode_utf16().collect();
         assert_eq!(path_key(&unterminated), "abc");
-    }
-
-    #[test]
-    fn same_paths_in_any_order_match() {
-        let known = set(&["a", "b"]);
-        let scanned = set(&["b", "a"]);
-        assert!(unmatched(&[&known], &[&scanned]).is_empty());
-        assert!(unmatched(&[&scanned], &[&known]).is_empty());
-    }
-
-    #[test]
-    fn changed_groups_are_gone_and_new() {
-        let receiver = set(&["r1", "r2"]);
-        let headset = set(&["h"]);
-        let receiver_less = set(&["r1"]);
-        let mouse = set(&["m"]);
-        let known = [&receiver, &headset];
-        let scanned = [&mouse, &headset, &receiver_less];
-        assert_eq!(unmatched(&known, &scanned), [0]);
-        assert_eq!(unmatched(&scanned, &known), [0, 2]);
-    }
-
-    #[test]
-    fn nothing_known_means_all_new() {
-        let a = set(&["a"]);
-        assert_eq!(unmatched(&[&a], &[]), [0]);
-        assert!(unmatched(&[], &[&a]).is_empty());
     }
 
     /// A rescan opens `group` at `at`.
@@ -1315,12 +1362,7 @@ mod tests {
     fn removing_an_opened_group_records_a_failure() {
         let mut device = device();
         for path in ["a", "b"] {
-            device.groups.push(Opened {
-                id: GroupId(u32::MAX),
-                paths: set(&[path]),
-                collections: Vec::new(),
-                container: None,
-            });
+            device.groups.push(opened_fixture(u32::MAX, path, None));
         }
 
         assert!(device.on_event(OsEvent::InterfaceRemoved { path: wide("A") }));
@@ -1343,6 +1385,20 @@ mod tests {
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),
             on_change: Box::new(|| {}),
+        }
+    }
+
+    fn opened_fixture(id: u32, path: &str, container: Option<ContainerId>) -> Opened {
+        Opened {
+            id: GroupId(id),
+            paths: set(&[path]),
+            signature: SelectionSignature {
+                kind: EngineKind::Hidpp,
+                direct: None,
+                roles: Vec::new(),
+            },
+            collections: Vec::new(),
+            container,
         }
     }
 
@@ -1393,7 +1449,7 @@ mod tests {
 
     #[test]
     fn only_collections_an_engine_reads_are_opened_with_input_armed() {
-        let (rx_server, rx) = Server::new(PIPE_ACCESS_DUPLEX);
+        let (rx_server, rx) = Server::new(PIPE_ACCESS_OUTBOUND);
         let (tx_server, tx) = Server::new(PIPE_ACCESS_DUPLEX);
         let mut rx = dongle_member(rx, 0xFF00, 2, 20);
         let mut tx = dongle_member(tx, 0xFF00, 1, 7);
@@ -1472,14 +1528,131 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
     }
 
     #[test]
+    fn read_only_required_command_does_not_admit_the_group() {
+        let (_server, pipe) = Server::new(PIPE_ACCESS_OUTBOUND);
+        let hidpp = dongle_member(pipe, 0xFF43, 0x0202, 20);
+        let mut device = device();
+        device
+            .products
+            .insert(path_key(&hidpp.path), "Synthetic headset".into());
+        let id = hidpp.collection.id;
+        device.apply_scan(Some(vec![hidpp]), now_ms());
+        assert!(device.groups.is_empty(), "command handle was read-only");
+        let now = now_ms();
+        assert!(
+            device
+                .reactor
+                .wait(Some(now), now)
+                .iter()
+                .all(|event| event != &OsEvent::WriteFailed { collection: id }),
+            "discovery tried to use a read-only handle"
+        );
+    }
+
+    #[test]
+    fn rescan_keeps_unchanged_roles_with_fresh_ids() {
+        let (mut device, _server, mut hidpp, _) = dongle_device();
+        let (_control_server, control) = Server::new(PIPE_ACCESS_DUPLEX);
+        let mut control = dongle_member(control, 0x000C, 1, 3);
+        let base = now_ms();
+        device.apply_scan(Some(vec![hidpp.clone(), control.clone()]), base);
+        let old_id = device.groups[0].id;
+        let old_collection = hidpp.collection.id;
+        hidpp.collection.id = CollectionId(u32::MAX);
+        control.collection.id = CollectionId(u32::MAX - 1);
+        device.apply_scan(Some(vec![control, hidpp]), base + 1);
+        assert_eq!(device.groups.len(), 1);
+        assert_eq!(device.groups[0].id, old_id);
+        assert_eq!(device.groups[0].collections, [old_collection]);
+    }
+
+    #[test]
+    fn rescan_replaces_changed_roles_without_spending_reopen_budget() {
+        let (_old_server, old) = Server::new(PIPE_ACCESS_DUPLEX);
+        let (_new_server, new) = Server::new(PIPE_ACCESS_DUPLEX);
+        let mut old = dongle_member(old, 0xFF43, 0x0202, 20);
+        let mut new = dongle_member(new, 0x000C, 1, 20);
+        old.container = Some([1; 16]);
+        new.container = old.container;
+        let mut device = device();
+        for member in [&old, &new] {
+            device
+                .products
+                .insert(path_key(&member.path), "Synthetic headset".into());
+        }
+        let base = now_ms();
+        device.apply_scan(Some(vec![old.clone(), new.clone()]), base);
+        let old_id = device.groups[0].id;
+        let old_collection = old.collection.id;
+        let paths = device.groups[0].paths.clone();
+        // Previous real failures may have spent the budget while the device is now open.
+        cap(&mut device.guard, &paths, base);
+        let reopen_log = device.guard.groups[&paths].reopens.clone();
+
+        (old.collection.usage_page, old.collection.usage) = (0x000C, 1);
+        (new.collection.usage_page, new.collection.usage) = (0xFF43, 0x0202);
+        old.collection.id = CollectionId(u32::MAX - 1);
+        new.collection.id = CollectionId(u32::MAX);
+        let replacement = new.collection.id;
+        device.apply_scan(Some(vec![new, old]), base + 8_000);
+
+        assert_eq!(device.groups.len(), 1);
+        assert_ne!(device.groups[0].id, old_id, "the stale group was reused");
+        assert_eq!(device.groups[0].collections, [replacement]);
+        assert!(!device.reactor.write(old_collection, &[0x11]));
+        assert_eq!(device.guard.groups[&paths].reopens, reopen_log);
+        assert_eq!(device.guard.groups[&paths].failed_at, base + 6_000);
+        assert_eq!(device.deadline(), device.hub.next_deadline());
+    }
+
+    #[test]
+    fn rescan_replaces_the_catalog_entry_when_only_cached_product_changes() {
+        let (mut device, server, mut hidpp, paths) = dongle_device();
+        hidpp.collection.pid = 0xBEEF;
+        let alpha = r#"
+[[device]]
+name = "Synthetic Alpha"
+vid = 0x046D
+pids = [0xBEEF]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "synthetic product-gate fixture"
+receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
+"#;
+        let beta = alpha.replace("Alpha", "Beta");
+        let catalog = Catalog::parse(&format!("{alpha}{beta}")).unwrap();
+        device.hub = Hub::new(catalog, Policy::default());
+        let base = now_ms();
+        let scan = |device: &mut Device, hidpp: &HidInterface, name: Option<&str>, at| {
+            device.apply_scan_with(Some(vec![hidpp.clone()]), at, |_| name.map(str::to_owned));
+        };
+        scan(&mut device, &hidpp, Some("Cached Alpha"), base);
+        let old = device.groups[0].id;
+        let old_collection = hidpp.collection.id;
+        hidpp.collection.id = CollectionId(u32::MAX);
+        scan(&mut device, &hidpp, Some("Cached Alpha"), base + 1);
+        assert_eq!(device.groups[0].id, old, "fresh IDs must not reopen handles");
+
+        // A single-instance named pipe needs the server end reset to allow a new client.
+        // Do not deliver a disconnect event to runtime: the physical scan is unchanged.
+        server.listen_again();
+        scan(&mut device, &hidpp, Some("Cached Beta"), base + 2);
+        assert_ne!(device.groups[0].id, old);
+        assert_eq!(device.groups[0].collections, [hidpp.collection.id]);
+        assert!(!device.reactor.write(old_collection, &[0x11]));
+        assert!(!device.guard.groups.contains_key(&paths));
+
+        scan(&mut device, &hidpp, None, base + 3);
+        assert!(device.groups.is_empty(), "the denied route remained open");
+        assert!(!device.reactor.write(hidpp.collection.id, &[0x11]));
+        assert!(!device.guard.groups.contains_key(&paths));
+    }
+
+    #[test]
     fn failed_enumeration_keeps_every_group() {
         let mut device = device();
-        device.groups.push(Opened {
-            id: GroupId(u32::MAX),
-            paths: set(&["a"]),
-            collections: Vec::new(),
-            container: None,
-        });
+        device.groups.push(opened_fixture(u32::MAX, "a", None));
 
         device.apply_scan(None, now_ms());
         assert_eq!(device.groups.len(), 1);
@@ -1606,12 +1779,7 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
             },
         ));
         for (id, container) in [(1, HEADSET), (2, MOUSE)] {
-            device.groups.push(Opened {
-                id: GroupId(id),
-                paths: set(&[&id.to_string()]),
-                collections: Vec::new(),
-                container: Some(container),
-            });
+            device.groups.push(opened_fixture(id, &id.to_string(), Some(container)));
             let group = HidGroup {
                 id: GroupId(id),
                 collections: Vec::new(),
