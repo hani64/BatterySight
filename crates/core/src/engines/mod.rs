@@ -2,6 +2,7 @@
 
 pub mod hidpp;
 pub mod rapoo;
+mod steelseries;
 
 use crate::catalog::{Catalog, CollectionSelector, DeviceEntry, EngineKind};
 use crate::engine::Engine;
@@ -10,6 +11,7 @@ use crate::model::DeviceKey;
 
 use hidpp::HidppEngine;
 use rapoo::RapooEngine;
+use steelseries::SteelseriesEngine;
 
 /// A resolved protocol and its collection roles. An open failure never reselects an entry
 /// or promotes another collection to the command role.
@@ -30,6 +32,11 @@ enum Roles {
     Rapoo {
         receive: CollectionId,
     },
+    Steelseries {
+        command: CollectionId,
+        events: Option<CollectionId>,
+        report_id: u8,
+    },
 }
 
 impl Selection {
@@ -37,6 +44,9 @@ impl Selection {
         match &self.roles {
             Roles::Hidpp { receive, .. } => receive.contains(&id),
             Roles::Rapoo { receive } => id == *receive,
+            Roles::Steelseries {
+                command, events, ..
+            } => id == *command || Some(id) == *events,
         }
     }
 
@@ -45,13 +55,14 @@ impl Selection {
     }
 
     pub fn sends(&self, id: CollectionId) -> bool {
-        matches!(self.roles, Roles::Hidpp { command, .. } if id == command)
+        self.send_role(id).is_some()
     }
 
     pub fn kind(&self) -> EngineKind {
         match self.roles {
             Roles::Hidpp { .. } => EngineKind::Hidpp,
             Roles::Rapoo { .. } => EngineKind::Rapoo,
+            Roles::Steelseries { .. } => EngineKind::Steelseries,
         }
     }
 
@@ -63,13 +74,19 @@ impl Selection {
     /// The report ID used to frame commands, if this selection sends any.
     pub fn command_report_id(&self) -> Option<u8> {
         match self.roles {
-            Roles::Hidpp { report_id, .. } => Some(report_id),
+            Roles::Hidpp { report_id, .. } | Roles::Steelseries { report_id, .. } => {
+                Some(report_id)
+            }
             Roles::Rapoo { .. } => None,
         }
     }
 
     pub(crate) fn send_role(&self, id: CollectionId) -> Option<CollectionRole> {
-        self.sends(id).then_some(hidpp::engine::COMMAND_ROLE)
+        match self.roles {
+            Roles::Hidpp { command, .. } if id == command => Some(hidpp::engine::COMMAND_ROLE),
+            Roles::Steelseries { command, .. } if id == command => Some(steelseries::COMMAND_ROLE),
+            _ => None,
+        }
     }
 
     pub fn ready(&self, group: &HidGroup) -> bool {
@@ -82,6 +99,9 @@ impl Selection {
                         && group.collections.iter().any(|c| receive.contains(&c.id))
                 }
                 Roles::Rapoo { receive } => group.collections.iter().any(|c| c.id == *receive),
+                Roles::Steelseries { command, .. } => {
+                    group.collections.iter().any(|c| c.id == *command)
+                }
             }
     }
 
@@ -95,6 +115,19 @@ impl Selection {
                 let entry = catalog.devices().get(self.direct?)?;
                 let rx = group.collections.iter().find(|c| c.id == receive)?;
                 Some(Box::new(RapooEngine::from_selection(group.id, rx, entry)?))
+            }
+            Roles::Steelseries {
+                command, events, ..
+            } => {
+                if group.id != self.group {
+                    return None;
+                }
+                let entry = catalog.devices().get(self.direct?)?;
+                let command = group.collections.iter().find(|c| c.id == command)?;
+                let events = group.collections.iter().find(|c| Some(c.id) == events);
+                Some(Box::new(SteelseriesEngine::from_selection(
+                    group.id, command, events, entry,
+                )?))
             }
         }
     }
@@ -213,6 +246,23 @@ fn match_roles(
             Match::Denied => Match::Denied,
         };
     }
+    if let Some((index, entry)) = direct
+        && entry.engine == EngineKind::Steelseries
+    {
+        return match SteelseriesEngine::match_collections(group, entry, product) {
+            Match::Unique((command, events, report_id)) => Match::Unique(Selection {
+                group: group.id,
+                direct: Some(index),
+                roles: Roles::Steelseries {
+                    command,
+                    events,
+                    report_id,
+                },
+            }),
+            Match::Absent => Match::Absent,
+            Match::Denied => Match::Denied,
+        };
+    }
 
     let receive = direct.and_then(|(_, entry)| entry.receive.as_ref());
     let send = direct.and_then(|(_, entry)| entry.send.as_ref());
@@ -292,7 +342,9 @@ fn match_roles(
 /// Whether two devices present at once can be registered under the same `key`: a key an
 /// engine builds without a serial or unit id. The hub tells such devices apart.
 pub fn shared_key(key: &DeviceKey) -> bool {
-    HidppEngine::is_fallback_key(key) || RapooEngine::is_fallback_key(key)
+    HidppEngine::is_fallback_key(key)
+        || RapooEngine::is_fallback_key(key)
+        || SteelseriesEngine::is_fallback_key(key)
 }
 
 #[cfg(test)]

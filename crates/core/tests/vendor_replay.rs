@@ -2,7 +2,9 @@
 
 use batterysight_core::catalog::Catalog;
 use batterysight_core::engines::rapoo::RapooEngine;
-use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup, ReportOrigin};
+use batterysight_core::hid::{
+    Collection, CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin,
+};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
 use batterysight_core::model::{Charge, DeviceKind, Level, Presence, Source, Verification, Via};
 use batterysight_core::scheduler::Policy;
@@ -439,4 +441,424 @@ fn rapoo_refresh_preserves_last_reading_and_natural_reports_wake_after_idle() {
     assert_eq!(fresh[0].level, Some(Level::Percent(0)));
     assert_eq!(fresh[0].updated_ms, 75_002);
     assert_eq!(hub.next_deadline(), Some(135_002));
+}
+
+fn steelseries_group(pid: u16, interface: u8, width: u16) -> HidGroup {
+    let command = Collection {
+        id: RX,
+        vid: 0x1038,
+        pid,
+        interface: Some(interface),
+        usage_page: 0xFFC0,
+        usage: 1,
+        input_len: width,
+        output_len: width,
+        feature_len: 0,
+        product: String::new(),
+    };
+    let event = Collection {
+        id: OTHER,
+        interface: Some(if width == 65 { 5 } else { interface }),
+        usage_page: 0xFF00,
+        output_len: 0,
+        ..command.clone()
+    };
+    HidGroup {
+        id: GroupId(1),
+        collections: vec![command, event],
+    }
+}
+
+fn steelseries_input(
+    hub: &mut Hub,
+    collection: CollectionId,
+    bytes: &[u8],
+    now: Ms,
+) -> Vec<HubOutput> {
+    hub.handle(
+        HubInput::Report {
+            collection,
+            origin: ReportOrigin::Input,
+            bytes: bytes.to_vec(),
+        },
+        now,
+    )
+}
+
+fn steelseries_sent(out: Vec<HubOutput>, expected: Option<(u8, usize)>) {
+    let sends: Vec<_> = out
+        .into_iter()
+        .filter(|output| *output != HubOutput::StateChanged)
+        .collect();
+    let wanted: Vec<_> = expected
+        .into_iter()
+        .map(|(id, width)| {
+            let mut bytes = vec![0; width];
+            bytes[..2].copy_from_slice(&[id, 0xB0]);
+            HubOutput::Send {
+                collection: RX,
+                kind: ReportKind::Output,
+                bytes,
+                deadline: None,
+            }
+        })
+        .collect();
+    assert_eq!(sends, wanted);
+}
+
+fn steelseries_state(hub: &Hub, presence: Presence, level: Option<u8>, charge: Charge) {
+    let states = hub.snapshot();
+    assert_eq!(states.len(), 1, "only the headset, never a spare or case");
+    let state = &states[0];
+    assert_eq!(state.kind, DeviceKind::Headset);
+    assert_eq!(state.via, Via::Receiver);
+    assert_eq!(state.presence, presence);
+    assert_eq!(state.level, level.map(Level::Percent));
+    assert_eq!(state.charge, charge);
+    assert_eq!(state.verification, Verification::SourceVerified);
+    assert!(state.reports_changes);
+    assert_eq!(state.poll_min_ms, None);
+}
+
+#[test]
+fn steelseries_nova_status_uses_exact_pid_scale_and_windows_report_id() {
+    // Linux hid-steelseries-arctis.c's separate Nova 7 scales and GG capture
+    // in Linux-Arctis-Manager nova_7_gen2.yaml; Nova 5X offset: CachyOS #628.
+    for (pid, frame, level, charge) in [
+        (0x2202, [0, 0xB0, 3, 3, 1, 0], 75, Charge::Charging),
+        (0x22A1, [0, 0xB0, 3, 3, 3, 0], 3, Charge::Discharging),
+        (0x2253, [0, 0xB0, 3, 3, 97, 3], 97, Charge::Discharging),
+    ] {
+        let mut hub = hub();
+        let group = steelseries_group(pid, 3, 65);
+        let selected = hub
+            .select_group(&group, |_, _| panic!("no metadata gate"))
+            .expect("a supported PID has an exact selection");
+        assert_eq!(selected.command_report_id(), Some(0));
+        assert!(selected.reads(RX) && selected.sends(RX));
+        assert!(selected.reads(OTHER) && !selected.sends(OTHER));
+        steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+        assert!(steelseries_input(&mut hub, RX, &frame[1..], 1).is_empty());
+        assert!(steelseries_input(&mut hub, OTHER, &frame, 2).is_empty());
+        steelseries_sent(steelseries_input(&mut hub, RX, &frame, 3), None);
+        steelseries_state(&hub, Presence::Online, Some(level), charge);
+        assert_eq!(hub.snapshot()[0].source, Source::Push);
+        assert!(hub.snapshot()[0].name.starts_with("SteelSeries "));
+    }
+}
+
+#[test]
+fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
+    let mut hub = hub();
+    let request = Some((0, 65));
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x2232, 3, 65)), 0),
+        None,
+    );
+    let due = hub.next_deadline().expect("initial settle");
+    assert!((1_000..=2_000).contains(&due));
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 2), None);
+    steelseries_sent(hub.handle(HubInput::Resume, 3), None);
+    steelseries_sent(hub.handle(HubInput::Tick, due - 1), None);
+    steelseries_sent(hub.handle(HubInput::Tick, due), request);
+    // The first up notification, even after settling, is not a down→up edge.
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], due + 1),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 0, 80, 3], due + 2),
+        None,
+    );
+    assert_eq!(hub.snapshot()[0].source, Source::Query);
+    assert_eq!(hub.next_deadline(), None);
+
+    // Arctis-Sound-Manager #348, a Nova 5; trailing 02 is not the state byte.
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 79, 2], 2_100),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1, 2], 2_101),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(79), Charge::Charging);
+    let key = hub.snapshot()[0].key.clone();
+    hub.handle(HubInput::SetIntervals([(key.clone(), 1)].into()), 2_102);
+    steelseries_sent(hub.handle(HubInput::Tick, 900_000), None);
+    steelseries_sent(hub.handle(HubInput::Activity(key), 900_001), None);
+    assert_eq!(hub.next_deadline(), None);
+
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_002),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 900_003),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 2], 900_004),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_005),
+        request,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_006),
+        None,
+    );
+    steelseries_sent(hub.handle(HubInput::Tick, 910_000), None);
+    steelseries_sent(hub.handle(HubInput::Resume, 910_001), request);
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 910_002), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 910_003),
+        None,
+    );
+    // The dongle can answer an explicit read even when its radio link is down.
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 910_004), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 0, 65, 2], 910_005),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(65), Charge::NotCharging);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 910_006),
+        None,
+    );
+}
+
+#[test]
+fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
+    // Linux-Arctis-Manager base_arctis_gamebuds_dongle.yaml (Windows fields),
+    // HeadsetControl steelseries_arctis_gamebuds.hpp (lower active-bud level).
+    let mut hub = hub();
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x230A, 3, 65)), 0),
+        None,
+    );
+    steelseries_sent(hub.handle(HubInput::Tick, 2_000), Some((0, 65)));
+    assert!(steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 3, 2, 2, 0, 0], 2_001).is_empty());
+    // On this PID B9 and BB are transparency and microphone mute, not link/charge.
+    assert!(steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3], 2_002).is_empty());
+    assert!(steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1], 2_003).is_empty());
+    let request = Some((0, 65));
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 3, 3, 2], 2_004),
+        request,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 3, 3, 3], 2_005),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 0, 0, 3, 3, 83, 32], 2_006),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(32), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 3, 3, 3, 2], 2_007),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 82, 0], 2_008),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(82), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 3, 3, 2, 2], 2_009),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(82), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_stations_keep_numbered_framing_and_only_track_headset() {
+    // arctis-omni-linux README Protocol; Linux-Arctis-Manager
+    // base_arctis_nova_pro_wireless.yaml; HeadsetControl #481 (Elite push).
+    for (pid, interface, rid, raw, level, push_raw, push_level) in [
+        (0x12E5, 4, 0x06, 5, 62, 7, 87),
+        (0x2244, 3, 0x01, 99, 99, 95, 95),
+    ] {
+        let mut hub = hub();
+        let group = steelseries_group(pid, interface, 64);
+        let selection = hub.select_group(&group, |_, _| None).expect("station role");
+        assert_eq!(selection.command_report_id(), Some(rid));
+        assert!(selection.reads(RX) && selection.sends(RX));
+        assert!(selection.reads(OTHER) && !selection.sends(OTHER));
+        steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+        let due = hub.next_deadline().expect("station must settle");
+        assert!(due >= 5_000);
+        steelseries_sent(hub.handle(HubInput::Tick, due - 1), None);
+        steelseries_sent(hub.handle(HubInput::Tick, due), Some((rid, 64)));
+        let frame = [rid, 0xB0, 0, 0, 1, 0, raw, 0xFF, 8, 1, 2, 10, 3, 0, 8, 2];
+        assert!(steelseries_input(&mut hub, OTHER, &frame, due + 1).is_empty());
+        assert!(steelseries_input(&mut hub, RX, &[0x07, 0x19, 0, 0], due + 2).is_empty());
+        steelseries_sent(steelseries_input(&mut hub, RX, &frame, due + 3), None);
+        steelseries_state(&hub, Presence::Online, Some(level), Charge::Charging);
+        assert_eq!(hub.snapshot()[0].source, Source::Query);
+        steelseries_sent(
+            steelseries_input(&mut hub, OTHER, &[0x07, 0xB7, push_raw, 3, 4], due + 4),
+            None,
+        );
+        steelseries_state(&hub, Presence::Online, Some(push_level), Charge::Full);
+        steelseries_sent(
+            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 4], due + 5),
+            None,
+        );
+        steelseries_state(&hub, Presence::Offline, Some(push_level), Charge::Unknown);
+        steelseries_sent(
+            steelseries_input(&mut hub, OTHER, &[0x07, 0xB5, 0, 0, 8], due + 6),
+            Some((rid, 64)),
+        );
+        steelseries_sent(
+            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 8], due + 7),
+            None,
+        );
+        steelseries_sent(hub.handle(HubInput::Tick, 1_000_000), None);
+        assert_eq!(hub.next_deadline(), None);
+    }
+}
+
+#[test]
+fn steelseries_rejects_malformed_or_foreign_frames_and_unmatched_roles() {
+    let mut hub = hub();
+    for (label, pid, interface, width) in [
+        ("unknown PID", 0x22FF, 3, 65),
+        ("station bootloader", 0x2245, 3, 64),
+        ("wired GameDAC", 0x12CB, 4, 64),
+        ("wrong interface", 0x2202, 4, 65),
+        ("wrong width", 0x2202, 3, 64),
+    ] {
+        assert!(
+            hub.select_group(&steelseries_group(pid, interface, width), |_, _| None)
+                .is_none(),
+            "{label}"
+        );
+    }
+    let mut group = steelseries_group(0x2202, 3, 65);
+    group.collections.push(Collection {
+        id: CollectionId(3),
+        ..group.collections[0].clone()
+    });
+    assert!(hub.select_group(&group, |_, _| None).is_none());
+    group.collections[2] = Collection {
+        id: CollectionId(3),
+        ..group.collections[1].clone()
+    };
+    assert!(hub.select_group(&group, |_, _| None).is_none());
+
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x2202, 3, 65)), 0),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 4, 3, 0], 1),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(100), Charge::Discharging);
+    let original = hub.snapshot();
+    for (collection, bytes) in [
+        (RX, &[0, 0xB0, 3, 1, 3][..]), // Missing the fifth payload byte.
+        (RX, &[0, 0xB0, 3, 5, 1, 0]),
+        (RX, &[0, 0xB0, 9, 2, 1, 0]),
+        (RX, &[0, 0xB0, 3, 2, 4, 0]),
+        (RX, &[0, 0xB1, 3, 2, 1, 0]),
+        (RX, &[1, 0xB0, 3, 2, 1, 0]),
+        (RX, &[0, 0xB9, 2]), // Events are not accepted on regular Nova command paths.
+        (OTHER, &[0, 0xB7, 5]),
+        (OTHER, &[0, 0xB9]),
+        (OTHER, &[0, 0xBB, 0xFF]),
+        (OTHER, &[0, 0xB5, 0, 0, 2, 2]), // Bluetooth event, not the 2.4 GHz link.
+    ] {
+        assert!(
+            steelseries_input(&mut hub, collection, bytes, 2).is_empty(),
+            "{bytes:02x?}"
+        );
+    }
+    assert!(
+        hub.handle(
+            HubInput::Report {
+                collection: RX,
+                origin: ReportOrigin::FeatureReply,
+                bytes: vec![0, 0xB0, 3, 2, 1, 0],
+            },
+            2,
+        )
+        .is_empty()
+    );
+    assert_eq!(hub.snapshot(), original);
+
+    for (pid, interface, rid, bad_level) in [(0x12E5, 4, 6, 9), (0x2290, 3, 1, 101)] {
+        let mut hub = self::hub();
+        hub.handle(
+            HubInput::GroupArrived(steelseries_group(pid, interface, 64)),
+            0,
+        );
+        let good = [rid, 0xB0, 0, 0, 1, 0, 4, 8, 8, 1, 2, 10, 3, 0, 8, 8];
+        steelseries_sent(steelseries_input(&mut hub, RX, &good, 1), None);
+        let original = hub.snapshot();
+        assert_eq!(original.len(), 1);
+        assert!(steelseries_input(&mut hub, RX, &good[..15], 2).is_empty());
+        for (offset, byte) in [
+            (0, 7),
+            (1, 0xB1),
+            (6, bad_level),
+            (6, 0xFF),
+            (14, 3),
+            (15, 3),
+        ] {
+            let mut bad = good;
+            bad[offset] = byte;
+            assert!(
+                steelseries_input(&mut hub, RX, &bad, 2).is_empty(),
+                "{bad:02x?}"
+            );
+        }
+        for bytes in [
+            &[0x07, 0xB7, 4, 0][..],
+            &[0x07, 0xB7, bad_level, 0, 4],
+            &[0x07, 0xB5, 0, 0],
+            &[0x07, 0xB5, 0, 0, 0xFF],
+            &[0x01, 0xB7, 4, 0, 2],
+        ] {
+            assert!(
+                steelseries_input(&mut hub, OTHER, bytes, 2).is_empty(),
+                "{bytes:02x?}"
+            );
+        }
+        assert_eq!(hub.snapshot(), original);
+    }
+}
+
+#[test]
+fn steelseries_7_plus_passively_reads_both_documented_event_paths() {
+    // LAM arctis_7_plus.yaml kept if 3 from real hardware; GG declares if 5.
+    let mut hub = hub();
+    let group = steelseries_group(0x2212, 3, 65);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 1_500), Some((0, 65)));
+    let push = [0, 0xB7, 3];
+    steelseries_sent(steelseries_input(&mut hub, RX, &push, 1_501), None);
+    steelseries_state(&hub, Presence::Online, Some(75), Charge::Unknown);
+    let push = [0, 0xB7, 2];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &push, 1_502), None);
+    steelseries_state(&hub, Presence::Online, Some(50), Charge::Unknown);
+    steelseries_sent(hub.handle(HubInput::Tick, 999_999), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn steelseries_an_expired_arrival_grant_is_not_retried() {
+    let mut hub = hub();
+    let group = steelseries_group(0x12E5, 4, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    // The synthetic loop missed the default 10-second discovery grant.
+    steelseries_sent(hub.handle(HubInput::Tick, 10_001), None);
+    assert_eq!(hub.next_deadline(), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 100_000), None);
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 100_001), Some((6, 64)));
 }

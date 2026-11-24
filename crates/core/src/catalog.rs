@@ -12,6 +12,7 @@ use crate::model::{DeviceKind, Verification};
 pub enum EngineKind {
     Hidpp,
     Rapoo,
+    Steelseries,
 }
 
 /// The input status format and any known wired PID for a Rapoo VT model.
@@ -29,6 +30,19 @@ pub enum RapooReport {
     Ch584,
     Legacy,
     LegacyWithUnknownLevel,
+}
+
+/// The status layout, battery scale and report ID of a SteelSeries USB PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SteelseriesReport {
+    Nova7Steps,
+    Nova7Percent,
+    Nova5Percent,
+    Arctis7Plus,
+    GameBuds,
+    Station06Steps,
+    Station01Percent,
 }
 
 /// Per-device deviations from engine defaults.
@@ -109,6 +123,7 @@ pub struct DeviceEntry {
     pub receive: Option<CollectionSelector>,
     pub send: Option<CollectionSelector>,
     pub rapoo: Option<RapooConfig>,
+    pub steelseries: Option<SteelseriesReport>,
     pub quirks: Quirks,
 }
 
@@ -177,6 +192,7 @@ struct RawDevice {
     receive: Option<CollectionSelector>,
     send: Option<CollectionSelector>,
     rapoo: Option<RapooConfig>,
+    steelseries: Option<SteelseriesReport>,
     #[serde(default)]
     quirks: Quirks,
 }
@@ -195,6 +211,7 @@ fn parse_status(s: String) -> Result<Verification, CatalogError> {
 const BUILTIN_FILES: &[&str] = &[
     include_str!("../catalog/logitech.toml"),
     include_str!("../catalog/rapoo.toml"),
+    include_str!("../catalog/steelseries.toml"),
 ];
 
 impl Catalog {
@@ -245,6 +262,7 @@ impl Catalog {
                     receive: d.receive,
                     send: d.send,
                     rapoo: d.rapoo,
+                    steelseries: d.steelseries,
                     quirks: d.quirks,
                 })
             })

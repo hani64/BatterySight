@@ -471,13 +471,16 @@ impl Hub {
         }
     }
 
-    /// Asks the scheduler for `trigger` on every registered device, then discovers each
-    /// group whose engine registered no device again, as on its arrival.
+    /// Requests one shot from each group that answers for itself, or from each
+    /// registered device. Other groups without a device repeat discovery.
     fn request_all(&mut self, trigger: Trigger, now: Ms, pass: &mut Pass) {
         let devices: Vec<(DeviceKey, GroupId)> = self
             .owners
             .keys()
-            .filter_map(|key| Some((key.clone(), self.device_owner(key)?)))
+            .filter_map(|key| {
+                let gid = self.device_owner(key)?;
+                (!self.engines.get(&gid)?.engine.group_one_shots()).then(|| (key.clone(), gid))
+            })
             .collect();
         for (key, gid) in devices {
             // An earlier grant's actions may have moved or released the device.
@@ -485,16 +488,26 @@ impl Hub {
                 self.grant(gid, &key, trigger, now, pass);
             }
         }
-        let empty: Vec<(GroupId, DeviceKey)> = self
+        let groups: Vec<_> = self
             .engines
             .iter()
-            .filter(|&(&gid, _)| self.rediscoverable(gid))
-            .map(|(&gid, slot)| (gid, slot.key.clone()))
+            .filter_map(|(&gid, slot)| {
+                let one_shot = if slot.engine.group_one_shots() {
+                    trigger
+                } else if self.rediscoverable(gid) {
+                    Trigger::Arrival
+                } else {
+                    return None;
+                };
+                Some((gid, slot.key.clone(), one_shot))
+            })
             .collect();
-        for (gid, key) in empty {
-            if self.rediscoverable(gid) {
+        for (gid, key, one_shot) in groups {
+            if one_shot != Trigger::Arrival {
+                self.grant(gid, &key, one_shot, now, pass);
+            } else if self.rediscoverable(gid) {
                 self.scheduler.rearm_arrival(&key);
-                self.grant(gid, &key, Trigger::Arrival, now, pass);
+                self.grant(gid, &key, one_shot, now, pass);
             }
         }
     }
@@ -910,8 +923,8 @@ impl Hub {
         }
     }
 
-    /// HID++ receiver slots use their wireless PID. Dedicated devices, including a
-    /// Rapoo dongle that reports its own mouse, use the exact direct entry.
+    /// HID++ receiver slots use their wireless PID. Dedicated devices, including
+    /// a dongle or base station, use the exact direct entry.
     /// Both fall back to the selected engine's family status, if present.
     fn identity(
         &self,
@@ -1416,6 +1429,75 @@ quirks = { query_wakes = true }
                 refused(ReportKind::Output, coll(1), WriteRefusal::Grant),
             ]
         );
+    }
+
+    #[test]
+    fn steelseries_allowlist_rejects_wrong_role_id_opcode_kind_width_and_padding() {
+        for (pid, interface, id, width, settle) in [
+            (0x2202, 3, 0, 65, 1_500),
+            (0x12E5, 4, 6, 64, 5_000),
+            (0x2244, 3, 1, 64, 5_000),
+        ] {
+            let mut hub = Hub::new(Catalog::builtin(), Policy::default());
+            let mut group = group(1, 0x1038, pid);
+            let command = &mut group.collections[0];
+            command.interface = Some(interface);
+            command.usage_page = 0xFFC0;
+            command.usage = 1;
+            command.input_len = width;
+            command.output_len = width;
+            command.feature_len = width; // Descriptor width alone must not admit features.
+            let events = CollectionId(99);
+            let event_collection = Collection {
+                id: events,
+                interface: Some(if id == 0 { 5 } else { interface }),
+                usage_page: 0xFF00,
+                ..command.clone()
+            };
+            group.collections.push(event_collection);
+            let gid = group.id;
+            assert!(hub.handle(HubInput::GroupArrived(group), 0).is_empty());
+            let key = hub.engines[&gid].key.clone();
+            let grant = hub
+                .scheduler
+                .request(&key, gid, Trigger::RefreshNow, 0)
+                .unwrap();
+
+            let mut valid = vec![0; usize::from(width)];
+            valid[..2].copy_from_slice(&[id, 0xB0]);
+            let mut wrong_id = valid.clone();
+            wrong_id[0] = id ^ 1;
+            let mut nonzero_pad = valid.clone();
+            *nonzero_pad.last_mut().unwrap() = 1;
+            let mut wrong_op = valid.clone();
+            wrong_op[1] = 0xB1; // Elite settings reset is never an allowed command.
+            let output = ReportKind::Output;
+            for (kind, collection, bytes, reason) in [
+                (output, events, &valid[..], WriteRefusal::Collection),
+                (output, coll(1), &valid[..2], WriteRefusal::Width),
+                (output, coll(1), &wrong_id, WriteRefusal::Rule),
+                (output, coll(1), &wrong_op, WriteRefusal::Rule),
+                (output, coll(1), &nonzero_pad, WriteRefusal::Rule),
+                (ReportKind::GetFeature, coll(1), &valid, WriteRefusal::Rule),
+                (ReportKind::SetFeature, coll(1), &valid, WriteRefusal::Rule),
+            ] {
+                assert_eq!(
+                    hub.admit_write(
+                        gid,
+                        grant.id,
+                        SendRequest {
+                            collection,
+                            kind,
+                            bytes,
+                            deadline: Some(100),
+                        },
+                        0,
+                    ),
+                    Err(reason)
+                );
+            }
+            assert_eq!(sends(&hub.handle(HubInput::Tick, settle)), [valid]);
+        }
     }
 
     #[test]

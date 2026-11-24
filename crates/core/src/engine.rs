@@ -254,6 +254,13 @@ pub(crate) fn write_allowed<'a>(
 pub trait Engine {
     /// Scheduler key for conversations with the group itself (e.g. a receiver).
     fn group_key(&self) -> DeviceKey;
+
+    /// Arrival, resume and refresh can query the group itself even if its radio
+    /// device is not registered or linked. Used by dongles answering for themselves.
+    fn group_one_shots(&self) -> bool {
+        false
+    }
+
     fn on_grant(&mut self, grant: &Grant, now: Ms) -> Vec<Action>;
     fn on_report(
         &mut self,
