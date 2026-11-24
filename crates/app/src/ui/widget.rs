@@ -202,6 +202,12 @@ impl Widgets {
         }
     }
 
+    /// Whether no widget is shown although a taskbar exists; see [`needs_tray`].
+    pub fn missing(&self) -> bool {
+        let shown = self.widgets.iter().any(|w| w.pos.is_some());
+        needs_tray(!taskbars().is_empty(), shown)
+    }
+
     /// Destroys the windows and removes the hooks. The UIA thread ends when `self` drops.
     pub fn destroy(&mut self) {
         self.destroy_windows();
@@ -343,6 +349,13 @@ fn class_name(hwnd: HWND) -> String {
     // SAFETY: `buf` outlives the call.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..usize::try_from(n).unwrap_or(0)])
+}
+
+/// Whether the session must switch to tray icons: a taskbar exists but no widget is shown on
+/// any (for example, a Windows build without a visible `TrayNotifyWnd`), so nothing would
+/// show the devices or offer "Exit". Without any taskbar, tray icons cannot show either.
+fn needs_tray(taskbar: bool, shown: bool) -> bool {
+    taskbar && !shown
 }
 
 /// The window procedure of the widget. Clicks open the menu on the host window; nothing
@@ -742,5 +755,14 @@ mod tests {
             "Shell_TrayWnd",
             NOT_TASKBAR
         ));
+    }
+
+    #[test]
+    fn no_widget_shown_on_a_taskbar_falls_back_to_tray() {
+        assert!(needs_tray(true, false));
+        assert!(!needs_tray(true, true));
+        // No taskbar at all (Explorer not running): tray icons cannot show either, and
+        // `TaskbarCreated` starts the check again.
+        assert!(!needs_tray(false, false));
     }
 }
