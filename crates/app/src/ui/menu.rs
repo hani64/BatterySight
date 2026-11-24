@@ -97,12 +97,14 @@ pub struct Model {
 
 impl Model {
     /// The menu for `states` (the snapshot) and `settings`; `fallback`: why tray icons
-    /// show the devices, if they do.
+    /// show the devices, if they do; `can_autostart`: whether the Run value can be written
+    /// (the exe path is known).
     pub fn new(
         states: &[DeviceState],
         settings: &Settings,
         monitors: &[MonitorInfo],
         fallback: Option<TrayReason>,
+        can_autostart: bool,
     ) -> Model {
         let mut b = Builder::default();
         let mut items = Vec::new();
@@ -138,7 +140,7 @@ impl Model {
             "Start with Windows",
             MenuCommand::Autostart(!settings.autostart),
             settings.autostart,
-            true,
+            can_autostart,
         ));
         items.push(Item::Separator);
         items.push(b.entry("Refresh now", MenuCommand::Refresh, false, true));
@@ -153,6 +155,33 @@ impl Model {
     pub fn command(&self, id: usize) -> Option<MenuCommand> {
         self.commands.get(id.checked_sub(1)?).cloned()
     }
+}
+
+/// Applies `command` to `settings` and says whether they changed. `shown`: the keys of the
+/// devices shown, in shown order (a move skips hidden devices). Commands that are not
+/// settings (history, refresh, exit) change nothing.
+pub fn change(settings: &mut Settings, command: &MenuCommand, shown: &[DeviceKey]) -> bool {
+    let before = settings.clone();
+    match command {
+        MenuCommand::ToggleShown(key) => {
+            let hide = !settings.hidden.contains(key);
+            settings.set_hidden(key, hide);
+        }
+        MenuCommand::MoveLeft(key) => settings.move_left(key, shown),
+        MenuCommand::MoveRight(key) => settings.move_right(key, shown),
+        // The level it already has (an explicit 15 % is the default's) is no change.
+        MenuCommand::Threshold(key, threshold) if settings.threshold(key) != *threshold => {
+            settings.set_threshold(key, *threshold);
+        }
+        MenuCommand::ShowOn(choice) => settings.monitors = choice.clone(),
+        MenuCommand::ShowAs(display) => settings.display = *display,
+        MenuCommand::Autostart(on) => settings.autostart = *on,
+        MenuCommand::Threshold(..)
+        | MenuCommand::History
+        | MenuCommand::Refresh
+        | MenuCommand::Exit => {}
+    }
+    *settings != before
 }
 
 /// Numbers the commands as their entries are made.
@@ -502,7 +531,13 @@ mod tests {
 
     #[test]
     fn menu_model_matches_spec() {
-        let model = Model::new(&two_devices(), &Settings::default(), &two_monitors(), None);
+        let model = Model::new(
+            &two_devices(),
+            &Settings::default(),
+            &two_monitors(),
+            None,
+            true,
+        );
         let mut expected = vec!["PRO X Superlight — 79% ▸".to_owned()];
         expected.extend(
             [
@@ -567,6 +602,7 @@ mod tests {
             &settings,
             &two_monitors(),
             Some(TrayReason::UserChoice),
+            true,
         );
         let text = lines(&model.items);
         let at = |line: &str| text.iter().position(|l| l == line).unwrap();
@@ -612,7 +648,7 @@ mod tests {
             monitors: MonitorChoice::Named(r"\\.\DISPLAY3".into()),
             ..Settings::default()
         };
-        let model = Model::new(&two_devices(), &settings, &two_monitors(), None);
+        let model = Model::new(&two_devices(), &settings, &two_monitors(), None, true);
         let text = lines(&model.items);
         assert!(text.contains(&"  Display 3 (not connected) ✓".to_owned()));
     }
@@ -630,6 +666,7 @@ mod tests {
                 &Settings::default(),
                 &two_monitors(),
                 Some(reason),
+                true,
             );
             let text = lines(&model.items);
             let at = text.iter().position(|l| l == "Show as ▸").unwrap();
@@ -648,7 +685,7 @@ mod tests {
 
     #[test]
     fn no_devices_found() {
-        let model = Model::new(&[], &Settings::default(), &two_monitors(), None);
+        let model = Model::new(&[], &Settings::default(), &two_monitors(), None, true);
         assert_eq!(
             lines(&model.items)[..3],
             [
@@ -663,7 +700,7 @@ mod tests {
     fn offline_devices_are_not_listed() {
         let mut states = two_devices();
         states[0].presence = Presence::Offline;
-        let model = Model::new(&states, &Settings::default(), &two_monitors(), None);
+        let model = Model::new(&states, &Settings::default(), &two_monitors(), None, true);
         assert!(!lines(&model.items).iter().any(|l| l.contains("Superlight")));
     }
 
@@ -671,7 +708,13 @@ mod tests {
     fn command_ids_round_trip() {
         let mouse = DeviceKey("mouse".into());
         let headset = DeviceKey("headset".into());
-        let model = Model::new(&two_devices(), &Settings::default(), &two_monitors(), None);
+        let model = Model::new(
+            &two_devices(),
+            &Settings::default(),
+            &two_monitors(),
+            None,
+            true,
+        );
         let entries = entries(&model.items);
         let mut ids: Vec<usize> = entries.iter().map(|e| e.id).filter(|&id| id != 0).collect();
         let count = ids.len();
@@ -727,12 +770,83 @@ mod tests {
             autostart: true,
             ..Settings::default()
         };
-        let model = Model::new(&two_devices(), &settings, &two_monitors(), None);
+        let model = Model::new(&two_devices(), &settings, &two_monitors(), None, true);
         let entry = entries(&model.items)
             .into_iter()
             .find(|e| e.label == "Start with Windows")
             .unwrap();
         assert_eq!(model.command(entry.id), Some(MenuCommand::Autostart(false)));
+    }
+
+    #[test]
+    fn autostart_is_greyed_without_the_exe_path() {
+        let model = Model::new(
+            &two_devices(),
+            &Settings::default(),
+            &two_monitors(),
+            None,
+            false,
+        );
+        assert!(lines(&model.items).contains(&"Start with Windows (disabled)".to_owned()));
+    }
+
+    fn keys(list: &[&str]) -> Vec<DeviceKey> {
+        list.iter().map(|k| DeviceKey((*k).into())).collect()
+    }
+
+    #[test]
+    fn commands_change_settings() {
+        let shown = keys(&["a", "b", "c"]);
+        let [a, b, _] = &shown[..] else {
+            unreachable!()
+        };
+        let mut s = Settings::default();
+        assert!(change(&mut s, &MenuCommand::ToggleShown(b.clone()), &shown));
+        assert!(s.hidden.contains(b));
+        assert!(change(&mut s, &MenuCommand::ToggleShown(b.clone()), &shown));
+        assert!(s.hidden.is_empty());
+        assert!(change(&mut s, &MenuCommand::MoveRight(a.clone()), &shown));
+        assert_eq!(s.order, keys(&["b", "a", "c"]));
+        assert!(change(&mut s, &MenuCommand::MoveLeft(a.clone()), &shown));
+        assert_eq!(s.order, keys(&["a", "b", "c"]));
+        let thirty = MenuCommand::Threshold(a.clone(), Threshold::Percent(30));
+        assert!(change(&mut s, &thirty, &shown));
+        assert_eq!(s.threshold(a), Threshold::Percent(30));
+        assert!(change(
+            &mut s,
+            &MenuCommand::ShowOn(MonitorChoice::Main),
+            &shown
+        ));
+        assert_eq!(s.monitors, MonitorChoice::Main);
+        assert!(change(
+            &mut s,
+            &MenuCommand::ShowAs(DisplayMode::Tray),
+            &shown
+        ));
+        assert_eq!(s.display, DisplayMode::Tray);
+        assert!(change(&mut s, &MenuCommand::Autostart(true), &shown));
+        assert!(s.autostart);
+    }
+
+    #[test]
+    fn commands_that_change_nothing_say_so() {
+        let shown = keys(&["a", "b"]);
+        let mut s = Settings::default();
+        let a = shown[0].clone();
+        for command in [
+            // The checked entries again.
+            MenuCommand::Threshold(a.clone(), Threshold::Percent(15)),
+            MenuCommand::ShowOn(MonitorChoice::All),
+            MenuCommand::ShowAs(DisplayMode::Widget),
+            MenuCommand::Autostart(false),
+            // Not settings.
+            MenuCommand::History,
+            MenuCommand::Refresh,
+            MenuCommand::Exit,
+        ] {
+            assert!(!change(&mut s, &command, &shown), "{command:?}");
+        }
+        assert_eq!(s, Settings::default());
     }
 
     #[test]
@@ -747,7 +861,7 @@ mod tests {
     #[test]
     fn ampersands_are_kept_literal() {
         let states = [device("k", "Keys & Mice", DeviceKind::Keyboard, 50)];
-        let model = Model::new(&states, &Settings::default(), &[], None);
+        let model = Model::new(&states, &Settings::default(), &[], None, true);
         let Item::Submenu { label, .. } = &model.items[0] else {
             panic!("device submenu first");
         };

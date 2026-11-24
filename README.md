@@ -44,7 +44,7 @@ Start `batterysight.exe`. It shows each device's battery level on the taskbar, n
 - one submenu per device: show it on the taskbar or hide it, move it left or right, and its low-battery level (off, or 5 % to 40 %; 15 % unless you change it). A level at or below it is shown in red.
 - "Show on": all monitors' taskbars, the main one only, or one monitor's.
 - "Show as": the taskbar widget or one notification-area icon per device. Tray icons chosen here stay, across restarts, until you choose the widget again.
-- "Start with Windows": adds or removes `BatterySight` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- "Start with Windows": adds or removes `BatterySight` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. It shows unchecked while Task Manager's "Startup apps" has BatterySight disabled; choosing it then enables it there again.
 - "Refresh now" and "Exit".
 
 Changes apply at once and are saved to `settings.toml`. Only one instance runs per session; starting another does nothing.

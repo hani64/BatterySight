@@ -535,29 +535,31 @@ impl Ui {
     /// saved off this thread.
     fn apply(&mut self, command: MenuCommand) {
         match command {
-            MenuCommand::ToggleShown(key) => {
-                let hide = !self.settings.hidden.contains(&key);
-                self.settings.set_hidden(&key, hide);
-                self.update_views();
+            MenuCommand::Refresh => {
+                self.runtime.refresh_now();
+                return;
             }
-            MenuCommand::MoveLeft(key) => {
-                let shown = self.shown_keys();
-                self.settings.move_left(&key, &shown);
-                self.update_views();
+            MenuCommand::Exit => {
+                post(WM_APP_EXIT);
+                return;
             }
-            MenuCommand::MoveRight(key) => {
-                let shown = self.shown_keys();
-                self.settings.move_right(&key, &shown);
-                self.update_views();
-            }
-            MenuCommand::Threshold(key, threshold) => {
-                self.settings.set_threshold(&key, threshold);
-                self.update_views();
-            }
-            // Disabled in the menu: there is no history window yet.
-            MenuCommand::History => return,
-            MenuCommand::ShowOn(choice) => {
-                self.settings.monitors = choice;
+            // Greyed in the menu: the Run value needs the exe path.
+            MenuCommand::Autostart(_) if self.exe.is_none() => return,
+            _ => {}
+        }
+        let shown = self.shown_keys();
+        let changed = menu::change(&mut self.settings, &command, &shown);
+        match command {
+            // Even unchanged: chosen during an automatic fallback, the widget is wanted
+            // now, and tray icons become the user's choice.
+            MenuCommand::ShowAs(DisplayMode::Widget) => self.choose_widget(),
+            MenuCommand::ShowAs(DisplayMode::Tray) => self.choose_tray(),
+            _ if !changed => {}
+            MenuCommand::ToggleShown(_)
+            | MenuCommand::MoveLeft(_)
+            | MenuCommand::MoveRight(_)
+            | MenuCommand::Threshold(..) => self.update_views(),
+            MenuCommand::ShowOn(_) => {
                 if matches!(self.surface, Surface::Widgets(_)) {
                     self.show();
                     if matches!(self.surface, Surface::Widgets(_)) {
@@ -569,28 +571,17 @@ impl Ui {
                     self.retry_widget(true);
                 }
             }
-            MenuCommand::ShowAs(display) => {
-                self.settings.display = display;
-                match display {
-                    DisplayMode::Widget => self.choose_widget(),
-                    DisplayMode::Tray => self.choose_tray(),
+            MenuCommand::Autostart(on) => {
+                if let Some(exe) = self.exe.clone() {
+                    with_store(|store| store.run(Box::new(move || write_autostart(&exe, on))));
                 }
             }
-            MenuCommand::Autostart(on) => {
-                let Some(exe) = self.exe.clone() else { return };
-                self.settings.autostart = on;
-                with_store(|store| store.run(Box::new(move || write_autostart(&exe, on))));
-            }
-            MenuCommand::Refresh => {
-                self.runtime.refresh_now();
-                return;
-            }
-            MenuCommand::Exit => {
-                post(WM_APP_EXIT);
-                return;
-            }
+            // No setting; disabled in the menu while there is no history window.
+            MenuCommand::History | MenuCommand::Refresh | MenuCommand::Exit => {}
         }
-        self.save();
+        if changed {
+            self.save();
+        }
     }
 
     /// The keys of the devices shown, in shown order.
@@ -623,6 +614,7 @@ impl Ui {
             &self.settings,
             &widget::monitors(),
             self.tray_reason,
+            self.exe.is_some(),
         )
     }
 }
@@ -636,8 +628,10 @@ fn write_autostart(exe: &Path, on: bool) {
     }
 }
 
-/// Runs `f` on the store, unless it is stopped. Never waits for the lock: only the
-/// watchdog, stopping the store before it ends the process, holds it for long.
+/// Runs `f` on the store, unless it is stopped. Never waits for the lock: it is held only
+/// for a send like this one or to take the store out ([`stop_store`]), never while the
+/// store stops. A miss means the watchdog is taking it out to end the process, so the send
+/// is dropped.
 fn with_store(f: impl FnOnce(&Store)) {
     let guard = match STORE.try_lock() {
         Ok(guard) => guard,
@@ -651,8 +645,11 @@ fn with_store(f: impl FnOnce(&Store)) {
 
 /// Finishes the queued writes (waiting at most 1 s) and stops the store's writer; later
 /// saves are dropped. Called on every way out: "Exit", the end of the session, a failed
-/// start, and by the watchdog before it ends the process. Never waits for the lock: whoever
-/// holds it is already stopping the store, or only sending to it.
+/// start, and by the watchdog before it ends the process. The store is taken out under the
+/// lock and stopped after it is released. Never waits for the lock: on the UI thread a miss
+/// means the watchdog is taking the store out; on the watchdog's, that the UI thread is
+/// sending to it at that instant, and the writer is then ended with the process
+/// (`settings.toml` is replaced atomically, so at most that change is lost).
 pub fn stop_store() {
     let store = match STORE.try_lock() {
         Ok(mut guard) => guard.take(),

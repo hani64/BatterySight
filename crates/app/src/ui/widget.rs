@@ -140,7 +140,10 @@ impl Widgets {
     /// them next to their anchor.
     fn arrange(&mut self, views: &[DeviceView], light: bool) -> Result<(), CreateFailed> {
         self.hook_taskbars();
-        let bars = select(&taskbars(), &self.monitors, monitor_device);
+        let clocks = &self.clocks;
+        let bars = select(&taskbars(), &self.monitors, monitor_device, |bar| {
+            anchor_x(bar, clocks, window_rect(bar)).is_some()
+        });
         self.widgets.retain(|w| {
             // SAFETY: plain handle checks.
             let alive =
@@ -566,12 +569,17 @@ fn taskbars() -> Vec<(HWND, bool)> {
 }
 
 /// The taskbars that get a widget for `choice`, from `bars` (taskbar, primary) in
-/// [`taskbars`] order; `device` names a taskbar's monitor. Every taskbar when none matches
-/// (the named monitor is disconnected or has no taskbar), so the devices always show.
+/// [`taskbars`] order; `device` names a taskbar's monitor, `anchored` says whether a widget
+/// on it can be placed now ([`anchor_x`]). Every taskbar while none of the chosen ones can:
+/// the named monitor is disconnected or has no taskbar, or a secondary taskbar's clock is
+/// not known yet (UI Automation answers after the widgets are made). So a widget shows at
+/// once next to the primary's notification area, and the widgets narrow to the choice when
+/// its anchor arrives ([`Widgets::take_clocks`], then a layout).
 fn select<T: Copy>(
     bars: &[(T, bool)],
     choice: &MonitorChoice,
     device: impl Fn(T) -> String,
+    anchored: impl Fn(T) -> bool,
 ) -> Vec<(T, bool)> {
     let chosen: Vec<(T, bool)> = bars
         .iter()
@@ -582,10 +590,10 @@ fn select<T: Copy>(
             MonitorChoice::Named(name) => device(bar) == *name,
         })
         .collect();
-    if chosen.is_empty() {
-        bars.to_vec()
-    } else {
+    if chosen.iter().any(|&(bar, _)| anchored(bar)) {
         chosen
+    } else {
+        bars.to_vec()
     }
 }
 
@@ -886,7 +894,7 @@ mod tests {
     fn monitor_choice_selects_taskbars() {
         let bars = [(1, true), (2, false), (3, false)];
         let device = |bar: i32| format!(r"\\.\DISPLAY{bar}");
-        let pick = |choice| select(&bars, &choice, device);
+        let pick = |choice| select(&bars, &choice, device, |_| true);
         assert_eq!(pick(MonitorChoice::All), bars);
         assert_eq!(pick(MonitorChoice::Main), [(1, true)]);
         assert_eq!(
@@ -896,6 +904,29 @@ mod tests {
         // Disconnected, or without a taskbar: every taskbar rather than none.
         assert_eq!(pick(MonitorChoice::Named(r"\\.\DISPLAY9".into())), bars);
         // No primary taskbar (Explorer starting): the secondary ones.
-        assert_eq!(select(&bars[1..], &MonitorChoice::Main, device), bars[1..]);
+        assert_eq!(
+            select(&bars[1..], &MonitorChoice::Main, device, |_| true),
+            bars[1..]
+        );
+    }
+
+    #[test]
+    fn unanchored_choice_shows_on_every_taskbar_until_anchored() {
+        let bars = [(1, true), (2, false), (3, false)];
+        let device = |bar: i32| format!(r"\\.\DISPLAY{bar}");
+        let display3 = MonitorChoice::Named(r"\\.\DISPLAY3".into());
+        // Display 3's clock is not known yet (UI Automation answers later): every
+        // taskbar, so the primary's widget shows at once.
+        assert_eq!(select(&bars, &display3, device, |bar| bar == 1), bars);
+        // Known: Display 3 only.
+        assert_eq!(
+            select(&bars, &display3, device, |bar| bar != 2),
+            [(3, false)]
+        );
+        // The primary's notification area is not laid out yet: every taskbar.
+        assert_eq!(
+            select(&bars, &MonitorChoice::Main, device, |bar| bar != 1),
+            bars
+        );
     }
 }
