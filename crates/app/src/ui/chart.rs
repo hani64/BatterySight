@@ -26,9 +26,9 @@ struct Plot {
     lines: Vec<Vec<(u64, u8)>>,
     /// `(from, to)` while charging.
     charging: Vec<(u64, u64)>,
-    /// Whether a reading was taken in the window (the sample carried in from before it
-    /// and session breaks are none).
-    readings: bool,
+    /// Whether anything is drawn in the window (the sample carried in from before it alone
+    /// draws nothing there).
+    drawn: bool,
 }
 
 /// The plot of `samples` (in time order) from `from` to `now`. It starts with the last
@@ -43,10 +43,7 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
         .partition_point(|s| s.at_unix_ms < from)
         .saturating_sub(1);
     let shown = &samples[start..end];
-    let mut plot = Plot {
-        readings: shown.iter().any(|s| s.at_unix_ms >= from && !s.is_break()),
-        ..Plot::default()
-    };
+    let mut plot = Plot::default();
     let mut line = Vec::new();
     for (i, s) in shown.iter().enumerate() {
         let awake = s.presence == Presence::Online;
@@ -68,6 +65,8 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     if !line.is_empty() {
         plot.lines.push(line);
     }
+    plot.drawn = plot.lines.iter().flatten().any(|&(t, _)| t >= from)
+        || plot.charging.iter().any(|&(_, to)| to > from);
     plot
 }
 
@@ -191,7 +190,7 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration, light: b
         let below = area.bottom + text_h / 8;
         text(dc, area.left, below, &start_label(span));
         text(dc, area.right - text_width(dc, "now"), below, "now");
-        if !plot.readings {
+        if !plot.drawn {
             let w = text_width(dc, NO_DATA);
             text(
                 dc,
@@ -404,18 +403,50 @@ mod tests {
     }
 
     #[test]
-    fn only_samples_in_the_window_are_readings() {
-        // Only the carry-in before the window: nothing read in it.
+    fn no_data_whenever_nothing_is_drawn() {
+        // Only the carry-in before the window.
         let samples = [on(0, 90)];
-        assert!(!plot(&samples, at(10), at(20)).readings);
-        // Nor is a session break.
+        assert!(!plot(&samples, at(10), at(20)).drawn);
+        // Nor a session break.
         let samples = [
             on(0, 90),
             Sample::session_break(DeviceKey("logi:4082:1".into()), at(15)),
         ];
-        assert!(!plot(&samples, at(10), at(20)).readings);
-        assert!(plot(&[on(0, 90), on(15, 89)], at(10), at(20)).readings);
-        assert!(!plot(&[], at(10), at(20)).readings);
+        assert!(!plot(&samples, at(10), at(20)).drawn);
+        assert!(plot(&[on(0, 90), on(15, 89)], at(10), at(20)).drawn);
+        assert!(!plot(&[], at(10), at(20)).drawn);
+        // Readings that draw nothing: asleep or offline with no awake sample before, awake
+        // without a level.
+        let samples = [
+            s(
+                12,
+                Some(Level::Percent(50)),
+                Presence::Asleep,
+                Charge::Discharging,
+            ),
+            s(
+                14,
+                Some(Level::Percent(50)),
+                Presence::Offline,
+                Charge::Discharging,
+            ),
+            s(16, None, Presence::Online, Charge::Unknown),
+        ];
+        assert!(!plot(&samples, at(10), at(20)).drawn);
+        // An awake charging stretch is drawn, even without a level.
+        let charging = [s(12, None, Presence::Online, Charge::Charging)];
+        assert!(plot(&charging, at(10), at(20)).drawn);
+        // A sleep that ends a line entering the window is drawn.
+        let samples = [
+            on(0, 90),
+            s(
+                15,
+                Some(Level::Percent(89)),
+                Presence::Asleep,
+                Charge::Discharging,
+            ),
+        ];
+        assert!(plot(&samples, at(10), at(20)).drawn);
     }
 
     #[test]

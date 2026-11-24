@@ -230,25 +230,31 @@ impl Recorder {
         samples
     }
 
-    /// Session breaks at `now_unix_ms` (BatterySight started, or the PC resumed) for every
-    /// known device: those with samples in `history` and those this recorder has seen, by
-    /// key, except a device whose latest sample in `history` is a break already.
+    /// Session breaks at `now_unix_ms` (BatterySight started, the PC is going to sleep or
+    /// resumed) for every device read since its last break: those whose latest sample in
+    /// `history`, or last sample in this recorder, is a reading. A second break with no
+    /// reading in between adds nothing.
     pub fn session_break(
         &mut self,
         history: &HashMap<DeviceKey, Vec<Sample>>,
         now_unix_ms: u64,
     ) -> Vec<Sample> {
-        let mut keys: Vec<&DeviceKey> = history.keys().chain(self.last.keys()).collect();
+        let read = |sample: Option<&Sample>| sample.is_some_and(|s| !s.is_break());
+        let mut keys: Vec<&DeviceKey> = history
+            .iter()
+            .filter(|(_, samples)| read(samples.last()))
+            .map(|(key, _)| key)
+            .chain(
+                self.last
+                    .iter()
+                    .filter(|(_, (last, _))| read(Some(last)))
+                    .map(|(key, _)| key),
+            )
+            .collect();
         keys.sort();
         keys.dedup();
         let breaks = keys
             .into_iter()
-            .filter(|key| {
-                !history
-                    .get(*key)
-                    .and_then(|s| s.last())
-                    .is_some_and(Sample::is_break)
-            })
             .map(|key| Sample::session_break(key.clone(), now_unix_ms))
             .collect();
         for (last, _) in self.last.values_mut() {
@@ -275,7 +281,8 @@ pub fn read(text: &str, since_unix_ms: u64) -> (Vec<Sample>, bool) {
 }
 
 /// Adds `samples` to `history` (each device's samples in time order) and drops every
-/// device's samples older than [`KEEP_MS`] before `now_unix_ms`.
+/// device's samples older than [`KEEP_MS`] before `now_unix_ms`. A device left with session
+/// breaks only is dropped: breaks alone keep nothing worth showing.
 pub fn add(
     history: &mut HashMap<DeviceKey, Vec<Sample>>,
     samples: impl IntoIterator<Item = Sample>,
@@ -291,18 +298,21 @@ pub fn add(
     history.retain(|_, list| {
         let old = list.partition_point(|s| s.at_unix_ms < since);
         list.drain(..old);
-        !list.is_empty()
+        list.iter().any(|s| !s.is_break())
     });
 }
 
 /// How long the battery of the device with `samples` (in time order) lasts from its
 /// latest level, at the rate it fell over its most recent qualifying discharge span: a
 /// run of awake, discharging samples with a percentage that does not rise, lasting at
-/// least 2 h with at least 3 samples. A sleeping or offline sample, a charge, or a rise
-/// ends a span. `None` without such a span, without a drop over it, or when the latest
+/// least 2 h with at least 3 samples. A sleeping or offline sample, a session break, a
+/// charge, or a rise ends a span. The latest level is the latest sample's, session breaks
+/// after it left out (a device that has not reported since the PC woke keeps its
+/// estimate). `None` without such a span, without a drop over it, or when the latest
 /// sample is on power or has no percentage. Samples after `now_unix_ms` are left out.
 pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
     let samples = &samples[..samples.partition_point(|s| s.at_unix_ms <= now_unix_ms)];
+    let samples = &samples[..samples.iter().rposition(|s| !s.is_break())? + 1];
     let latest = samples.last()?;
     let Some(Level::Percent(level)) = latest.level else {
         return None;
@@ -700,7 +710,14 @@ mod tests {
         let mut history = HashMap::new();
         add(
             &mut history,
-            [a, Sample::session_break(key("b"), T0)],
+            [
+                a,
+                Sample {
+                    key: key("b"),
+                    ..sample(T0 - MIN, 50)
+                },
+                Sample::session_break(key("b"), T0),
+            ],
             T0 + MIN,
         );
         // A device whose latest sample is a break already gets none; the recorder's too.
@@ -753,5 +770,67 @@ mod tests {
             time_left(&s, T0 + 34 * HOUR),
             Some(Duration::from_millis(76 * 2 * HOUR / 4))
         );
+    }
+
+    #[test]
+    fn suspend_break_precedes_the_resume_reading() {
+        let mut r = Recorder::default();
+        let mut history = HashMap::new();
+        add(&mut history, r.observe(&[state(80, 1)], T0), T0);
+        // Suspend at 23:00: the break is recorded before the PC sleeps.
+        let suspend = T0 + HOUR;
+        let breaks = r.session_break(&history, suspend);
+        add(&mut history, breaks, suspend);
+        // The device's resume reading at 08:00, unchanged, is recorded after it.
+        let resume = T0 + 10 * HOUR;
+        let read = r.observe(&[state(80, 2)], resume);
+        assert_eq!(read.len(), 1);
+        add(&mut history, read, resume);
+        let at: Vec<(u64, bool)> = history[&key("logi:4082:1")]
+            .iter()
+            .map(|s| (s.at_unix_ms, s.is_break()))
+            .collect();
+        assert_eq!(at, [(T0, false), (suspend, true), (resume, false)]);
+        // Suspend again, then the resume break before any reading: it adds nothing.
+        let breaks = r.session_break(&history, resume + HOUR);
+        assert_eq!(breaks.len(), 1);
+        add(&mut history, breaks, resume + HOUR);
+        assert!(r.session_break(&history, resume + 2 * HOUR).is_empty());
+    }
+
+    #[test]
+    fn time_left_skips_trailing_breaks() {
+        let mut s = discharge(&[(0, 100), (2, 95), (5, 90)]);
+        s.push(Sample {
+            presence: Presence::Asleep,
+            ..sample(T0 + 6 * HOUR, 90)
+        });
+        let before = time_left(&s, T0 + 6 * HOUR);
+        assert_eq!(before, Some(Duration::from_secs(45 * 3600)));
+        // The PC slept and woke; the device has not reported since.
+        s.push(Sample::session_break(key("logi:4082:1"), T0 + 7 * HOUR));
+        s.push(Sample::session_break(key("logi:4082:1"), T0 + 9 * HOUR));
+        assert_eq!(time_left(&s, T0 + 9 * HOUR), before);
+    }
+
+    #[test]
+    fn devices_with_only_breaks_are_dropped() {
+        let mut history = HashMap::new();
+        add(
+            &mut history,
+            [
+                Sample::session_break(key("gone"), T0),
+                Sample::session_break(key("gone"), T0 + HOUR),
+                sample(T0, 80),
+                Sample::session_break(key("logi:4082:1"), T0 + HOUR),
+            ],
+            T0 + HOUR,
+        );
+        assert!(!history.contains_key(&key("gone")));
+        assert_eq!(history[&key("logi:4082:1")].len(), 2);
+        // Once its readings age out, its breaks go too.
+        let later = T0 + KEEP_MS + 1;
+        add(&mut history, [], later);
+        assert!(history.is_empty());
     }
 }

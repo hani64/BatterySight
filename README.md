@@ -33,7 +33,7 @@ Otherwise it only listens. Opening the menu never queries; it shows the last kno
 
 BatterySight collects no telemetry. Its only network call is the update check (arriving in milestone 4).
 
-Settings and battery history live in `%LOCALAPPDATA%\BatterySight` (`settings.toml`, `history.tsv`) and contain device ids, such as unit ids, as keys; they stay on your PC. `history.tsv` holds one line per sample (time, device key, level, charging state, awake/asleep/offline, millivolts when known, where the reading came from); a line with no level, `unknown`, `offline` and `os` marks where BatterySight started or the PC woke up, so the time before it was not observed. Samples older than 30 days are removed when BatterySight starts.
+Settings and battery history live in `%LOCALAPPDATA%\BatterySight` (`settings.toml`, `history.tsv`) and contain device ids, such as unit ids, as keys; they stay on your PC. `history.tsv` holds one line per sample (time, device key, level, charging state, awake/asleep/offline, millivolts when known, where the reading came from); a line with no level, `unknown`, `offline` and `os` marks where BatterySight started or the PC went to sleep, so the time after the device's previous line was not observed. Samples older than 30 days are removed when BatterySight starts.
 
 For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it write every HID++ frame it sends and receives to `%LOCALAPPDATA%\BatterySight\sends.log`, along with when audio starts and stops on a device or cannot be watched (`audio` lines) and why it switched to tray icons (`ui fallback` lines). Tracing is off by default. The frames include device unit ids and other serial-like values, so review the file before sharing it.
 

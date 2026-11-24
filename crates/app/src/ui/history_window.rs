@@ -93,8 +93,8 @@ pub struct Device {
 }
 
 /// The devices to list: the snapshot's in the user's order, hidden and offline ones
-/// included, then devices with history that are not in the snapshot, by key (their names
-/// are not kept).
+/// included, then devices with readings in the history that are not in the snapshot, by
+/// key (their names are not kept); session breaks alone do not list a device.
 pub fn devices(
     states: &[DeviceState],
     settings: &Settings,
@@ -109,8 +109,11 @@ pub fn devices(
         })
         .collect();
     let mut rest: Vec<&DeviceKey> = history
-        .keys()
-        .filter(|key| !list.iter().any(|d| d.key == **key))
+        .iter()
+        .filter(|(key, samples)| {
+            samples.iter().any(|s| !s.is_break()) && !list.iter().any(|d| d.key == **key)
+        })
+        .map(|(key, _)| key)
         .collect();
     rest.sort();
     list.extend(rest.into_iter().map(|key| Device {
@@ -822,5 +825,24 @@ mod tests {
             .collect();
         // Devices not connected now are listed by key.
         assert_eq!(names, ["K400", "G305", "PRO X", "y", "z"]);
+    }
+
+    #[test]
+    fn devices_with_only_breaks_are_not_listed() {
+        let history = HashMap::from([
+            (
+                DeviceKey("x".into()),
+                vec![Sample::session_break(DeviceKey("x".into()), 1)],
+            ),
+            (
+                DeviceKey("y".into()),
+                vec![sample("y"), Sample::session_break(DeviceKey("y".into()), 2)],
+            ),
+        ]);
+        let keys: Vec<String> = devices(&[], &Settings::default(), &history)
+            .into_iter()
+            .map(|d| d.key.0)
+            .collect();
+        assert_eq!(keys, ["y"]);
     }
 }
