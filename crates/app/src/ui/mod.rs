@@ -842,7 +842,7 @@ impl Ui {
         let samples = self.history.get(&hover.key).map_or(&[][..], Vec::as_slice);
         let left = history::time_left(samples, unix_now_ms());
         let lines = card::card_text(state, left, tick_ms());
-        self.card.show(hover, &lines, samples, self.light);
+        self.card.show(hover, &lines, self.light);
         if self.card.shown().is_none() {
             // Not drawn: the next move on the device tries again.
             self.hover = None;

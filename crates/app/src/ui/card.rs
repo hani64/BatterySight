@@ -1,17 +1,16 @@
-//! The hover card: a device's name, level, status, time left and its battery chart of the
-//! last 24 h, shown above the taskbar once the cursor has rested on the device on a widget
-//! for [`HOVER_MS`](super::HOVER_MS). The tray icons' tooltips carry the same text
-//! ([`card_text`]).
+//! The hover card: a device's name, level, status and time left, shown above the taskbar
+//! once the cursor has rested on the device on a widget for [`HOVER_MS`](super::HOVER_MS).
+//! The tray icons' tooltips carry the same text ([`card_text`]).
 //!
 //! The card is a layered top-level popup of the UI thread (`WS_POPUP`; a tool window,
 //! topmost, never activated and click-through), never a child of a taskbar: creating,
 //! showing, moving and hiding it are calls on our own window that Explorer takes no part
 //! in. It is created when first shown and painted from the snapshot and the history in
-//! memory: no device traffic, no disk. Its chart is bounded by its width (`chart`).
+//! memory: no device traffic, no disk.
 
 use std::time::Duration;
 
-use batterysight_core::history::{self, Sample};
+use batterysight_core::history;
 use batterysight_core::model::{Charge, DeviceKey, DeviceState, Presence};
 use batterysight_core::time::Ms;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -29,9 +28,6 @@ use windows::core::w;
 
 use super::widget::Hover;
 use super::{CARD_CLASS, hinstance, level_text, render};
-
-/// What the card's chart covers.
-const CHART_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The card's window, created when first shown, and the device it shows.
 pub struct Card {
@@ -55,11 +51,11 @@ impl Card {
         self.shown.as_ref()
     }
 
-    /// Paints `lines` ([`card_text`]) and the chart of `samples` (the device's, in time
-    /// order) at the DPI of `hover`'s widget, and shows the card above `hover`'s taskbar,
-    /// on its monitor ([`place`]). A card that cannot be drawn is hidden.
-    pub fn show(&mut self, hover: &Hover, lines: &[String], samples: &[Sample], light: bool) {
-        let painter = render::card(lines, samples, CHART_WINDOW, hover.dpi, light);
+    /// Paints `lines` ([`card_text`]) at the DPI of `hover`'s widget and shows the card
+    /// above `hover`'s taskbar, on its monitor ([`place`]). A card that cannot be drawn is
+    /// hidden.
+    pub fn show(&mut self, hover: &Hover, lines: &[String], light: bool) {
+        let painter = render::card(lines, hover.dpi, light);
         let (Some(painter), Some((monitor, work))) = (painter, monitor_of(&hover.bar)) else {
             self.hide();
             return;

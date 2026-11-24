@@ -758,7 +758,7 @@ impl Window {
             SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
             let text = wide(&line);
             let _ = TextOutW(dc, a.text.0, a.text.1, &text[..text.len() - 1]);
-            chart::paint(dc, a.chart, samples, RANGES[self.range].1, true);
+            chart::paint(dc, a.chart, samples, RANGES[self.range].1);
             if let Some(original) = original {
                 SelectObject(dc, original);
             }

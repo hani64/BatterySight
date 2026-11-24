@@ -1,14 +1,14 @@
-//! The battery chart, shared by the history window and the hover card: a device's level
-//! over a time window ending now, charging spans shaded, gaps where it slept or was off.
+//! The battery history window's chart: a device's level over a time window ending now,
+//! charging spans shaded, gaps where it slept or was off or was not observed.
 //!
 //! Drawn with plain GDI on the caller's DC in the font selected there (labels are sized
 //! from it); everything the chart selects is restored before it returns. Drawing is bounded
-//! by the chart's width: at most one point per pixel column ([`columns`]).
+//! by the chart's width: at most a column's first and last point per line ([`columns`]).
 
 use std::time::Duration;
 
 use batterysight_core::history::Sample;
-use batterysight_core::model::{Charge, CoarseLevel, Level, Presence};
+use batterysight_core::model::{Charge, CoarseLevel, Level, Presence, Source};
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FillRect, GetTextExtentPoint32W,
@@ -19,6 +19,8 @@ use windows::Win32::Graphics::Gdi::{
 /// Percent lines across the chart; the first, middle and last are labelled.
 const GRID: [u8; 5] = [0, 25, 50, 75, 100];
 const NO_DATA: &str = "No readings in this period";
+/// A wake reading followed this soon by an awake reading gives way to it ([`provisional`]).
+const PROVISIONAL_MS: u64 = 10 * 60 * 1000;
 
 /// What the chart shows, in unix milliseconds and percent.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -36,8 +38,8 @@ struct Plot {
 /// sample before `from`, so a line enters from the left edge. A line runs from a sample on
 /// only while the device is awake and has a level; a sample asleep or offline (a session
 /// break too) ends the line at its level, and draws nothing until the device is awake
-/// again. An awake charging sample shades the time until the next sample (or now, for the
-/// latest).
+/// again. A [`provisional`] wake reading draws no point. An awake charging sample shades
+/// the time until the next sample (or now, for the latest).
 fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     let end = samples.partition_point(|s| s.at_unix_ms <= now);
     let start = samples[..end]
@@ -48,7 +50,12 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     let mut line = Vec::new();
     for (i, s) in shown.iter().enumerate() {
         let awake = s.presence == Presence::Online;
-        match s.level.map(height) {
+        let point = if provisional(&samples[..end], start + i) {
+            None
+        } else {
+            s.level.map(height)
+        };
+        match point {
             Some(h) if awake || !line.is_empty() => line.push((s.at_unix_ms, h)),
             _ => {}
         }
@@ -71,6 +78,35 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     plot
 }
 
+/// Whether `samples[i]` is a wake reading that gives way to a later one: a level from
+/// the voltage (with millivolts) that the device pushed as it woke (the sample before it
+/// is not awake, or a session break, or there is none), followed within
+/// [`PROVISIONAL_MS`] by an awake reading that is not one too. A battery that has rested
+/// reads several points higher than in use minutes later, which would draw a spike at
+/// every wake; the reading in use stands for it. A wake reading with nothing soon after
+/// (the latest, say) is drawn.
+fn provisional(samples: &[Sample], i: usize) -> bool {
+    let woke = |i: usize| {
+        let s = &samples[i];
+        s.presence == Presence::Online
+            && s.source == Source::Push
+            && s.millivolts.is_some()
+            && s.level.is_some()
+            && i.checked_sub(1)
+                .is_none_or(|p| samples[p].presence != Presence::Online || samples[p].is_break())
+    };
+    if !woke(i) {
+        return false;
+    }
+    let at = samples[i].at_unix_ms;
+    samples
+        .iter()
+        .enumerate()
+        .skip(i + 1)
+        .take_while(|(_, s)| s.at_unix_ms - at <= PROVISIONAL_MS)
+        .any(|(j, s)| s.presence == Presence::Online && s.level.is_some() && !woke(j))
+}
+
 /// Where a level is drawn, in percent; a coarse level at a fixed height in its band.
 fn height(level: Level) -> u8 {
     match level {
@@ -82,9 +118,9 @@ fn height(level: Level) -> u8 {
     }
 }
 
-/// The plot in pixel columns (`x` maps a time to its column), at most one point per
-/// column, so drawing is bounded by the chart's width however many samples there are.
-/// Within a column, a later point replaces the earlier one. A line that starts in the
+/// The plot in pixel columns (`x` maps a time to its column), at most a column's first
+/// and last point per line, so drawing is bounded by the chart's width however many
+/// samples there are; a change within a column is a step in it. A line that starts in the
 /// column the line before it ended in continues that line: a gap narrower than a column
 /// cannot be drawn, and dropping the point would open a false one. Charging spans
 /// clamped to `left..right` that touch or overlap are merged.
@@ -104,8 +140,17 @@ fn columns(plot: &Plot, x: impl Fn(u64) -> i32, left: i32, right: i32) -> Column
         for &(t, p) in line {
             let column = x(t);
             if taken.is_some_and(|c| column <= c) {
-                if let Some(last) = points.last_mut().filter(|last| last.0 == column) {
-                    last.1 = p;
+                // In the last column (an earlier one, after a clock set back, is skipped):
+                // the column's first point stays, its last is this one (none when equal).
+                match points[..] {
+                    [.., a, b] if a.0 == column && b.0 == column => {
+                        points.pop();
+                        if a.1 != p {
+                            points.push((column, p));
+                        }
+                    }
+                    [.., b] if b.0 == column && b.1 != p => points.push((column, p)),
+                    _ => {}
                 }
                 continue;
             }
@@ -157,41 +202,28 @@ struct Colors {
     charging: COLORREF,
 }
 
-impl Colors {
-    fn new(light: bool) -> Colors {
-        if light {
-            Colors {
-                background: rgb(255, 255, 255),
-                grid: rgb(229, 229, 229),
-                text: rgb(96, 96, 96),
-                line: rgb(0, 103, 192),
-                charging: rgb(223, 246, 221),
-            }
-        } else {
-            Colors {
-                background: rgb(32, 32, 32),
-                grid: rgb(64, 64, 64),
-                text: rgb(200, 200, 200),
-                line: rgb(96, 205, 255),
-                charging: rgb(31, 58, 35),
-            }
-        }
-    }
-}
+/// The chart's colours, on the window's light background.
+const COLORS: Colors = Colors {
+    background: rgb(255, 255, 255),
+    grid: rgb(229, 229, 229),
+    text: rgb(96, 96, 96),
+    line: rgb(0, 103, 192),
+    charging: rgb(223, 246, 221),
+};
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
 /// Paints the chart of `samples` (one device's, in time order) over the `window` ending
-/// now into `rect` of `dc`, for a light or dark background. Labels use the font selected
-/// in `dc`; line widths follow its height, so they scale with the DPI the font was made for.
-pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration, light: bool) {
+/// now into `rect` of `dc`. Labels use the font selected in `dc`; line widths follow its
+/// height, so they scale with the DPI the font was made for.
+pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration) {
     let now = super::unix_now_ms();
     let span = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
     let from = now.saturating_sub(span);
     let plot = plot(samples, from, now);
-    let colors = Colors::new(light);
+    let colors = &COLORS;
     // SAFETY: GDI calls on the caller's live DC; the strings and points outlive the calls
     // that read them. The DC's state is saved first and restored before the pens and
     // brushes made here are deleted, so none is deleted while selected.
@@ -271,7 +303,9 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration, light: b
         for line in &columns.lines {
             let points: Vec<POINT> = line.iter().map(|&(x, p)| POINT { x, y: y(p) }).collect();
             if let [dot] = points[..] {
-                let r = thick + 1;
+                // A reading alone: a dot about as wide as the line is thick, so it does not
+                // stand out from the lines around it.
+                let r = thick;
                 let _ = Ellipse(dc, dot.x - r, dot.y - r, dot.x + r + 1, dot.y + r + 1);
             } else {
                 let _ = Polyline(dc, &points);
@@ -521,13 +555,14 @@ mod tests {
     }
 
     #[test]
-    fn columns_keep_one_point_per_column() {
+    fn columns_keep_a_column_s_first_and_last_point() {
         let plot = Plot {
             lines: vec![
                 vec![(0, 90), (1, 89), (4, 88), (10, 80)],
-                // Starts in the column the line before ended in: continues it.
+                // Starts in the column the line before ended in: continues it, with a step
+                // in that column from where the line before ended.
                 vec![(11, 79), (20, 70)],
-                // Wholly in that column: joins it too, the later value winning.
+                // Wholly in that column: joins it too, the later value ending the step.
                 vec![(21, 69)],
                 vec![(40, 60)],
             ],
@@ -535,9 +570,100 @@ mod tests {
             drawn: true,
         };
         let c = columns(&plot, |t| (t / 5) as i32, 0, 20);
-        assert_eq!(c.lines, [vec![(0, 88), (2, 79), (4, 69)], vec![(8, 60)]]);
+        assert_eq!(
+            c.lines,
+            [
+                vec![(0, 90), (0, 88), (2, 80), (2, 79), (4, 70), (4, 69)],
+                vec![(8, 60)]
+            ]
+        );
         // Pixel spans (0,0) empty, (1,2) and (2,3) merge, (6,20) clamped to the right edge.
         assert_eq!(c.charging, [(1, 3), (6, 20)]);
+    }
+
+    #[test]
+    fn a_level_held_then_dropping_stays_flat_until_the_drop() {
+        // 67 % held for hours, then asleep, then 61 % a moment later in the same column.
+        let samples = [
+            on(0, 67),
+            s(
+                230,
+                Some(Level::Percent(67)),
+                Presence::Asleep,
+                Charge::Discharging,
+            ),
+            on(231, 61),
+        ];
+        let p = plot(&samples, at(0), at(240));
+        let c = columns(&p, |t| ((t - at(0)) / (2 * MIN)) as i32, 0, 120);
+        // Not a slope from 67 to 61 over the hours it read 67.
+        assert_eq!(c.lines, [vec![(0, 67), (115, 67), (115, 61)]]);
+    }
+
+    /// A device's push as it wakes, with millivolts (its level comes from the voltage).
+    fn wake_push(at: u64, p: u8) -> Sample {
+        Sample {
+            millivolts: Some(3_800),
+            source: Source::Push,
+            ..on(at, p)
+        }
+    }
+
+    fn asleep(at: u64, p: u8) -> Sample {
+        s(
+            at,
+            Some(Level::Percent(p)),
+            Presence::Asleep,
+            Charge::Discharging,
+        )
+    }
+
+    #[test]
+    fn a_wake_reading_gives_way_to_a_reading_soon_after() {
+        let brk = |m| Sample::session_break(DeviceKey("logi:4082:1".into()), at(m));
+        // Asleep, then the wake push reads 64 % on a rested battery; a minute later (after
+        // a restart) the device reads 61 % in use: the line starts at the 61.
+        let samples = [
+            asleep(0, 61),
+            wake_push(10, 64),
+            brk(11),
+            on(11, 61),
+            on(20, 60),
+        ];
+        assert_eq!(
+            plot(&samples, at(0), at(30)).lines,
+            [vec![(at(11), 61), (at(20), 60)]]
+        );
+        // The wake push and the asleep sample that kept its level draw nothing either.
+        let samples = [
+            asleep(0, 50),
+            wake_push(10, 58),
+            asleep(12, 58),
+            wake_push(14, 58),
+            on(15, 50),
+        ];
+        assert_eq!(plot(&samples, at(0), at(30)).lines, [vec![(at(15), 50)]]);
+        // The latest reading stays, as does one with no reading within 10 min after it.
+        let samples = [asleep(0, 50), wake_push(10, 58)];
+        assert_eq!(plot(&samples, at(0), at(30)).lines, [vec![(at(10), 58)]]);
+        let samples = [asleep(0, 50), wake_push(10, 58), on(21, 50)];
+        assert_eq!(
+            plot(&samples, at(0), at(30)).lines,
+            [vec![(at(10), 58), (at(21), 50)]]
+        );
+        // A reading while awake, or one without millivolts (a percentage the device
+        // reports itself), is drawn.
+        let samples = [on(0, 60), wake_push(10, 64), on(11, 61)];
+        assert_eq!(plot(&samples, at(0), at(30)).lines[0].len(), 3);
+        let pushed = Sample {
+            source: Source::Push,
+            ..on(10, 64)
+        };
+        let samples = [asleep(0, 61), pushed, on(11, 61)];
+        assert_eq!(
+            plot(&samples, at(0), at(30)).lines,
+            [vec![(at(10), 64), (at(11), 61)]]
+        );
     }
 
     #[test]

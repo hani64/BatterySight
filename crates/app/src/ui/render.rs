@@ -5,9 +5,7 @@
 //! in its colours on an opaque background instead.
 
 use std::ffi::c_void;
-use std::time::Duration;
 
-use batterysight_core::history::Sample;
 use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateBitmap,
@@ -19,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 use windows::core::{PCWSTR, w};
 
-use super::{DeviceView, chart};
+use super::DeviceView;
 
 /// Icon fonts, best first: Windows 11 ships Segoe Fluent Icons, Windows 10 Segoe MDL2 Assets
 /// (same code points for the glyphs used here).
@@ -340,7 +338,7 @@ pub fn tray_icon(view: Option<&DeviceView>, size: i32, light: bool) -> Option<HI
     p.into_icon()
 }
 
-/// Colours of the hover card for the taskbar's theme; its background is the chart's.
+/// Colours of the hover card for the taskbar's theme.
 struct CardColors {
     background: [u8; 3],
     border: [u8; 3],
@@ -368,26 +366,20 @@ impl CardColors {
     }
 }
 
-/// The hover card: `lines` (the first, the device's name, emphasised) above the chart of
-/// `samples` over `window`, opaque, in the taskbar's theme; `dpi` scales it.
-pub fn card(
-    lines: &[String],
-    samples: &[Sample],
-    window: Duration,
-    dpi: u32,
-    light: bool,
-) -> Option<Painter> {
+/// The hover card: `lines` (the first, the device's name, emphasised), opaque, in the
+/// taskbar's theme; `dpi` scales it.
+pub fn card(lines: &[String], dpi: u32, light: bool) -> Option<Painter> {
     let px = |v: i32| v * dpi as i32 / 96;
     let colors = CardColors::new(light);
     let mut p = Painter::new()?;
     let title_font = p.font(&[TEXT_FACE], -px(14), FW_SEMIBOLD.0 as i32)?;
     let text_font = p.font(&[TEXT_FACE], -px(12), FW_NORMAL.0 as i32)?;
-    let chart_font = p.font(&[TEXT_FACE], -px(11), FW_NORMAL.0 as i32)?;
     let pad = px(12);
     // (font, text, y, colour)
     let mut rows = Vec::with_capacity(lines.len());
     let mut y = pad;
-    let mut width = px(300);
+    let mut bottom = pad;
+    let mut width = px(180);
     for (i, line) in lines.iter().enumerate() {
         let (font, rgb, gap) = if i == 0 {
             (title_font, colors.title, px(4))
@@ -398,15 +390,10 @@ pub fn card(
         let size = p.measure(font, &wide);
         width = width.max(size.cx + 2 * pad);
         rows.push((font, wide, y, rgb));
-        y += size.cy + gap;
+        bottom = y + size.cy;
+        y = bottom + gap;
     }
-    let chart = RECT {
-        left: pad / 2,
-        top: y + px(6),
-        right: width - pad / 2,
-        bottom: y + px(126),
-    };
-    let height = chart.bottom + pad / 2;
+    let height = bottom + pad;
     if !p.begin(width, height) {
         return None;
     }
@@ -429,8 +416,6 @@ pub fn card(
         unsafe { SetTextColor(p.dc, colorref(*rgb)) };
         p.draw(*font, pad, *y, wide);
     }
-    p.select(chart_font);
-    chart::paint(p.dc, chart, samples, window, light);
     p.opaque();
     Some(p)
 }
