@@ -21,7 +21,8 @@ pub struct Quirks {
     /// An active battery query wakes the device, so it is only queried on user activity.
     pub query_wakes: bool,
     /// The device reports its battery only when it powers on or off, never while in use,
-    /// so it is read on observed activity (audio playing to it), at most every 5 minutes.
+    /// so it is read on observed activity (audio playing to it), never more often than every
+    /// 5 minutes.
     pub no_in_use_push: bool,
 }
 

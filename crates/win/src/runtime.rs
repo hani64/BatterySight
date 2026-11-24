@@ -7,9 +7,9 @@
 //! While audio plays to a physical device (its container has an active audio session and a
 //! peak level of at least -60 dBFS), the device thread hands the hub an activity input for
 //! each of that device's registered devices as soon as the scheduler would grant one (for
-//! the PRO X Wireless, 5 minutes after its last read). Devices the scheduler would refuse
-//! (asleep, or pushing their battery) are not metered. Without an active session it sets no
-//! deadline for this, so a silent PC never wakes the thread.
+//! the PRO X Wireless, 10 minutes after its last read by default, 5 after a wake). Devices
+//! the scheduler would refuse (asleep, or pushing their battery) are not metered. Without an
+//! active session it sets no deadline for this, so a silent PC never wakes the thread.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -822,7 +822,7 @@ mod tests {
     use batterysight_core::engine::{Action, Engine};
     use batterysight_core::hid::Collection;
     use batterysight_core::model::{DeviceUpdate, Presence, Source};
-    use batterysight_core::scheduler::{Capabilities, Grant, Trigger};
+    use batterysight_core::scheduler::{Capabilities, DEFAULT_INTERVAL_MS, Grant, Trigger};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 
     use crate::reactor::tests::Server;
@@ -1540,11 +1540,13 @@ mod tests {
             [Trigger::Arrival, Trigger::Activity]
         );
         assert_eq!(*mouse_grants.borrow(), [Trigger::Arrival]);
-        assert_eq!(device.deadline(), Some(at + GAP));
+        // The first read after registration came at the minimum; the default gap follows.
+        assert_eq!(device.deadline(), Some(at + DEFAULT_INTERVAL_MS));
 
         // An audible check reset the back-off.
-        device.check_activity(at + GAP, headset_peak(0.0));
-        assert_eq!(device.deadline(), Some(at + GAP + 15_000));
+        let next = at + DEFAULT_INTERVAL_MS;
+        device.check_activity(next, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(next + 15_000));
 
         // Audio stops: nothing wakes the device thread any more.
         for container in [HEADSET, MOUSE] {
