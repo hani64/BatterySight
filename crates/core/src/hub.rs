@@ -169,6 +169,12 @@ impl Hub {
             .collect()
     }
 
+    /// When an [`HubInput::Activity`] for `key` may next be granted; `None` while none can
+    /// be (unknown device, one that pushes its battery, or one asleep).
+    pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
+        self.scheduler.activity_ready_at(key)
+    }
+
     fn arrive(&mut self, group: &HidGroup, now: Ms, pass: &mut Pass) {
         // The same id again means the old handles are gone.
         self.remove_group(group.id, now, pass);
@@ -417,6 +423,9 @@ impl Hub {
         groups.push(gid);
         self.grace.remove(&key);
         self.scheduler.register(key.clone(), caps);
+        // The discovery that registered the device read its battery: audio already playing
+        // waits the device's gap before asking again.
+        self.scheduler.note_read(&key, now);
         self.note_presence(&key, initial.presence);
 
         let state = self
@@ -1208,7 +1217,29 @@ source = "test"
     }
 
     #[test]
-    fn reregister_within_grace_keeps_scheduler_history() {
+    fn registration_restarts_the_activity_gap() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
+        let mut hub = hub(&[(1, &f)]);
+        // The discovery that registers a device reads its battery: audio already playing
+        // must not ask again at once.
+        hub.handle(logi(1), 1_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(101_000));
+
+        hub.handle(HubInput::Activity(a.clone()), 100_999);
+        hub.handle(HubInput::Activity(a.clone()), 101_000);
+
+        assert_eq!(
+            grants(&f),
+            vec![(group_key(1), Trigger::Arrival), (a, Trigger::Activity)]
+        );
+    }
+
+    #[test]
+    fn reregister_within_grace_restarts_the_activity_gap() {
         let a = dev("dev-a");
         let (first, second) = (fake(), fake());
         first
@@ -1225,33 +1256,31 @@ source = "test"
         hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
         hub.handle(logi(2), 2_000);
 
-        hub.handle(HubInput::Activity(a), 3_000);
-
+        hub.handle(HubInput::Activity(a.clone()), 101_999);
         assert_eq!(grants(&second), vec![(group_key(2), Trigger::Arrival)]);
+        hub.handle(HubInput::Activity(a.clone()), 102_000);
+        assert_eq!(grants(&second).last(), Some(&(a, Trigger::Activity)));
     }
 
     #[test]
-    fn grace_expiry_forgets_scheduler_history() {
-        let a = dev("dev-a");
-        let (first, second) = (fake(), fake());
-        first
-            .borrow_mut()
-            .on_grant
-            .push_back(vec![register_with(&a, activity_gap(), None)]);
-        second
-            .borrow_mut()
-            .on_grant
-            .push_back(vec![register_with(&a, activity_gap(), None)]);
-        let mut hub = hub(&[(1, &first), (2, &second)]);
+    fn activity_ready_at_is_none_for_devices_activity_cannot_reach() {
+        let f = fake();
+        let (poll, push) = (dev("poll"), dev("push"));
+        f.borrow_mut().on_grant.push_back(vec![
+            register_with(&poll, activity_gap(), None),
+            register(&push, None),
+        ]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Asleep(poll.clone())]);
+        let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
-        hub.handle(HubInput::RefreshNow, 0);
-        hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
-        hub.handle(HubInput::Tick, 61_000);
-        hub.handle(logi(2), 62_000);
+        assert_eq!(hub.activity_ready_at(&poll), Some(100_000));
+        assert_eq!(hub.activity_ready_at(&push), None, "pushes");
+        assert_eq!(hub.activity_ready_at(&dev("unknown")), None);
 
-        hub.handle(HubInput::Activity(a.clone()), 63_000);
-
-        assert_eq!(grants(&second).last(), Some(&(a, Trigger::Activity)));
+        hub.handle(report(1), 1);
+        assert_eq!(hub.activity_ready_at(&poll), None, "asleep");
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub enum OsEvent {
         container: ContainerId,
         active: bool,
     },
+    /// Audio activity is not (fully) watched: `stage` failed on the audio thread.
+    AudioUnavailable { stage: &'static str },
     /// Posted by another thread to make [`Reactor::wait`] return.
     Wake,
 }

@@ -65,21 +65,32 @@ impl Drop for AudioGuard {
 ///
 /// Returns without waiting for the thread to set up: the audio service may be slow to answer
 /// (for example right after logon) and must not hold up the caller. A thread that cannot set
-/// up ends and posts nothing; the devices are then read as without audio.
+/// up posts [`OsEvent::AudioUnavailable`] and ends; the devices are then read as without
+/// audio.
 pub fn start(poster: Poster) -> Result<AudioGuard> {
     let (sender, messages) = mpsc::channel();
     let own = sender.clone();
     thread::Builder::new()
         .name("batterysight-audio".into())
         .spawn(move || {
-            let Ok(_mta) = Mta::enter() else {
-                return;
+            let _mta = match Mta::enter() {
+                Ok(mta) => mta,
+                Err(_) => return unavailable(&poster, "com"),
             };
-            if let Ok(mut activity) = Activity::new(own, poster) {
-                activity.run(&messages);
+            // Declared after `_mta`, so a session still queued is released inside the
+            // apartment.
+            let messages = messages;
+            match Activity::new(own, poster.clone()) {
+                Ok(mut activity) => activity.run(&messages),
+                Err(stage) => unavailable(&poster, stage),
             }
         })?;
     Ok(AudioGuard(sender))
+}
+
+/// Tells the device thread that audio activity is not (fully) watched, and why.
+fn unavailable(poster: &Poster, stage: &'static str) {
+    poster.post(OsEvent::AudioUnavailable { stage });
 }
 
 /// The highest current peak level (0.0 to 1.0) of the active render endpoints of
@@ -90,6 +101,7 @@ pub fn peak(container: &ContainerId) -> Option<f32> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER) }.ok()?;
     render_endpoints(&enumerator)
+        .ok()?
         .into_iter()
         .filter(|device| endpoint_container(device).as_ref() == Some(container))
         .filter_map(|device| {
@@ -102,18 +114,15 @@ pub fn peak(container: &ContainerId) -> Option<f32> {
         .reduce(f32::max)
 }
 
-/// The active render endpoints, or none when they cannot be listed.
-fn render_endpoints(enumerator: &IMMDeviceEnumerator) -> Vec<IMMDevice> {
+/// The active render endpoints; an endpoint that cannot be fetched is left out.
+fn render_endpoints(enumerator: &IMMDeviceEnumerator) -> Result<Vec<IMMDevice>> {
     // SAFETY: `enumerator` is live.
-    let Ok(devices) = (unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) })
-    else {
-        return Vec::new();
-    };
+    let devices = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }?;
     // SAFETY: `devices` is live; `Item` is called with indices below its count.
-    let count = unsafe { devices.GetCount() }.unwrap_or(0);
-    (0..count)
+    let count = unsafe { devices.GetCount() }?;
+    Ok((0..count)
         .filter_map(|index| unsafe { devices.Item(index) }.ok())
-        .collect()
+        .collect())
 }
 
 /// The container id of an audio endpoint's device, or `None` when it cannot be read.
@@ -132,7 +141,9 @@ fn endpoint_container(device: &IMMDevice) -> Option<ContainerId> {
     let container = unsafe {
         let inner = &value.Anonymous.Anonymous;
         let guid = inner.Anonymous.puuid;
-        (inner.vt == VT_CLSID && !guid.is_null()).then(|| container_id(&*guid))
+        (inner.vt == VT_CLSID && !guid.is_null())
+            .then(|| container_id(&*guid))
+            .flatten()
     };
     // SAFETY: `value` came from `GetValue` and is cleared once.
     let _ = unsafe { PropVariantClear(&mut value) };
@@ -311,13 +322,17 @@ struct Activity {
 }
 
 impl Activity {
-    fn new(sender: Sender<Message>, poster: Poster) -> Result<Activity> {
+    /// Sets up the endpoint notifications and watches the current endpoints; on failure,
+    /// names the stage that failed.
+    fn new(sender: Sender<Message>, poster: Poster) -> std::result::Result<Activity, &'static str> {
         // SAFETY: creates an in-process object; no pointer arguments.
         let enumerator: IMMDeviceEnumerator =
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER) }?;
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| "enumerator")?;
         let endpoint_watch: IMMNotificationClient = EndpointWatch(sender.clone()).into();
         // SAFETY: both objects are live; the callback is unregistered on drop.
-        unsafe { enumerator.RegisterEndpointNotificationCallback(&endpoint_watch) }?;
+        unsafe { enumerator.RegisterEndpointNotificationCallback(&endpoint_watch) }
+            .map_err(|_| "notifications")?;
         let mut activity = Activity {
             sender,
             poster,
@@ -357,10 +372,17 @@ impl Activity {
     fn rescan(&mut self) {
         self.release();
         self.generation += 1;
-        for device in render_endpoints(&self.enumerator) {
-            if let Some(container) = endpoint_container(&device) {
-                // An endpoint that cannot be watched counts as silent.
-                let _ = self.watch(&device, container);
+        let Ok(devices) = render_endpoints(&self.enumerator) else {
+            unavailable(&self.poster, "endpoints");
+            self.publish();
+            return;
+        };
+        for device in devices {
+            if let Some(container) = endpoint_container(&device)
+                && self.watch(&device, container).is_err()
+            {
+                // Counts as silent until the next rescan.
+                unavailable(&self.poster, "sessions");
             }
         }
         self.publish();
@@ -536,7 +558,7 @@ mod tests {
         // SAFETY: creates an in-process object; no pointer arguments.
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER) }.unwrap();
-        for device in render_endpoints(&enumerator) {
+        for device in render_endpoints(&enumerator).unwrap() {
             let container = endpoint_container(&device);
             println!(
                 "container {}  peak {:?}  {}",
@@ -562,8 +584,12 @@ mod tests {
         while Instant::now() < end {
             let left = end.saturating_duration_since(Instant::now()).as_millis() as u64;
             for event in reactor.wait(Some(left), 0) {
-                if let OsEvent::AudioActive { container, active } = event {
-                    println!("{} {}", container_hex(&container), active);
+                match event {
+                    OsEvent::AudioActive { container, active } => {
+                        println!("{} {}", container_hex(&container), active);
+                    }
+                    OsEvent::AudioUnavailable { stage } => println!("unavailable {stage}"),
+                    _ => {}
                 }
             }
         }
