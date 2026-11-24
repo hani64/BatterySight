@@ -176,8 +176,11 @@ fn explorer_answers() -> bool {
     }
 }
 
-/// Starts the tray-only replacement and ends this process at once.
+/// Finishes the settings writes (at most 1 s, normally none are queued), starts the
+/// tray-only replacement and ends this process at once. The replacement waits for this
+/// process to end before it loads the settings.
 fn trip() -> ! {
+    super::stop_store();
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe)
             .args(["--tray-only", "--takeover"])

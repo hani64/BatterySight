@@ -9,10 +9,6 @@ use batterysight_win::trace::ui_line;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayReason {
     /// The user chose tray icons.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no setting offers tray icons yet")
-    )]
     UserChoice,
     /// Started with `--tray-only`.
     TrayOnlyFlag,
@@ -51,11 +47,12 @@ pub fn self_retry_delay(attempts_done: u8, elapsed_ms: u64) -> Option<u32> {
     next_self_retry(attempts_done).map(|at| at.saturating_sub(elapsed))
 }
 
-/// The reason to start in tray mode, from the flags: `--tray-only`, which the watchdog's
-/// relaunch also passes along with `--takeover`. `None` starts the widget.
-pub fn start_reason(tray_only: bool, takeover: bool) -> Option<TrayReason> {
+/// The reason to start in tray mode, from the flags (`--tray-only`, which the watchdog's
+/// relaunch also passes along with `--takeover`), then from the user's choice of tray
+/// icons (`user_tray`). `None` starts the widget.
+pub fn start_reason(tray_only: bool, takeover: bool, user_tray: bool) -> Option<TrayReason> {
     match (tray_only, takeover) {
-        (false, _) => None,
+        (false, _) => user_tray.then_some(TrayReason::UserChoice),
         (true, false) => Some(TrayReason::TrayOnlyFlag),
         (true, true) => Some(TrayReason::Watchdog),
     }
@@ -85,11 +82,28 @@ mod tests {
 
     #[test]
     fn start_reason_from_flags() {
-        assert_eq!(start_reason(false, false), None);
-        assert_eq!(start_reason(false, true), None);
-        assert_eq!(start_reason(true, false), Some(TrayReason::TrayOnlyFlag));
+        assert_eq!(start_reason(false, false, false), None);
+        assert_eq!(start_reason(false, true, false), None);
+        assert_eq!(
+            start_reason(true, false, false),
+            Some(TrayReason::TrayOnlyFlag)
+        );
         // The watchdog's relaunch: never retried, or a stalled widget could loop.
-        assert_eq!(start_reason(true, true), Some(TrayReason::Watchdog));
+        assert_eq!(start_reason(true, true, false), Some(TrayReason::Watchdog));
+    }
+
+    #[test]
+    fn start_reason_from_the_user_choice() {
+        assert_eq!(
+            start_reason(false, false, true),
+            Some(TrayReason::UserChoice)
+        );
+        // The flags say more about this session; neither is retried either.
+        assert_eq!(start_reason(true, true, true), Some(TrayReason::Watchdog));
+        assert_eq!(
+            start_reason(true, false, true),
+            Some(TrayReason::TrayOnlyFlag)
+        );
     }
 
     #[test]

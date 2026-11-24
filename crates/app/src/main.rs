@@ -1,10 +1,13 @@
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod list;
 mod ui;
 
 use std::ffi::OsString;
 
+use batterysight_core::settings::DisplayMode;
+use batterysight_win::store::Store;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
@@ -31,12 +34,20 @@ fn main() {
     let Some(instance) = SingleInstance::acquire(takeover) else {
         return;
     };
+    // Before any window exists: both block this thread briefly (disk, registry).
+    let store = Store::start();
+    let mut settings = store.load_settings();
+    settings.autostart = std::env::current_exe().is_ok_and(|exe| autostart::is_enabled(&exe));
     let options = ui::Options {
-        tray: ui::fallback::start_reason(has("--tray-only"), takeover),
+        tray: ui::fallback::start_reason(
+            has("--tray-only"),
+            takeover,
+            settings.display == DisplayMode::Tray,
+        ),
         debug_stall: cfg!(debug_assertions) && has("--debug-stall-widget"),
         debug_no_anchor: cfg!(debug_assertions) && has("--debug-force-no-anchor"),
     };
-    let code = ui::run(&options);
+    let code = ui::run(&options, store, settings);
     drop(instance);
     std::process::exit(code);
 }

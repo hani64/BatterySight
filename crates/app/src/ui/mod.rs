@@ -7,8 +7,10 @@
 //! and, in tray mode, the tray icons. It only paints, positions and handles menu and mouse
 //! input; its calls to Explorer are the ones `widget` and `tray` list. The device runtime's
 //! `on_change` runs on the device thread and only posts [`WM_APP_CHANGED`] here; the menu
-//! reads the snapshot and sends no device traffic. UI Automation runs on its own windowless
-//! thread (`widget`), and the [`watchdog`] on another.
+//! reads the snapshot, the in-memory settings and the monitor list, and sends no device
+//! traffic. Settings are loaded before the UI starts; changes are saved, and the Run value
+//! written, by the store's writer thread ([`Store`]). UI Automation runs on its own
+//! windowless thread (`widget`), and the [`watchdog`] on another.
 //!
 //! # Re-entrancy
 //!
@@ -25,9 +27,10 @@
 //! - Only `WM_APP_*` handlers borrow the state. One that arrives while the state is borrowed
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
-//!   tracked with the state released.
+//!   tracked with the state released; the chosen command borrows it again afterwards.
 
 pub mod fallback;
+mod menu;
 pub mod render;
 mod tray;
 pub mod watchdog;
@@ -35,33 +38,35 @@ mod widget;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::PoisonError;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
-use batterysight_core::model::{Charge, CoarseLevel, DeviceKind, DeviceState, Level, Presence};
+use batterysight_core::model::{
+    Charge, CoarseLevel, DeviceKey, DeviceKind, DeviceState, Level, Presence,
+};
+use batterysight_core::settings::{DisplayMode, Settings, Threshold};
 use batterysight_win::runtime::{self, RuntimeHandle};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use batterysight_win::store::Store;
+use batterysight_win::trace::ui_line;
+use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MF_DISABLED,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetForegroundWindow, SetTimer, TPM_BOTTOMALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_NULL, WM_SETTINGCHANGE, WM_TIMER,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, IDC_ARROW,
+    KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use fallback::{TrayReason, should_retry_widget};
+use menu::{MenuCommand, Model};
 use tray::Tray;
 use widget::Widgets;
-
-/// A device at or below this percentage is shown as low.
-const LOW_PERCENT: u8 = 15;
 
 /// A tray icon chosen with the keyboard (not defined by the `windows` crate).
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
@@ -69,6 +74,7 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 /// What the UI shows for one device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceView {
+    pub key: DeviceKey,
     pub glyph: char,
     pub text: String,
     pub dimmed: bool,
@@ -77,16 +83,18 @@ pub struct DeviceView {
     pub tooltip: String,
 }
 
-/// The devices to show, in snapshot order; offline devices are left out.
-pub fn views(states: &[DeviceState]) -> Vec<DeviceView> {
-    states
-        .iter()
-        .filter(|s| s.presence != Presence::Offline)
-        .map(view)
+/// The devices to show: in the user's order, hidden and offline devices left out.
+pub fn views(states: &[DeviceState], settings: &Settings) -> Vec<DeviceView> {
+    settings
+        .ordered(states)
+        .into_iter()
+        .filter(|s| s.presence != Presence::Offline && !settings.hidden.contains(&s.key))
+        .map(|s| view(s, settings.threshold(&s.key)))
         .collect()
 }
 
-fn view(s: &DeviceState) -> DeviceView {
+/// One device; `threshold`: its low-battery threshold, which also colours it as low.
+fn view(s: &DeviceState, threshold: Threshold) -> DeviceView {
     // Segoe Fluent Icons code points (the same in Segoe MDL2 Assets).
     let glyph = match s.kind {
         DeviceKind::Mouse => '\u{E962}',
@@ -111,12 +119,17 @@ fn view(s: &DeviceState) -> DeviceView {
     if charging {
         tooltip.push_str(" charging");
     }
+    let low = match (s.level, threshold) {
+        (Some(Level::Percent(p)), Threshold::Percent(t)) => p <= t,
+        _ => false,
+    };
     DeviceView {
+        key: s.key.clone(),
         glyph,
         text,
         dimmed: s.presence != Presence::Online,
         charging,
-        low: matches!(s.level, Some(Level::Percent(p)) if p <= LOW_PERCENT),
+        low,
         tooltip,
     }
 }
@@ -134,8 +147,9 @@ const WM_APP_CLOCKS: u32 = WM_APP + 3;
 const WM_APP_TASKBAR_CREATED: u32 = WM_APP + 4;
 /// Displays or settings changed (`WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`).
 const WM_APP_ENVIRONMENT: u32 = WM_APP + 5;
-/// "Refresh now" was chosen.
-const WM_APP_REFRESH: u32 = WM_APP + 6;
+/// Writing the Run value failed (posted by the store's writer thread); `wparam`: the state
+/// it was to get (1 on, 0 off).
+const WM_APP_AUTOSTART_FAILED: u32 = WM_APP + 6;
 /// Fall back to tray icons if no widget is shown, or in tray mode try the widget again
 /// (posted by [`WIDGET_CHECK_TIMER`]).
 const WM_APP_CHECK_WIDGET: u32 = WM_APP + 7;
@@ -158,8 +172,6 @@ const WIDGET_CHECK_MS: u32 = 5_000;
 /// One-shot: in tray mode after a failure that may pass, the next self-retry of the widget
 /// ([`fallback::next_self_retry`]).
 const SELF_RETRY_TIMER: usize = 3;
-const MENU_REFRESH: usize = 1;
-const MENU_EXIT: usize = 2;
 
 /// Sleep of the widget thread after the first click with `--debug-stall-widget`.
 const DEBUG_STALL: Duration = Duration::from_secs(10);
@@ -172,6 +184,9 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static DEBUG_STALL_ARMED: AtomicBool = AtomicBool::new(false);
 /// Whether the next widget check reports no anchor (`--debug-force-no-anchor`).
 static DEBUG_NO_ANCHOR_ARMED: AtomicBool = AtomicBool::new(false);
+/// The writer of the settings (and the Run value). Not in [`Ui`]: the watchdog stops it
+/// too, from its own thread, before it ends the process ([`stop_store`]).
+static STORE: Mutex<Option<Store>> = Mutex::new(None);
 
 thread_local! {
     /// The UI state; lives on the UI thread only. See the module doc for how it is borrowed.
@@ -189,11 +204,14 @@ pub struct Options {
     pub debug_no_anchor: bool,
 }
 
-/// Runs the UI on this thread until "Exit". Returns the process exit code.
-pub fn run(options: &Options) -> i32 {
+/// Runs the UI on this thread until "Exit". Returns the process exit code. `store` has
+/// loaded `settings`; it is stopped before this returns.
+pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
+    *STORE.lock().unwrap_or_else(PoisonError::into_inner) = Some(store);
     DEBUG_STALL_ARMED.store(options.debug_stall, Ordering::Relaxed);
     DEBUG_NO_ANCHOR_ARMED.store(options.debug_no_anchor, Ordering::Relaxed);
     let Some(host) = create_host() else {
+        stop_store();
         return 1;
     };
     // The runtime starts before any widget exists: its start blocks this thread, which must
@@ -203,14 +221,17 @@ pub fn run(options: &Options) -> i32 {
         Err(_) => {
             // SAFETY: our own window.
             let _ = unsafe { DestroyWindow(host) };
+            stop_store();
             return 1;
         }
     };
     let light = light_theme();
-    let views = views(&read_snapshot(&runtime));
+    let views = views(&read_snapshot(&runtime), &settings);
     let widgets = match options.tray {
         Some(reason) => Err(reason),
-        None => Widgets::new(&views, light).map_err(|_| TrayReason::CreateFailed),
+        None => {
+            Widgets::new(&views, light, &settings.monitors).map_err(|_| TrayReason::CreateFailed)
+        }
     };
     let (surface, tray_reason) = match widgets {
         Ok(widgets) => {
@@ -227,6 +248,8 @@ pub fn run(options: &Options) -> i32 {
     let mut ui = Ui {
         host,
         runtime,
+        settings,
+        exe: std::env::current_exe().ok(),
         views,
         light,
         surface,
@@ -252,6 +275,8 @@ pub fn run(options: &Options) -> i32 {
         let _ = KillTimer(Some(host), SELF_RETRY_TIMER);
         let _ = DestroyWindow(host);
     }
+    // Already done by "Exit"; this covers a message loop that ended otherwise.
+    stop_store();
     0
 }
 
@@ -264,6 +289,11 @@ enum Surface {
 struct Ui {
     host: HWND,
     runtime: RuntimeHandle,
+    /// The user's options, as last changed; saved through [`STORE`] on every change.
+    /// `autostart` tracks the Run value, read once at startup.
+    settings: Settings,
+    /// This executable, for the Run value; `None` if Windows did not say.
+    exe: Option<PathBuf>,
     /// What is shown, from the last snapshot read.
     views: Vec<DeviceView>,
     /// Whether the taskbar uses the light theme.
@@ -284,18 +314,9 @@ struct SelfRetry {
 }
 
 impl Ui {
-    fn handle(&mut self, msg: u32) {
+    fn handle(&mut self, msg: u32, wp: WPARAM) {
         match msg {
-            WM_APP_CHANGED => {
-                let views = views(&read_snapshot(&self.runtime));
-                if views != self.views {
-                    self.views = views;
-                    if let Surface::Widgets(w) = &mut self.surface {
-                        w.invalidate();
-                    }
-                    self.show();
-                }
-            }
+            WM_APP_CHANGED => self.update_views(),
             WM_APP_LAYOUT => self.show(),
             WM_APP_CLOCKS => {
                 if let Surface::Widgets(w) = &mut self.surface {
@@ -336,7 +357,14 @@ impl Ui {
                     self.fall_back_to_tray(TrayReason::CreateFailed);
                 }
             }
-            WM_APP_REFRESH => self.runtime.refresh_now(),
+            WM_APP_AUTOSTART_FAILED => {
+                // The Run value kept its old state: so does the checkmark.
+                let wanted = wp.0 != 0;
+                if self.settings.autostart == wanted {
+                    self.settings.autostart = !wanted;
+                    self.save();
+                }
+            }
             WM_APP_CHECK_WIDGET => {
                 if let Surface::Widgets(w) = &self.surface {
                     if take_debug_no_anchor() || w.missing() {
@@ -361,10 +389,22 @@ impl Ui {
         }
     }
 
+    /// Reads the snapshot again and shows the views if they changed.
+    fn update_views(&mut self) {
+        let views = views(&read_snapshot(&self.runtime), &self.settings);
+        if views != self.views {
+            self.views = views;
+            if let Surface::Widgets(w) = &mut self.surface {
+                w.invalidate();
+            }
+            self.show();
+        }
+    }
+
     /// Shows the current views and lays the widgets out.
     fn show(&mut self) {
         let result = match &mut self.surface {
-            Surface::Widgets(w) => w.layout(&self.views, self.light),
+            Surface::Widgets(w) => w.layout(&self.views, self.light, &self.settings.monitors),
             Surface::Tray(t) => {
                 t.show(&self.views, self.light);
                 Ok(())
@@ -427,7 +467,7 @@ impl Ui {
         // without it, the widgets built (secondary windows, a UI Automation walk) would be
         // thrown away. Dropping widgets that do not show destroys their windows and hooks.
         let widgets = if widget::primary_anchor_ready() {
-            Widgets::new(&self.views, self.light)
+            Widgets::new(&self.views, self.light, &self.settings.monitors)
                 .ok()
                 .filter(Widgets::shown)
         } else {
@@ -448,22 +488,179 @@ impl Ui {
         true
     }
 
-    /// Removes the widgets or tray icons, then stops the runtime (bounded by its 2 s limit)
-    /// and ends the message loop.
+    /// "Show as: Taskbar widget": widgets again, whatever made the session use tray icons
+    /// (the user's choice beats the automatic fallback). If Windows refuses them, tray
+    /// icons stay as after any refusal.
+    fn choose_widget(&mut self) {
+        if matches!(self.surface, Surface::Widgets(_)) {
+            return;
+        }
+        // SAFETY: our own window and timer (killing one that is not set fails harmlessly).
+        let _ = unsafe { KillTimer(Some(self.host), SELF_RETRY_TIMER) };
+        self.self_retry = None;
+        match Widgets::new(&self.views, self.light, &self.settings.monitors) {
+            Ok(widgets) => {
+                start_widget_checks(self.host);
+                self.tray_reason = None;
+                // Dropping the tray removes its icons.
+                self.surface = Surface::Widgets(widgets);
+            }
+            Err(_) => {
+                self.tray_reason = Some(TrayReason::CreateFailed);
+                fallback::trace(TrayReason::CreateFailed);
+                self.schedule_self_retry();
+            }
+        }
+    }
+
+    /// "Show as: Tray icons": tray icons that nothing turns back into the widget
+    /// ([`should_retry_widget`]) until the user chooses it again.
+    fn choose_tray(&mut self) {
+        match self.surface {
+            Surface::Widgets(_) => self.fall_back_to_tray(TrayReason::UserChoice),
+            Surface::Tray(_) => {
+                self.tray_reason = Some(TrayReason::UserChoice);
+                self.self_retry = None;
+                // SAFETY: our own window and timers (killing one that is not set fails
+                // harmlessly).
+                unsafe {
+                    let _ = KillTimer(Some(self.host), SELF_RETRY_TIMER);
+                    let _ = KillTimer(Some(self.host), WIDGET_CHECK_TIMER);
+                }
+            }
+        }
+    }
+
+    /// Carries out a command chosen in the menu; a changed setting is shown at once and
+    /// saved off this thread.
+    fn apply(&mut self, command: MenuCommand) {
+        match command {
+            MenuCommand::ToggleShown(key) => {
+                let hide = !self.settings.hidden.contains(&key);
+                self.settings.set_hidden(&key, hide);
+                self.update_views();
+            }
+            MenuCommand::MoveLeft(key) => {
+                let shown = self.shown_keys();
+                self.settings.move_left(&key, &shown);
+                self.update_views();
+            }
+            MenuCommand::MoveRight(key) => {
+                let shown = self.shown_keys();
+                self.settings.move_right(&key, &shown);
+                self.update_views();
+            }
+            MenuCommand::Threshold(key, threshold) => {
+                self.settings.set_threshold(&key, threshold);
+                self.update_views();
+            }
+            // Disabled in the menu: there is no history window yet.
+            MenuCommand::History => return,
+            MenuCommand::ShowOn(choice) => {
+                self.settings.monitors = choice;
+                if matches!(self.surface, Surface::Widgets(_)) {
+                    self.show();
+                    if matches!(self.surface, Surface::Widgets(_)) {
+                        check_widget_later(self.host);
+                    }
+                } else {
+                    // A settings change, like a display change, tries a widget that
+                    // failed again.
+                    self.retry_widget(true);
+                }
+            }
+            MenuCommand::ShowAs(display) => {
+                self.settings.display = display;
+                match display {
+                    DisplayMode::Widget => self.choose_widget(),
+                    DisplayMode::Tray => self.choose_tray(),
+                }
+            }
+            MenuCommand::Autostart(on) => {
+                let Some(exe) = self.exe.clone() else { return };
+                self.settings.autostart = on;
+                with_store(|store| store.run(Box::new(move || write_autostart(&exe, on))));
+            }
+            MenuCommand::Refresh => {
+                self.runtime.refresh_now();
+                return;
+            }
+            MenuCommand::Exit => {
+                post(WM_APP_EXIT);
+                return;
+            }
+        }
+        self.save();
+    }
+
+    /// The keys of the devices shown, in shown order.
+    fn shown_keys(&self) -> Vec<DeviceKey> {
+        self.views.iter().map(|v| v.key.clone()).collect()
+    }
+
+    /// Queues writing the settings on the store's writer thread.
+    fn save(&self) {
+        let settings = self.settings.clone();
+        with_store(|store| store.save_settings(settings));
+    }
+
+    /// Removes the widgets or tray icons, finishes the queued writes (at most 1 s), then
+    /// stops the runtime (bounded by its 2 s limit) and ends the message loop.
     fn exit(self) {
         watchdog::arm(false);
         drop(self.surface);
+        stop_store();
         self.runtime.stop();
         // SAFETY: no pointers involved.
         unsafe { PostQuitMessage(0) };
     }
 
-    /// One line per device for the menu, from the snapshot: no device traffic.
-    fn menu_lines(&self) -> Vec<String> {
-        views(&read_snapshot(&self.runtime))
-            .into_iter()
-            .map(|v| v.tooltip)
-            .collect()
+    /// The menu, from the snapshot, the in-memory settings and the monitor list: no device
+    /// traffic, no disk.
+    fn menu_model(&self) -> Model {
+        Model::new(
+            &read_snapshot(&self.runtime),
+            &self.settings,
+            &widget::monitors(),
+            self.tray_reason,
+        )
+    }
+}
+
+/// Writes the Run value (on the store's writer thread). A failure is traced and reported
+/// to the UI thread, so the menu's checkmark keeps following the Run value.
+fn write_autostart(exe: &Path, on: bool) {
+    if let Err(e) = crate::autostart::set(exe, on) {
+        ui_line(&format!("autostart not changed: {e}"));
+        post_with(WM_APP_AUTOSTART_FAILED, usize::from(on));
+    }
+}
+
+/// Runs `f` on the store, unless it is stopped. Never waits for the lock: only the
+/// watchdog, stopping the store before it ends the process, holds it for long.
+fn with_store(f: impl FnOnce(&Store)) {
+    let guard = match STORE.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    if let Some(store) = guard.as_ref() {
+        f(store);
+    }
+}
+
+/// Finishes the queued writes (waiting at most 1 s) and stops the store's writer; later
+/// saves are dropped. Called on every way out: "Exit", the end of the session, a failed
+/// start, and by the watchdog before it ends the process. Never waits for the lock: whoever
+/// holds it is already stopping the store, or only sending to it.
+pub fn stop_store() {
+    let store = match STORE.try_lock() {
+        Ok(mut guard) => guard.take(),
+        Err(TryLockError::Poisoned(e)) => e.into_inner().take(),
+        Err(TryLockError::WouldBlock) => None,
+    };
+    if let Some(store) = store {
+        store.stop();
     }
 }
 
@@ -487,10 +684,15 @@ fn ui_busy() -> bool {
 
 /// Posts `msg` to the host window, from any thread.
 fn post(msg: u32) {
+    post_with(msg, 0);
+}
+
+/// Posts `msg` with `wparam` to the host window, from any thread.
+fn post_with(msg: u32, wparam: usize) {
     let host = HWND(HOST.load(Ordering::Relaxed) as *mut c_void);
     if !host.is_invalid() {
         // SAFETY: no pointers involved; a stale handle only makes the post fail.
-        let _ = unsafe { PostMessageW(Some(host), msg, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(Some(host), msg, WPARAM(wparam), LPARAM(0)) };
     }
 }
 
@@ -619,7 +821,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if msg == WM_APP_LAYOUT {
                 LAYOUT_PENDING.set(false);
             }
-            with_ui(|ui| ui.handle(msg));
+            with_ui(|ui| ui.handle(msg, wp));
         }
         // SAFETY: forwarding this window's own message.
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -638,55 +840,18 @@ fn exit() {
     }
 }
 
-/// Shows the menu at the cursor: one read-only line per device, "Refresh now" and "Exit".
+/// Shows the menu at the cursor and carries out the command chosen.
 fn menu(host: HWND) {
     if ui_busy() {
         post(WM_APP_MENU);
         return;
     }
-    let Some(lines) = with_ui(|ui| ui.menu_lines()) else {
+    let Some(model) = with_ui(|ui| ui.menu_model()) else {
         return;
     };
-    // SAFETY: the menu and the strings outlive their use; the state is not borrowed while
-    // the menu's modal loop runs.
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        if lines.is_empty() {
-            let _ = AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, w!("No devices found"));
-        }
-        for line in &lines {
-            // A single `&` would mark a mnemonic.
-            let text: Vec<u16> = line
-                .replace('&', "&&")
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            let _ = AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, PCWSTR(text.as_ptr()));
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, MENU_REFRESH, w!("Refresh now"));
-        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
-        let mut at = POINT::default();
-        let _ = GetCursorPos(&mut at);
-        // The menu closes on a click elsewhere only if its owner is in the foreground.
-        let _ = SetForegroundWindow(host);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
-            at.x,
-            at.y,
-            None,
-            host,
-            None,
-        )
-        .0 as usize;
-        let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        match chosen {
-            MENU_REFRESH => post(WM_APP_REFRESH),
-            MENU_EXIT => post(WM_APP_EXIT),
-            _ => {}
-        }
+    // The state is not borrowed while the menu's modal loop runs.
+    if let Some(command) = menu::track(&model, host) {
+        with_ui(|ui| ui.apply(command));
     }
 }
 
@@ -712,9 +877,12 @@ fn light_theme() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use batterysight_core::model::{
-        Charge, CoarseLevel, DeviceKey, DeviceKind, Level, Presence, Source, Verification, Via,
-    };
+    use batterysight_core::model::{Source, Verification, Via};
+    use batterysight_core::settings::Threshold;
+
+    fn all(states: &[DeviceState]) -> Vec<DeviceView> {
+        views(states, &Settings::default())
+    }
 
     fn state(name: &str, kind: DeviceKind, level: Option<Level>) -> DeviceState {
         DeviceState {
@@ -736,22 +904,55 @@ mod tests {
         state(name, DeviceKind::Mouse, Some(Level::Percent(p)))
     }
 
+    fn texts(v: &[DeviceView]) -> Vec<&str> {
+        v.iter().map(|v| v.text.as_str()).collect()
+    }
+
+    #[test]
+    fn views_follow_order_and_hide() {
+        let states = [percent("A", 10), percent("B", 20), percent("C", 30)];
+        let mut settings = Settings {
+            order: vec![DeviceKey("C".into()), DeviceKey("A".into())],
+            ..Settings::default()
+        };
+        // User order first; devices it does not list follow in snapshot order.
+        assert_eq!(texts(&views(&states, &settings)), ["30%", "10%", "20%"]);
+        settings.set_hidden(&DeviceKey("A".into()), true);
+        let v = views(&states, &settings);
+        assert_eq!(texts(&v), ["30%", "20%"]);
+        assert_eq!(v[0].key, DeviceKey("C".into()));
+    }
+
+    #[test]
+    fn low_uses_device_threshold() {
+        let mut settings = Settings::default();
+        settings.set_threshold(&DeviceKey("A".into()), Threshold::Percent(30));
+        settings.set_threshold(&DeviceKey("B".into()), Threshold::Off);
+        let v = views(&[percent("A", 25), percent("B", 5)], &settings);
+        assert!(v[0].low, "25 % at a 30 % threshold");
+        assert!(!v[1].low, "Off is never low");
+        // A device without a threshold keeps the 15 % default.
+        let v = views(&[percent("A", 25), percent("C", 15)], &Settings::default());
+        assert!(!v[0].low);
+        assert!(v[1].low);
+    }
+
     #[test]
     fn asleep_is_dimmed_and_keeps_text() {
         let s = DeviceState {
             presence: Presence::Asleep,
             ..percent("M", 40)
         };
-        let v = views(&[s]);
+        let v = all(&[s]);
         assert_eq!(v.len(), 1);
         assert!(v[0].dimmed);
         assert_eq!(v[0].text, "40%");
-        assert!(!views(&[percent("M", 40)])[0].dimmed);
+        assert!(!all(&[percent("M", 40)])[0].dimmed);
     }
 
     #[test]
     fn low_threshold_is_15() {
-        let v = views(&[percent("A", 15), percent("B", 16), percent("C", 0)]);
+        let v = all(&[percent("A", 15), percent("B", 16), percent("C", 0)]);
         assert_eq!(
             v.iter().map(|v| v.low).collect::<Vec<_>>(),
             [true, false, true]
@@ -764,7 +965,7 @@ mod tests {
             presence: Presence::Offline,
             ..percent("Off", 50)
         };
-        let v = views(&[off, percent("On", 60)]);
+        let v = all(&[off, percent("On", 60)]);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].text, "60%");
     }
@@ -781,7 +982,7 @@ mod tests {
             Verification::CommunityTested,
             Verification::Generic,
         ] {
-            assert_eq!(views(&[with(status)])[0].tooltip, "PRO X — 40%");
+            assert_eq!(all(&[with(status)])[0].tooltip, "PRO X — 40%");
         }
     }
 
@@ -791,15 +992,15 @@ mod tests {
             charge: Charge::Charging,
             ..percent("M", 70)
         };
-        let v = &views(&[s])[0];
+        let v = &all(&[s])[0];
         assert!(v.charging);
         assert_eq!(v.tooltip, "M — 70% charging");
-        assert!(!views(&[percent("M", 70)])[0].charging);
+        assert!(!all(&[percent("M", 70)])[0].charging);
     }
 
     #[test]
     fn coarse_level_is_a_word_and_unknown_is_a_question_mark() {
-        let v = views(&[
+        let v = all(&[
             state(
                 "K",
                 DeviceKind::Keyboard,
@@ -823,7 +1024,7 @@ mod tests {
             DeviceKind::Other,
         ]
         .into_iter()
-        .map(|kind| views(&[state("D", kind, None)])[0].glyph)
+        .map(|kind| all(&[state("D", kind, None)])[0].glyph)
         .collect();
         assert_eq!(
             glyphs,

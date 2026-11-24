@@ -218,6 +218,11 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
 
+    use batterysight_core::model::{
+        Charge, DeviceKey, DeviceKind, DeviceState, Level, Presence, Source, Verification, Via,
+    };
+    use batterysight_core::settings::Settings;
+
     /// Records calls; icons are numbered handles; `fail` lists views that cannot be drawn.
     #[derive(Default)]
     struct FakeShell {
@@ -249,6 +254,7 @@ mod tests {
 
     fn view(text: &str) -> DeviceView {
         DeviceView {
+            key: DeviceKey("M".into()),
             glyph: '\u{E962}',
             text: text.into(),
             dimmed: false,
@@ -256,6 +262,34 @@ mod tests {
             low: false,
             tooltip: format!("M — {text}"),
         }
+    }
+
+    #[test]
+    fn all_hidden_shows_placeholder() {
+        let state = |key: &str| DeviceState {
+            key: DeviceKey(key.into()),
+            name: key.into(),
+            kind: DeviceKind::Mouse,
+            via: Via::Receiver,
+            level: Some(Level::Percent(50)),
+            millivolts: None,
+            charge: Charge::Discharging,
+            presence: Presence::Online,
+            updated_ms: 0,
+            source: Source::Query,
+            verification: Verification::HardwareTested,
+        };
+        let states = [state("A"), state("B")];
+        let mut settings = Settings::default();
+        settings.set_hidden(&DeviceKey("A".into()), true);
+        settings.set_hidden(&DeviceKey("B".into()), true);
+        let views = super::super::views(&states, &settings);
+        // The widget draws its own placeholder for no views (`render::widget_strip`).
+        assert!(views.is_empty());
+        let mut shell = FakeShell::default();
+        let mut icons = Vec::new();
+        sync(&mut icons, &mut shell, &views, false);
+        assert_eq!(shell.calls, [(Action::Add, 1, Some(NO_DEVICES.into()))]);
     }
 
     #[test]
