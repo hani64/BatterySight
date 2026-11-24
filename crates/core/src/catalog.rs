@@ -35,7 +35,11 @@ pub struct Family {
 pub struct DeviceEntry {
     pub name: String,
     pub vid: u16,
+    /// USB product ids: the device itself, or the dongle that is the device (a headset's).
     pub pids: Vec<u16>,
+    /// Wireless product ids of a device behind a receiver, as the receiver reports them; a
+    /// receiver's USB PID says nothing about the devices paired to it.
+    pub wpids: Vec<u16>,
     pub kind: DeviceKind,
     pub engine: EngineKind,
     pub status: Verification,
@@ -94,7 +98,10 @@ struct RawFamily {
 struct RawDevice {
     name: String,
     vid: u16,
+    #[serde(default)]
     pids: Vec<u16>,
+    #[serde(default)]
+    wpids: Vec<u16>,
     kind: DeviceKind,
     engine: EngineKind,
     status: String,
@@ -153,6 +160,7 @@ impl Catalog {
                     name: d.name,
                     vid: d.vid,
                     pids: d.pids,
+                    wpids: d.wpids,
                     kind: d.kind,
                     engine: d.engine,
                     status,
@@ -188,11 +196,18 @@ impl Catalog {
         &self.devices
     }
 
-    /// The first entry listing `pid` for vendor `vid`.
+    /// The first entry listing USB product id `pid` for vendor `vid`.
     pub fn device(&self, vid: u16, pid: u16) -> Option<&DeviceEntry> {
         self.devices
             .iter()
             .find(|d| d.vid == vid && d.pids.contains(&pid))
+    }
+
+    /// The first entry listing wireless product id `wpid` for vendor `vid`.
+    pub fn device_by_wpid(&self, vid: u16, wpid: u16) -> Option<&DeviceEntry> {
+        self.devices
+            .iter()
+            .find(|d| d.vid == vid && d.wpids.contains(&wpid))
     }
 
     pub fn family(&self, vid: u16, engine: EngineKind) -> Option<&Family> {
@@ -349,6 +364,33 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let cat = Catalog::parse("").unwrap();
         assert_eq!(cat.device(0x046D, 0x0ABA), None);
         assert_eq!(cat.family(0x046D, EngineKind::Hidpp), None);
+    }
+
+    #[test]
+    fn wireless_pids_match_receiver_devices_only_by_wpid() {
+        let toml = format!(
+            "{SAMPLE}\n{}",
+            r#"
+[[device]]
+name = "PRO X Superlight"
+vid = 0x046D
+wpids = [0x4093]
+kind = "mouse"
+engine = "hidpp"
+status = "hardware-tested"
+source = "test"
+"#
+        );
+        let cat = Catalog::parse(&toml).unwrap();
+        let dev = cat.device_by_wpid(0x046D, 0x4093).unwrap();
+        assert_eq!(dev.name, "PRO X Superlight");
+        assert_eq!(dev.kind, DeviceKind::Mouse);
+        assert!(dev.pids.is_empty());
+        assert_eq!(dev.wpids, vec![0x4093]);
+        // USB and wireless PIDs are separate name spaces.
+        assert_eq!(cat.device(0x046D, 0x4093), None);
+        assert_eq!(cat.device_by_wpid(0x046D, 0x0ABA), None);
+        assert_eq!(cat.device_by_wpid(0x1532, 0x4093), None);
     }
 
     #[test]

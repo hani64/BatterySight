@@ -142,6 +142,8 @@ pub struct HidppEngine {
     /// Slots whose one late-reply rediscovery is used up; re-armed by a 0x41 for
     /// the slot, by `forget` or by a successful discovery.
     late_used: BTreeSet<u8>,
+    /// Wireless product id per receiver slot, from the slot's last 0x41.
+    wpids: BTreeMap<u8, u16>,
     budgets: HashMap<GrantId, Budget>,
 }
 
@@ -231,6 +233,7 @@ impl HidppEngine {
             in_flight: BTreeMap::new(),
             pending: BTreeSet::new(),
             late_used: BTreeSet::new(),
+            wpids: BTreeMap::new(),
             budgets: HashMap::new(),
         }
     }
@@ -439,6 +442,7 @@ impl HidppEngine {
                 min_query_gap_ms: 0,
             },
             initial,
+            wpid: self.wpids.get(&index).copied(),
         });
     }
 
@@ -475,6 +479,7 @@ impl HidppEngine {
     fn forget(&mut self, index: u8, actions: &mut Vec<Action>) {
         self.in_flight.remove(&index);
         self.late_used.remove(&index);
+        self.wpids.remove(&index);
         if let Some(d) = self.devices.remove(&index) {
             actions.push(Action::Unregister(d.key));
         }
@@ -551,6 +556,15 @@ impl HidppEngine {
             return;
         };
         let lost = flags & LINK_LOST != 0;
+        // Bytes 5..7: the slot's wireless product id, little-endian; zero means not reported.
+        // Source: Linux hid-logitech-dj.c (HIDPP_PARAM_EQUAD_LSB/MSB of the 0x41 notification);
+        // owner capture 2026-11-23: `93 40` from a mouse whose 0x0003 model id is 4093.
+        if let Some(&[lo, hi]) = frame.get(5..7)
+            && RECEIVER_SLOTS.contains(&index)
+            && u16::from_le_bytes([lo, hi]) != 0
+        {
+            self.wpids.insert(index, u16::from_le_bytes([lo, hi]));
+        }
         // The receiver vouches for the slot again: a late reply may rediscover it once more.
         self.late_used.remove(&index);
         if let Some(d) = self.devices.get(&index) {
@@ -1108,10 +1122,32 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                     presence: Some(Presence::Online),
                     ..update(mouse_key(), Source::Query)
                 },
+                wpid: None,
             }]
         );
         // Pings 2..=6 went out at t = 1 and are still unanswered (device timeout 4 s).
         assert_eq!(e.next_deadline(), Some(4_001));
+    }
+
+    #[test]
+    fn receiver_slot_registers_with_wireless_pid_from_link_notification() {
+        let mut e = receiver_notified();
+        let gk = e.group_key();
+        // Owner capture 2026-11-23: link up on slot 1, wireless PID 0x4093 little-endian in
+        // bytes 5..7 (the device's own 0x0003 model id says 4093 too).
+        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x41, 0x11, 0xA2, 0x93, 0x40]), 3);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+        let a = e.on_grant(&grant(2, &gk, Trigger::Connected), 4);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
+        run(&mut e, &mouse_script(), 5);
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 6);
+
+        let [Action::Register { key, wpid, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(*key, mouse_key());
+        assert_eq!(*wpid, Some(0x4093));
     }
 
     #[test]
@@ -1184,6 +1220,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                     presence: Some(Presence::Online),
                     ..update(headset_key(), Source::Query)
                 },
+                wpid: None,
             }]
         );
     }
@@ -1295,6 +1332,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                     presence: Some(Presence::Online),
                     ..update(key, Source::Query)
                 },
+                wpid: None,
             }]
         );
 
@@ -1424,6 +1462,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                     presence: Some(Presence::Asleep),
                     ..update(key.clone(), Source::Query)
                 },
+                wpid: None,
             }]
         );
         assert_eq!(e.next_deadline(), None);

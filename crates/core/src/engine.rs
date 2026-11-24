@@ -19,11 +19,14 @@ pub enum Action {
         collection: CollectionId,
         bytes: Vec<u8>,
     },
-    /// Start tracking a device discovered behind this engine's group.
+    /// Start tracking a device discovered behind this engine's group. `wpid` is the
+    /// wireless product id of a device behind a receiver, when the receiver reported one;
+    /// the hub then looks the device up by it instead of by the group's USB product id.
     Register {
         key: DeviceKey,
         caps: Capabilities,
         initial: DeviceUpdate,
+        wpid: Option<u16>,
     },
     /// This group no longer serves the device (e.g. unpaired); with no other
     /// group serving it, its entry goes offline.
