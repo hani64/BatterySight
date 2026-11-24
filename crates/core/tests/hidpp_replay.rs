@@ -1,9 +1,11 @@
 //! Replays HID++ fixture transcripts through a real [`Hub`] with the built-in
 //! engines and checks every write against the transcript.
 //!
-//! Fixture lines are `out <short|long> <hex>` (a frame we write) or
-//! `in <short|long> <hex>` (a frame we read), `#` starts a comment. The `out`
-//! lines between two `in` lines are exactly the writes the first one causes.
+//! Fixture lines are `out <short|long> <hex>` (a frame we write),
+//! `in <short|long> <hex>` (a frame we read) or `@t+<ms>` (time passes, then the
+//! hub gets a `Tick`); `#` starts a comment. Each `in` advances the clock by
+//! 1 ms. The `out` lines between two inputs are exactly the writes the first
+//! one causes.
 
 use batterysight_core::catalog::Catalog;
 use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup};
@@ -32,32 +34,30 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 const SHORT: CollectionId = CollectionId(1);
 const LONG: CollectionId = CollectionId(2);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Dir {
-    In,
-    Out,
+/// One transcript line.
+enum Entry {
+    In(CollectionId, Vec<u8>),
+    Out(CollectionId, Vec<u8>),
+    /// Milliseconds that pass before the next `Tick`.
+    Wait(u64),
 }
 
-struct Frame {
-    line: usize,
-    dir: Dir,
-    collection: CollectionId,
-    bytes: Vec<u8>,
-}
-
-fn parse(name: &str, text: &str) -> Vec<Frame> {
-    let mut frames = Vec::new();
+fn parse(name: &str, text: &str) -> Vec<(usize, Entry)> {
+    let mut entries = Vec::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or_default().trim();
         if line.is_empty() {
             continue;
         }
+        if let Some(ms) = line.strip_prefix("@t+") {
+            let ms = ms
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}:{}: bad wait {ms:?}", n + 1));
+            entries.push((n + 1, Entry::Wait(ms)));
+            continue;
+        }
         let mut words = line.split_whitespace();
-        let dir = match words.next() {
-            Some("in") => Dir::In,
-            Some("out") => Dir::Out,
-            other => panic!("{name}:{}: bad direction {other:?}", n + 1),
-        };
+        let dir = words.next();
         let (collection, len) = match words.next() {
             Some("short") => (SHORT, 7),
             Some("long") => (LONG, 20),
@@ -68,14 +68,14 @@ fn parse(name: &str, text: &str) -> Vec<Frame> {
             .collect();
         assert!(bytes.len() <= len, "{name}:{}: frame too long", n + 1);
         bytes.resize(len, 0);
-        frames.push(Frame {
-            line: n + 1,
-            dir,
-            collection,
-            bytes,
-        });
+        let entry = match dir {
+            Some("in") => Entry::In(collection, bytes),
+            Some("out") => Entry::Out(collection, bytes),
+            other => panic!("{name}:{}: bad direction {other:?}", n + 1),
+        };
+        entries.push((n + 1, entry));
     }
-    frames
+    entries
 }
 
 fn collection(
@@ -136,32 +136,37 @@ struct Expect {
 
 /// Replays `text` and returns the hub for state checks.
 fn replay(name: &str, text: &str, group: HidGroup) -> Hub {
-    let frames = parse(name, text);
+    let entries = parse(name, text);
+    let receiver = group.collections[0].product.contains("Receiver");
     let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
     let mut now = 0;
-    let mut sent = sends(hub.handle(HubInput::GroupArrived(group), now));
+    let mut sent = sends(hub.handle(HubInput::GroupArrived(group), now), receiver);
     let mut expected = Vec::new();
-    for frame in frames {
-        match frame.dir {
-            Dir::Out => expected.push((frame.collection, frame.bytes)),
-            Dir::In => {
-                assert_eq!(sent, expected, "{name}: writes before line {}", frame.line);
-                now += 1;
-                sent.extend(sends(hub.handle(
-                    HubInput::Report {
-                        collection: frame.collection,
-                        bytes: frame.bytes,
-                    },
-                    now,
-                )));
+    for (line, entry) in entries {
+        let input = match entry {
+            Entry::Out(collection, bytes) => {
+                expected.push((collection, bytes));
+                continue;
             }
-        }
+            Entry::In(collection, bytes) => {
+                now += 1;
+                HubInput::Report { collection, bytes }
+            }
+            Entry::Wait(ms) => {
+                now += ms;
+                HubInput::Tick
+            }
+        };
+        assert_eq!(sent, expected, "{name}: writes before line {line}");
+        sent.extend(sends(hub.handle(input, now), receiver));
     }
     assert_eq!(sent, expected, "{name}: writes at end of transcript");
     hub
 }
 
-fn sends(out: Vec<HubOutput>) -> Vec<(CollectionId, Vec<u8>)> {
+/// The writes in `out`. Requests to a receiver itself time out after 1 s,
+/// requests to a device (receiver slot or direct device) after 4 s.
+fn sends(out: Vec<HubOutput>, receiver: bool) -> Vec<(CollectionId, Vec<u8>)> {
     out.into_iter()
         .filter_map(|o| match o {
             HubOutput::Send {
@@ -169,7 +174,12 @@ fn sends(out: Vec<HubOutput>) -> Vec<(CollectionId, Vec<u8>)> {
                 bytes,
                 timeout_ms,
             } => {
-                assert_eq!(timeout_ms, 1_000);
+                let want = if receiver && bytes[1] == 0xFF {
+                    1_000
+                } else {
+                    4_000
+                };
+                assert_eq!(timeout_ms, want, "{bytes:02X?}");
                 Some((collection, bytes))
             }
             HubOutput::StateChanged => None,
@@ -272,7 +282,8 @@ fn headset_off_at_start() {
         &hub,
         name,
         &Expect {
-            key: "logi:unit:FFFFFFFF",
+            // Unit id FFFFFFFF is a placeholder: pid and index instead.
+            key: "logi:0ABA:255",
             name: "PRO X Wireless Gaming Headset",
             kind: DeviceKind::Headset,
             via: Via::Usb,
@@ -281,4 +292,39 @@ fn headset_off_at_start() {
             charge: Charge::Discharging,
         },
     );
+}
+
+/// The mouse of the c547 fixtures, registered at 80 %.
+fn c547_mouse() -> Expect {
+    Expect {
+        key: "logi:unit:1A2B3C4D",
+        name: "PRO X Superlight",
+        kind: DeviceKind::Mouse,
+        via: Via::Receiver,
+        level: Level::Percent(80),
+        millivolts: None,
+        charge: Charge::Discharging,
+    }
+}
+
+#[test]
+fn c547_slow_ping() {
+    let name = "c547-slow-ping.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/c547-slow-ping.txt"),
+        receiver(),
+    );
+    check(&hub, name, &c547_mouse());
+}
+
+#[test]
+fn c547_late_ping_reply() {
+    let name = "c547-late-ping-reply.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/c547-late-ping-reply.txt"),
+        receiver(),
+    );
+    check(&hub, name, &c547_mouse());
 }

@@ -5,8 +5,8 @@
 # drivers/hid/hid-logitech-hidpp.c (short 0x10 / long 0x11 reports, 0x8F
 # HID++ 1.0 error) and Solaar lib/logitech_receiver (base.py ping,
 # hidpp10_constants.py NotificationFlag.WIRELESS, hidpp20.py feature calls,
-# notifications.py 0x41 link notification). Replace with a real capture in
-# Task 14.
+# notifications.py 0x41 link notification, receiver.py notify_devices).
+# Replace with a real capture in Task 14.
 #
 # Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
 # reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The
@@ -18,20 +18,16 @@ in  short 10 FF 81 00 00 00 00
 # Wireless notifications off: set only bit 0x01 of the middle byte.
 out short 10 FF 80 00 00 01 00
 in  short 10 FF 80 00 00 00 00
-# Ping every device index (HID++ 2.0 root fn 1, mark 0x5A).
+# Ask the receiver to report every paired slot: register 0x02 = 0x02 (Solaar
+# receiver.py notify_devices). It answers from its pairing table, without
+# radio traffic to the devices.
+out short 10 FF 80 02 02 00 00
+in  short 10 FF 80 02 00 00 00
+# Slot 1: 0x41, link established (byte 4 bit 6 clear; wpid bytes synthetic)
+# -> Connected grant on the receiver -> ping slot 1 only.
+in  short 10 01 41 04 00 93 40
 out short 10 01 00 1B 00 00 5A
-out short 10 02 00 1B 00 00 5A
-out short 10 03 00 1B 00 00 5A
-out short 10 04 00 1B 00 00 5A
-out short 10 05 00 1B 00 00 5A
-out short 10 06 00 1B 00 00 5A
-# Indices 2..6 are empty: HID++ 1.0 error 0x08 (unknown device).
-in  short 10 02 8F 00 1B 08 00
-in  short 10 03 8F 00 1B 08 00
-in  short 10 04 8F 00 1B 08 00
-in  short 10 05 8F 00 1B 08 00
-in  short 10 06 8F 00 1B 08 00
-# Index 1 answers with protocol 4.2: HID++ 2.0.
+# Slot 1 answers with protocol 4.2: HID++ 2.0.
 in  long  11 01 00 1B 04 02 5A
 # Root getFeature 0x0005 (device name and type) -> index 3.
 out short 10 01 00 0B 00 05 00

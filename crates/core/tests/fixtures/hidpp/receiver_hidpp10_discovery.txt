@@ -15,6 +15,11 @@
 out short 10 FF 81 00 00 00 00
 # Wireless notifications already on: no write.
 in  short 10 FF 81 00 00 01 00
+# Ask the receiver to report every paired slot (register 0x02 = 0x02, Solaar
+# receiver.py notify_devices) ...
+out short 10 FF 80 02 02 00 00
+# ... refused (error 0x02, synthetic): fall back to pinging every slot.
+in  short 10 FF 8F 80 02 02 00
 out short 10 01 00 1B 00 00 5A
 out short 10 02 00 1B 00 00 5A
 out short 10 03 00 1B 00 00 5A
