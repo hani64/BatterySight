@@ -1,18 +1,26 @@
-//! The battery history window: a normal top-level window of the UI thread (not a taskbar
-//! child) with the devices in a list, 24 h / 7 d / 30 d buttons, the chart of the device
-//! chosen and its time-left estimate. One at a time: opening it again brings it to the
-//! front; it closes with the app.
+//! The battery history window: a normal top-level window (not a taskbar child) with the
+//! devices in a list, 24 h / 7 d / 30 d buttons, the chart of the device chosen and its
+//! time-left estimate. One at a time: opening it again brings it to the front; it closes
+//! with the app.
 //!
-//! It keeps its own copy of the samples, given by the UI state when it opens and as new
-//! ones are recorded ([`open`], [`update`]), so its procedure (input, paint, DPI changes)
-//! works on that copy only: it never borrows the UI state and never reads the disk. Its
-//! own state is borrowed only for short stretches that call nothing that dispatches
-//! messages; calls that do (creating, showing, destroying, `SetWindowPos`, filling the
-//! list) run with it released.
+//! It runs on its own thread with its own message loop, so nothing it does — painting,
+//! or a modal loop such as holding a caption button, which dispatches no timers — can hold
+//! up the UI thread, whose widgets share Explorer's input queue and beat the watchdog. The
+//! UI thread only sends it data ([`open`], [`update`]): a copy of the history when it
+//! opens, then the samples recorded since, through a channel and a posted message. It
+//! never waits on the window's thread, except for a bounded wait at exit ([`close`]). The
+//! window's procedure works on its own copy only: it never touches the UI state and never
+//! reads the disk. Its state is borrowed only for short stretches that call nothing that
+//! dispatches messages; calls that do (creating, showing, destroying, `SetWindowPos`,
+//! filling the list) run with it released.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use batterysight_core::history::{self, Sample};
@@ -32,14 +40,15 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BM_SETCHECK, BN_CLICKED, BS_AUTORADIOBUTTON, BS_PUSHLIKE, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetDlgItem, HMENU, IDCANCEL,
-    IsDialogMessageW, IsIconic, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
-    LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MINMAXINFO, MSG, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_SIZE,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetDlgItem,
+    GetMessageW, HMENU, IDCANCEL, IsDialogMessageW, IsIconic, LB_ADDSTRING, LB_GETCURSEL,
+    LB_RESETCONTENT, LB_SETCURSEL, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MINMAXINFO,
+    MSG, NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, SPI_GETNONCLIENTMETRICS, SW_RESTORE,
+    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_PAINT, WM_SETFONT, WM_SIZE, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP, WS_OVERLAPPEDWINDOW,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -57,6 +66,10 @@ const ID_LIST: i32 = 100;
 const ID_RANGE: i32 = 101;
 /// `BST_CHECKED` (defined by the `windows` crate's Controls feature only).
 const BST_CHECKED: usize = 1;
+/// Updates from the UI thread are queued (posted to the window by [`WindowThread::send`]).
+const WM_APP_UPDATES: u32 = WM_APP + 1;
+/// How long [`close`] waits for the window's thread to end.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
 
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
 /// A control parent: the keyboard moves between the list and the buttons.
@@ -66,7 +79,9 @@ const START_SIZE: (i32, i32) = (760, 420);
 const MIN_SIZE: (i32, i32) = (560, 320);
 
 thread_local! {
-    /// The open window; lives on the UI thread only.
+    /// The window's thread, as the UI thread knows it; used on the UI thread only.
+    static THREAD: RefCell<Option<WindowThread>> = const { RefCell::new(None) };
+    /// The window's state, on the window's own thread.
     static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
 }
 
@@ -105,62 +120,143 @@ pub fn devices(
     list
 }
 
-struct Window {
-    hwnd: HWND,
-    /// The message font for the window's DPI, used by the controls and the text.
-    font: Option<HFONT>,
-    /// In list order.
-    devices: Vec<Device>,
-    selected: Option<DeviceKey>,
-    /// Index into [`RANGES`].
-    range: usize,
-    history: HashMap<DeviceKey, Vec<Sample>>,
+/// What the UI thread sends the window.
+enum Update {
+    /// Come to the front, with these devices.
+    Show(Vec<Device>),
+    /// The devices now, and the samples recorded since the last update.
+    Data {
+        devices: Vec<Device>,
+        samples: Vec<Sample>,
+    },
+    /// The app is ending.
+    Close,
 }
 
-impl Drop for Window {
-    fn drop(&mut self) {
-        if let Some(font) = self.font.take() {
-            // SAFETY: our font; the controls that used it are gone (dropped on WM_NCDESTROY).
-            let _ = unsafe { DeleteObject(font.into()) };
+/// The window's thread, from the UI thread.
+struct WindowThread {
+    updates: Sender<Update>,
+    /// The window, once created (0 before and after), for posting [`WM_APP_UPDATES`].
+    hwnd: Arc<AtomicIsize>,
+    /// Closed when the thread ends (the window was closed, or never created).
+    done: Receiver<()>,
+    thread: JoinHandle<()>,
+}
+
+impl WindowThread {
+    /// Starts the thread, which creates and shows the window with `devices` and `history`.
+    fn start(devices: Vec<Device>, history: HashMap<DeviceKey, Vec<Sample>>) -> Option<Self> {
+        let (updates, queue) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel::<()>();
+        let hwnd = Arc::new(AtomicIsize::new(0));
+        let slot = Arc::clone(&hwnd);
+        let thread = thread::Builder::new()
+            .name("batterysight-history".into())
+            .spawn(move || {
+                run(devices, history, queue, &slot);
+                drop(done_tx);
+            })
+            .ok()?;
+        Some(WindowThread {
+            updates,
+            hwnd,
+            done,
+            thread,
+        })
+    }
+
+    fn alive(&self) -> bool {
+        matches!(self.done.try_recv(), Err(TryRecvError::Empty))
+    }
+
+    /// Queues `update` and posts [`WM_APP_UPDATES`] to the window. Before the window
+    /// exists nothing is posted: the thread takes what is queued once it has made it.
+    fn send(&self, update: Update) {
+        if self.updates.send(update).is_err() {
+            return;
+        }
+        let hwnd = self.hwnd.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            // SAFETY: no pointers involved; a window just destroyed only makes it fail.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_APP_UPDATES,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
         }
     }
+}
+
+/// Runs `f` on the window's thread as the UI thread knows it; `None` when it is borrowed.
+fn with_thread<R>(f: impl FnOnce(&mut Option<WindowThread>) -> R) -> Option<R> {
+    THREAD.with(|cell| cell.try_borrow_mut().ok().map(|mut t| f(&mut t)))
 }
 
 /// Opens the window with `devices` and a copy of `history`, or brings the open one to the
-/// front with them.
+/// front with `devices` (it has the history already). From the UI thread.
 pub fn open(devices: Vec<Device>, history: &HashMap<DeviceKey, Vec<Sample>>) {
-    if let Some(hwnd) = hwnd() {
-        with_window(|w| w.history = history.clone());
-        set_devices(hwnd, devices);
-        invalidate(hwnd);
-        // SAFETY: our own window.
-        unsafe {
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            }
-            let _ = SetForegroundWindow(hwnd);
+    with_thread(|thread| match thread.as_ref().filter(|t| t.alive()) {
+        Some(t) => t.send(Update::Show(devices)),
+        // A thread that ended is dropped, so detached: it is finishing on its own.
+        None => *thread = WindowThread::start(devices, history.clone()),
+    });
+}
+
+/// Whether the window is open (or opening). From the UI thread.
+pub fn is_open() -> bool {
+    with_thread(|thread| thread.as_ref().is_some_and(WindowThread::alive)).unwrap_or(false)
+}
+
+/// Gives the open window the current `devices` and the samples just recorded. From the UI
+/// thread.
+pub fn update(devices: Vec<Device>, samples: &[Sample]) {
+    with_thread(|thread| {
+        if let Some(t) = thread.as_ref().filter(|t| t.alive()) {
+            t.send(Update::Data {
+                devices,
+                samples: samples.to_vec(),
+            });
         }
+    });
+}
+
+/// Closes the window, if open, and waits at most 1 s for its thread to end (past that it
+/// ends with the process). From the UI thread, at exit.
+pub fn close() {
+    let Some(Some(t)) = with_thread(Option::take) else {
         return;
+    };
+    t.send(Update::Close);
+    // The thread closes `done` only as it ends.
+    if t.done.recv_timeout(CLOSE_WAIT) == Err(RecvTimeoutError::Disconnected) {
+        let _ = t.thread.join();
     }
+}
+
+/// The window's thread: creates and shows the window, then runs its message loop until
+/// the window is destroyed.
+fn run(
+    devices: Vec<Device>,
+    history: HashMap<DeviceKey, Vec<Sample>>,
+    queue: Receiver<Update>,
+    slot: &AtomicIsize,
+) {
     let Some(hwnd) = create() else {
         return;
     };
-    let window = Window {
-        hwnd,
-        font: None,
-        devices: Vec::new(),
-        selected: None,
-        range: 0,
-        history: history.clone(),
-    };
-    if WINDOW
-        .with(|cell| cell.try_borrow_mut().map(|mut w| *w = Some(window)))
-        .is_err()
-    {
-        // SAFETY: our own window, not yet shown.
-        let _ = unsafe { DestroyWindow(hwnd) };
-        return;
-    }
+    WINDOW.with(|cell| {
+        *cell.borrow_mut() = Some(Window {
+            font: None,
+            devices: Vec::new(),
+            selected: None,
+            range: 0,
+            history,
+            queue,
+        });
+    });
     set_font(hwnd);
     set_devices(hwnd, devices);
     layout(hwnd);
@@ -172,45 +268,78 @@ pub fn open(devices: Vec<Device>, history: &HashMap<DeviceKey, Vec<Sample>>) {
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(hwnd);
     }
+    slot.store(hwnd.0 as isize, Ordering::SeqCst);
+    // What was sent before the window existed (and so not posted).
+    take_updates(hwnd);
+    let mut msg = MSG::default();
+    // SAFETY: `msg` outlives each call. GetMessageW returns -1 on error, 0 on WM_QUIT
+    // (posted when the window is destroyed).
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+        // SAFETY: `msg` came from GetMessageW; the dialog keys (Tab, arrows, Esc) are
+        // handled by IsDialogMessageW.
+        unsafe {
+            if !IsDialogMessageW(hwnd, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+    slot.store(0, Ordering::SeqCst);
+    // The controls are gone: the font can go.
+    WINDOW.with(|cell| cell.borrow_mut().take());
 }
 
-/// Whether the window is open.
-pub fn is_open() -> bool {
-    hwnd().is_some()
-}
-
-/// Gives the open window the current `devices` and the samples just recorded.
-pub fn update(devices: Vec<Device>, samples: &[Sample]) {
-    let Some(hwnd) = hwnd() else {
-        return;
-    };
-    set_devices(hwnd, devices);
-    if !samples.is_empty() {
-        with_window(|w| history::add(&mut w.history, samples.iter().cloned(), unix_now_ms()));
-        invalidate(hwnd);
+/// Carries out the updates queued by the UI thread.
+fn take_updates(hwnd: HWND) {
+    while let Some(Ok(update)) = with_window(|w| w.queue.try_recv()) {
+        match update {
+            Update::Show(devices) => {
+                set_devices(hwnd, devices);
+                invalidate(hwnd);
+                // SAFETY: our own window.
+                unsafe {
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
+            Update::Data { devices, samples } => {
+                set_devices(hwnd, devices);
+                if !samples.is_empty() {
+                    with_window(|w| history::add(&mut w.history, samples, unix_now_ms()));
+                    invalidate(hwnd);
+                }
+            }
+            Update::Close => {
+                // SAFETY: our own window; WM_DESTROY ends the message loop.
+                let _ = unsafe { DestroyWindow(hwnd) };
+                return;
+            }
+        }
     }
 }
 
-/// Closes the window, if open.
-pub fn close() {
-    if let Some(hwnd) = hwnd() {
-        // SAFETY: our own window; its state is dropped on WM_NCDESTROY.
-        let _ = unsafe { DestroyWindow(hwnd) };
+struct Window {
+    /// The message font for the window's DPI, used by the controls and the text.
+    font: Option<HFONT>,
+    /// In list order.
+    devices: Vec<Device>,
+    selected: Option<DeviceKey>,
+    /// Index into [`RANGES`].
+    range: usize,
+    history: HashMap<DeviceKey, Vec<Sample>>,
+    /// Updates from the UI thread.
+    queue: Receiver<Update>,
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        if let Some(font) = self.font.take() {
+            // SAFETY: our font; dropped after the window and its controls are destroyed.
+            let _ = unsafe { DeleteObject(font.into()) };
+        }
     }
-}
-
-/// Lets the window handle `msg` as dialog keyboard input (Tab, arrows, Esc). Returns
-/// whether it did; the message loop then does not dispatch it.
-pub fn dialog_message(msg: &MSG) -> bool {
-    let Some(hwnd) = hwnd() else {
-        return false;
-    };
-    // SAFETY: `msg` outlives the call; our own window.
-    unsafe { IsDialogMessageW(hwnd, msg) }.as_bool()
-}
-
-fn hwnd() -> Option<HWND> {
-    WINDOW.with(|cell| cell.try_borrow().ok()?.as_ref().map(|w| w.hwnd))
 }
 
 /// Runs `f` on the window's state; `None` when it is closed or borrowed.
@@ -425,8 +554,11 @@ fn set_font(hwnd: HWND) {
             0,
             GetDpiForWindow(hwnd),
         );
+        if got.is_err() {
+            return;
+        }
         let font = CreateFontIndirectW(&metrics.lfMessageFont);
-        if got.is_err() || font.is_invalid() {
+        if font.is_invalid() {
             return;
         }
         let Some(old) = with_window(|w| w.font.replace(font)) else {
@@ -499,8 +631,8 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// The window procedure. It handles input, paint and DPI changes on the window's own state
-/// (see the module doc), never the UI state.
+/// The window procedure, on the window's thread. It handles input, paint, DPI changes and
+/// the UI thread's updates on the window's own state (see the module doc).
 pub unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_SIZE => {
@@ -538,17 +670,10 @@ pub unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
         WM_PAINT => paint(hwnd),
         // Paint covers everything.
         WM_ERASEBKGND => return LRESULT(1),
-        WM_NCDESTROY => {
-            let window = WINDOW.with(|cell| {
-                let mut state = cell.try_borrow_mut().ok()?;
-                if state.as_ref().is_some_and(|w| w.hwnd == hwnd) {
-                    state.take()
-                } else {
-                    None
-                }
-            });
-            drop(window);
-        }
+        WM_APP_UPDATES => take_updates(hwnd),
+        // Ends the window's message loop; its state goes with the loop.
+        // SAFETY: no pointers involved.
+        WM_DESTROY => unsafe { PostQuitMessage(0) },
         // SAFETY: forwarding this window's own message.
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
@@ -573,7 +698,7 @@ fn command(hwnd: HWND, id: i32, code: u32) {
         invalidate(hwnd);
     } else if id == IDCANCEL.0 {
         // Esc.
-        // SAFETY: our own window; its state is dropped on WM_NCDESTROY.
+        // SAFETY: our own window; WM_DESTROY ends the message loop.
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 }

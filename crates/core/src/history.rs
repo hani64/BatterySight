@@ -139,6 +139,33 @@ impl Sample {
     fn same_reading(&self, other: &Sample) -> bool {
         self.level == other.level && self.charge == other.charge && self.presence == other.presence
     }
+
+    /// A session break for `key` at `at_unix_ms`: nothing was observed from the device's
+    /// previous sample until now (BatterySight was not running, or the PC was off or
+    /// asleep). Written as an offline sample with nothing known (no level or millivolts,
+    /// charge unknown, source OS), it ends discharge spans and chart lines like any offline
+    /// sample. A real reading of an offline device that knows nothing reads the same, and
+    /// means the same.
+    pub fn session_break(key: DeviceKey, at_unix_ms: u64) -> Sample {
+        Sample {
+            at_unix_ms,
+            key,
+            level: None,
+            charge: Charge::Unknown,
+            presence: Presence::Offline,
+            millivolts: None,
+            source: Source::Os,
+        }
+    }
+
+    /// Whether this is a session break ([`Sample::session_break`]).
+    pub fn is_break(&self) -> bool {
+        self.level.is_none()
+            && self.charge == Charge::Unknown
+            && self.presence == Presence::Offline
+            && self.millivolts.is_none()
+            && self.source == Source::Os
+    }
 }
 
 fn name<T: PartialEq + Copy>(table: &[(T, &'static str)], of: T) -> &'static str {
@@ -162,7 +189,9 @@ fn number<T: FromStr>(text: &str) -> Option<T> {
 
 /// Which snapshot readings become samples: a device's first reading, any change of level,
 /// charge or presence, and a fresh unchanged reading [`RECORD_EVERY_MS`] or more after
-/// the device's last sample (either way, so a clock set back does not stop it).
+/// the device's last sample (either way, so a clock set back does not stop it). After a
+/// session break ([`Recorder::session_break`]) a device's next fresh reading is recorded,
+/// changed or not, and a reading from before the break is not.
 #[derive(Debug, Default)]
 pub struct Recorder {
     /// Per device: its last sample, and the `updated_ms` of the last reading seen (a
@@ -184,8 +213,12 @@ impl Recorder {
                 None => true,
                 Some((last, seen)) => {
                     let fresh = std::mem::replace(seen, state.updated_ms) != state.updated_ms;
-                    !last.same_reading(&sample)
-                        || (fresh && now_unix_ms.abs_diff(last.at_unix_ms) >= RECORD_EVERY_MS)
+                    if last.is_break() {
+                        fresh
+                    } else {
+                        !last.same_reading(&sample)
+                            || (fresh && now_unix_ms.abs_diff(last.at_unix_ms) >= RECORD_EVERY_MS)
+                    }
                 }
             };
             if record {
@@ -195,6 +228,33 @@ impl Recorder {
             }
         }
         samples
+    }
+
+    /// Session breaks at `now_unix_ms` (BatterySight started, or the PC resumed) for every
+    /// known device: those with samples in `history` and those this recorder has seen, by
+    /// key, except a device whose latest sample in `history` is a break already.
+    pub fn session_break(
+        &mut self,
+        history: &HashMap<DeviceKey, Vec<Sample>>,
+        now_unix_ms: u64,
+    ) -> Vec<Sample> {
+        let mut keys: Vec<&DeviceKey> = history.keys().chain(self.last.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        let breaks = keys
+            .into_iter()
+            .filter(|key| {
+                !history
+                    .get(*key)
+                    .and_then(|s| s.last())
+                    .is_some_and(Sample::is_break)
+            })
+            .map(|key| Sample::session_break(key.clone(), now_unix_ms))
+            .collect();
+        for (last, _) in self.last.values_mut() {
+            *last = Sample::session_break(last.key.clone(), now_unix_ms);
+        }
+        breaks
     }
 }
 
@@ -604,5 +664,94 @@ mod tests {
         assert_eq!(time_left_text(h(45 * 60 + 10)), "Time left: about 45 h");
         assert_eq!(time_left_text(h(45 * 60 + 30)), "Time left: about 46 h");
         assert_eq!(time_left_text(h(20)), "Time left: less than 1 h");
+    }
+
+    fn key(k: &str) -> DeviceKey {
+        DeviceKey(k.into())
+    }
+
+    #[test]
+    fn session_break_round_trips() {
+        let b = Sample::session_break(key("logi:4082:1"), T0);
+        assert_eq!(
+            b.to_line(),
+            format!("{T0}\tlogi:4082:1\t-\tunknown\toffline\t-\tos")
+        );
+        assert_eq!(Sample::parse(&b.to_line()), Some(b.clone()));
+        assert!(b.is_break());
+        assert!(!sample(T0, 80).is_break());
+        let offline = Sample {
+            presence: Presence::Offline,
+            ..sample(T0, 80)
+        };
+        assert!(!offline.is_break(), "an offline device that kept its level");
+    }
+
+    #[test]
+    fn session_breaks_for_known_devices_once() {
+        let mut r = Recorder::default();
+        let mut c = state(60, 1);
+        c.key = key("c");
+        r.observe(&[c], T0);
+        let a = Sample {
+            key: key("a"),
+            ..sample(T0, 80)
+        };
+        let mut history = HashMap::new();
+        add(
+            &mut history,
+            [a, Sample::session_break(key("b"), T0)],
+            T0 + MIN,
+        );
+        // A device whose latest sample is a break already gets none; the recorder's too.
+        let breaks = r.session_break(&history, T0 + MIN);
+        assert_eq!(
+            breaks,
+            [
+                Sample::session_break(key("a"), T0 + MIN),
+                Sample::session_break(key("c"), T0 + MIN)
+            ]
+        );
+        add(&mut history, breaks, T0 + MIN);
+        assert!(r.session_break(&history, T0 + 2 * MIN).is_empty());
+    }
+
+    #[test]
+    fn recording_after_a_break_waits_for_a_fresh_reading() {
+        let mut r = Recorder::default();
+        assert_eq!(r.observe(&[state(80, 1)], T0).len(), 1);
+        let mut history = HashMap::new();
+        add(&mut history, [sample(T0, 80)], T0);
+        assert_eq!(r.session_break(&history, T0 + MIN).len(), 1);
+        // The reading from before the break is not recorded again…
+        assert!(r.observe(&[state(80, 1)], T0 + 2 * MIN).is_empty());
+        // …a fresh one is, unchanged and within 30 min.
+        let s = r.observe(&[state(80, 2)], T0 + 3 * MIN);
+        assert_eq!(
+            s.iter().map(|s| s.at_unix_ms).collect::<Vec<_>>(),
+            [T0 + 3 * MIN]
+        );
+        // Then the usual rule again.
+        assert!(r.observe(&[state(80, 3)], T0 + 4 * MIN).is_empty());
+    }
+
+    #[test]
+    fn time_left_never_spans_a_session_break() {
+        // 82 % at 22:00, 80 % at 23:00, the PC off overnight, 80 % at 08:00, 78 % at 09:00.
+        let night = discharge(&[(22, 82), (23, 80), (32, 80), (33, 78)]);
+        // Without a break: one 11 h span, about 214 h left.
+        assert_eq!(
+            time_left(&night, T0 + 33 * HOUR),
+            Some(Duration::from_millis(78 * 11 * HOUR / 4))
+        );
+        let mut s = night.clone();
+        s.insert(2, Sample::session_break(key("logi:4082:1"), T0 + 32 * HOUR));
+        assert_eq!(time_left(&s, T0 + 33 * HOUR), None);
+        // The span after the break alone, once long enough: 80 → 76 % over 2 h.
+        s.extend(discharge(&[(34, 76)]));
+        assert_eq!(
+            time_left(&s, T0 + 34 * HOUR),
+            Some(Duration::from_millis(76 * 2 * HOUR / 4))
+        );
     }
 }
