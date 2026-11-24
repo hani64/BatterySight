@@ -362,6 +362,10 @@ impl Hub {
                         continue;
                     }
                     self.note_presence(&update.key, update.presence);
+                    // A fresh level (pushed or queried) is as good as an activity read.
+                    if update.level.is_some() {
+                        self.scheduler.note_read(&update.key, now);
+                    }
                     if let Some(state) = self.states.get_mut(&update.key) {
                         state.apply(&update, now);
                         if update.presence.is_none() {
@@ -926,9 +930,11 @@ source = "test"
     fn removal_keeps_state_for_grace_then_drops() {
         let f = fake();
         let a = dev("dev-a");
-        f.borrow_mut()
-            .on_grant
-            .push_back(vec![register(&a, Some(Level::Percent(50)))]);
+        f.borrow_mut().on_grant.push_back(vec![register_with(
+            &a,
+            activity_gap(),
+            Some(Level::Percent(50)),
+        )]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
 
@@ -941,10 +947,13 @@ source = "test"
         let out = hub.handle(HubInput::Tick, 1_000 + 59_999);
         assert!(out.is_empty(), "{out:?}");
         assert!(state(&hub, &a).is_some());
+        // The scheduler keeps the device through the grace.
+        assert_eq!(hub.activity_ready_at(&a), Some(100_000));
 
         let out = hub.handle(HubInput::Tick, 1_000 + 60_000);
         assert_eq!(out, vec![HubOutput::StateChanged]);
         assert!(hub.snapshot().is_empty());
+        assert_eq!(hub.activity_ready_at(&a), None, "scheduler forgot it");
     }
 
     #[test]
@@ -1305,24 +1314,48 @@ source = "test"
     fn activity_requests_grant_unless_device_pushes() {
         let f = fake();
         let (poll, push) = (dev("poll"), dev("push"));
-        let polled = Capabilities {
-            pushes_battery: false,
-            ..pushing()
-        };
         f.borrow_mut().on_grant.push_back(vec![
-            register_with(&poll, polled, None),
+            register_with(&poll, activity_gap(), None),
             register(&push, None),
         ]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
 
-        hub.handle(HubInput::Activity(push), 10);
-        hub.handle(HubInput::Activity(poll.clone()), 10);
+        hub.handle(HubInput::Activity(push), 100_000);
+        hub.handle(HubInput::Activity(poll.clone()), 100_000);
 
         assert_eq!(
             grants(&f),
             vec![(group_key(1), Trigger::Arrival), (poll, Trigger::Activity)]
         );
+    }
+
+    #[test]
+    fn a_reading_restarts_the_activity_gap() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
+        // A headset switched on during playback broadcasts its level: no read right after.
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&a, 80)]);
+        // A presence change alone is no reading.
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Update(DeviceUpdate {
+                presence: Some(Presence::Online),
+                ..update(&a)
+            })]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+        assert_eq!(hub.activity_ready_at(&a), Some(100_000));
+
+        hub.handle(report(1), 50_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(150_000));
+        hub.handle(report(1), 60_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(150_000));
     }
 
     #[test]
