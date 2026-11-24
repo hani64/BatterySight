@@ -120,14 +120,20 @@ pub fn beat() {
     HEARTBEAT.store(now_ms(), Ordering::Relaxed);
 }
 
-/// Starts or stops the checks; arming also beats, so the check starts fresh.
+/// Starts or stops the checks; arming also beats, so the check starts fresh. The release
+/// store makes that beat visible to a check that sees the watchdog armed.
 pub fn arm(armed: bool) {
     beat();
-    ARMED.store(armed, Ordering::Relaxed);
+    ARMED.store(armed, Ordering::Release);
 }
 
-/// Starts the watchdog thread. It owns no windows and runs until the process ends.
+/// Starts the watchdog thread, once per process (later calls do nothing). It owns no
+/// windows and runs until the process ends.
 pub fn spawn() {
+    static SPAWNED: AtomicBool = AtomicBool::new(false);
+    if SPAWNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let _ = thread::Builder::new()
         .name("batterysight-watchdog".into())
         .spawn(watch);
@@ -137,10 +143,12 @@ fn watch() {
     let mut staleness = Staleness::new(now_ms(), HEARTBEAT.load(Ordering::Relaxed));
     loop {
         thread::sleep(Duration::from_millis(Ms::from(INTERVAL_MS)));
+        // Armed is read first: a check that sees a fresh arming also sees its beat, so the
+        // staleness built up while disarmed cannot trip it.
+        let armed = ARMED.load(Ordering::Acquire);
         // Observed even while disarmed, so arming starts from an up-to-date state.
         let stale = staleness.observe(now_ms(), HEARTBEAT.load(Ordering::Relaxed));
-        if ARMED.load(Ordering::Relaxed) && WATCHDOG.check(stale, explorer_answers) == Verdict::Trip
-        {
+        if armed && WATCHDOG.check(stale, explorer_answers) == Verdict::Trip {
             trip();
         }
     }
@@ -168,8 +176,14 @@ fn explorer_answers() -> bool {
     }
 }
 
-/// Starts the tray-only replacement and ends this process at once.
+/// Finishes the settings writes (at most 1 s, normally none are queued), deletes a
+/// notification's temporary icon if Explorer answers, starts the tray-only replacement and
+/// ends this process at once. The replacement waits for this process to end before it
+/// loads the settings.
 fn trip() -> ! {
+    super::stop_store();
+    // Asks Explorer only with the icon shown: the delete waits on its taskbar thread.
+    super::notify::delete_on_trip(super::host(), explorer_answers);
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe)
             .args(["--tray-only", "--takeover"])

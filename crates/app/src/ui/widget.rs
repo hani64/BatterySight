@@ -1,5 +1,5 @@
 //! The in-taskbar widget: a layered child window of `Shell_TrayWnd` and of every
-//! `Shell_SecondaryTrayWnd`, drawn with `UpdateLayeredWindow`.
+//! `Shell_SecondaryTrayWnd` that "Show on" chooses, drawn with `UpdateLayeredWindow`.
 //!
 //! Positioning is event-driven. WinEvent hooks on the taskbars' threads only (not the rest of
 //! Explorer) report when a taskbar or its notification area (`TrayNotifyWnd`) moves or
@@ -18,8 +18,13 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
+use batterysight_core::model::DeviceKey;
+use batterysight_core::settings::MonitorChoice;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, ScreenToClient};
+use windows::Win32::Graphics::Gdi::{
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow, ScreenToClient,
+};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
@@ -28,27 +33,35 @@ use windows::Win32::UI::Accessibility::{
     TreeScope_Descendants, UnhookWinEvent,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_LOCATIONCHANGE,
     EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GA_PARENT, GW_HWNDPREV,
     GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_TOP, IsWindow, IsWindowVisible, MA_NOACTIVATE, OBJID_WINDOW,
-    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CONTEXTMENU, WM_DPICHANGED_AFTERPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_VISIBLE,
+    GetWindowThreadProcessId, HWND_TOP, IsWindow, IsWindowVisible, MA_NOACTIVATE,
+    MONITORINFOF_PRIMARY, OBJID_WINDOW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU, WM_DPICHANGED_AFTERPARENT,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{BOOL, PCWSTR, w};
 
-use super::{DeviceView, WIDGET_CLASS, WM_APP_CLOCKS, WM_APP_MENU, hinstance, post, render};
+use super::menu::{MonitorInfo, display_number};
+use super::{
+    DeviceView, WIDGET_CLASS, WM_APP_CLOCKS, WM_APP_HOVER_END, WM_APP_MENU, hinstance, post, render,
+};
 
 /// How often UI Automation looks again for a secondary taskbar's clock that is missing
 /// (Explorer starting), and for how many rounds.
 const CLOCK_RETRY: Duration = Duration::from_millis(500);
 const CLOCK_RETRIES: u32 = 20;
 
-/// Windows refused to create the widget window: this Windows build gets tray icons.
+/// The cursor left the window (asked for with `TrackMouseEvent`); the `windows` crate
+/// defines it only with its `Win32_UI_Controls` feature.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// Windows refused to create a widget window: tray icons, until the widget is tried again.
 #[derive(Debug)]
 pub struct CreateFailed;
 
@@ -61,6 +74,8 @@ pub struct Widgets {
     /// (process, thread) of the taskbars the hooks watch.
     hooked: Vec<(u32, u32)>,
     uia: Option<Uia>,
+    /// Which taskbars get a widget ("Show on").
+    monitors: MonitorChoice,
 }
 
 struct Widget {
@@ -73,6 +88,20 @@ struct Widget {
     pos: Option<(i32, i32)>,
     /// Width of the taskbar when its clock was last asked for (secondary taskbars).
     bar_width: i32,
+    /// Each shown device's columns of the painted strip: (key, x0, x1).
+    devices: Vec<(DeviceKey, i32, i32)>,
+}
+
+/// The device under the cursor on a widget ([`Widgets::hit`]), in screen coordinates.
+#[derive(Debug, PartialEq)]
+pub struct Hover {
+    pub key: DeviceKey,
+    /// The device's columns of the widget.
+    pub device: RECT,
+    /// The taskbar the widget is on.
+    pub bar: RECT,
+    /// The DPI the widget is painted for.
+    pub dpi: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -89,17 +118,22 @@ struct Uia {
 }
 
 impl Widgets {
-    /// Hooks Explorer and creates a widget on every taskbar there is (none while Explorer is
-    /// not running; `TaskbarCreated` brings them).
-    pub fn new(views: &[DeviceView], light: bool) -> Result<Widgets, CreateFailed> {
+    /// Hooks Explorer and creates a widget on every taskbar `monitors` chooses ([`select`];
+    /// none while Explorer is not running; `TaskbarCreated` brings them).
+    pub fn new(
+        views: &[DeviceView],
+        light: bool,
+        monitors: &MonitorChoice,
+    ) -> Result<Widgets, CreateFailed> {
         let mut widgets = Widgets {
             widgets: Vec::new(),
             clocks: Vec::new(),
             hooks: Vec::new(),
             hooked: Vec::new(),
             uia: None,
+            monitors: monitors.clone(),
         };
-        widgets.layout(views, light)?;
+        widgets.arrange(views, light)?;
         Ok(widgets)
     }
 
@@ -110,21 +144,40 @@ impl Widgets {
         }
     }
 
-    /// Creates widgets on new taskbars, drops those whose taskbar is gone, repaints those
-    /// whose DPI, height, theme or views changed, and moves them next to their anchor.
-    pub fn layout(&mut self, views: &[DeviceView], light: bool) -> Result<(), CreateFailed> {
+    /// Lays the widgets out on the taskbars `monitors` now chooses (see [`Widgets::arrange`]).
+    pub fn layout(
+        &mut self,
+        views: &[DeviceView],
+        light: bool,
+        monitors: &MonitorChoice,
+    ) -> Result<(), CreateFailed> {
+        if self.monitors != *monitors {
+            self.monitors = monitors.clone();
+        }
+        self.arrange(views, light)
+    }
+
+    /// Creates widgets on new chosen taskbars, drops those whose taskbar is gone or no
+    /// longer chosen, repaints those whose DPI, height, theme or views changed, and moves
+    /// them next to their anchor.
+    fn arrange(&mut self, views: &[DeviceView], light: bool) -> Result<(), CreateFailed> {
         self.hook_taskbars();
+        let clocks = &self.clocks;
+        let bars = select(&taskbars(), &self.monitors, monitor_device, |bar| {
+            anchor_x(bar, clocks, window_rect(bar)).is_some()
+        });
         self.widgets.retain(|w| {
             // SAFETY: plain handle checks.
             let alive =
                 unsafe { IsWindow(Some(w.hwnd)).as_bool() && IsWindow(Some(w.bar)).as_bool() };
-            if !alive {
+            let keep = alive && bars.iter().any(|&(bar, _)| bar == w.bar);
+            if !keep {
                 destroy(w.hwnd);
             }
-            alive
+            keep
         });
         let mut ask_clocks = false;
-        for (bar, primary) in taskbars() {
+        for (bar, primary) in bars {
             if self.widgets.iter().any(|w| w.bar == bar) {
                 continue;
             }
@@ -168,8 +221,8 @@ impl Widgets {
     ) -> Result<(), CreateFailed> {
         self.destroy_windows();
         self.clocks.clear();
-        self.unhook(); // the taskbars run on new threads; `layout` hooks them
-        self.layout(views, light)?;
+        self.unhook(); // the taskbars run on new threads; `arrange` hooks them
+        self.arrange(views, light)?;
         self.ask_clocks();
         Ok(())
     }
@@ -181,7 +234,7 @@ impl Widgets {
         views: &[DeviceView],
         light: bool,
     ) -> Result<(), CreateFailed> {
-        self.layout(views, light)?;
+        self.arrange(views, light)?;
         self.ask_clocks();
         Ok(())
     }
@@ -203,8 +256,35 @@ impl Widgets {
 
     /// Whether no widget is shown although a taskbar exists; see [`needs_tray`].
     pub fn missing(&self) -> bool {
-        let shown = self.widgets.iter().any(|w| w.pos.is_some());
-        needs_tray(!taskbars().is_empty(), shown)
+        needs_tray(!taskbars().is_empty(), self.shown())
+    }
+
+    /// Whether a widget is shown on some taskbar.
+    pub fn shown(&self) -> bool {
+        self.widgets.iter().any(|w| w.pos.is_some())
+    }
+
+    /// The device under `at` (screen coordinates) on a shown widget. Reads window-manager
+    /// state only.
+    pub fn hit(&self, at: POINT) -> Option<Hover> {
+        self.widgets.iter().find_map(|w| {
+            let p = w.painted.filter(|_| w.pos.is_some())?;
+            let r = window_rect(w.hwnd);
+            if !(r.top..r.bottom).contains(&at.y) || !(r.left..r.right).contains(&at.x) {
+                return None;
+            }
+            let (key, x0, x1) = device_at(&w.devices, at.x - r.left)?;
+            Some(Hover {
+                key: key.clone(),
+                device: RECT {
+                    left: r.left + x0,
+                    right: r.left + x1,
+                    ..r
+                },
+                bar: window_rect(w.bar),
+                dpi: p.dpi,
+            })
+        })
     }
 
     /// Destroys the windows and removes the hooks. The UIA thread ends when `self` drops.
@@ -220,7 +300,7 @@ impl Widgets {
     }
 
     fn ask_clocks(&mut self) {
-        if taskbars().iter().all(|&(_, primary)| primary) {
+        if self.widgets.iter().all(|w| w.primary) {
             return;
         }
         if self.uia.is_none() {
@@ -352,12 +432,19 @@ fn class_name(hwnd: HWND) -> String {
 
 /// Whether the session must switch to tray icons: a taskbar exists but no widget is shown on
 /// any (for example, a Windows build without a visible `TrayNotifyWnd`), so nothing would
-/// show the devices or offer "Exit". Without any taskbar, tray icons cannot show either.
+/// show the devices or offer "Exit". Without any taskbar, tray icons cannot show either. A
+/// later taskbar or display change tries the widget again.
 fn needs_tray(taskbar: bool, shown: bool) -> bool {
     taskbar && !shown
 }
 
-/// The window procedure of the widget. Clicks open the menu on the host window; nothing
+/// The device at `x` (from the widget's left edge) of `devices` (key, x0, x1).
+fn device_at(devices: &[(DeviceKey, i32, i32)], x: i32) -> Option<&(DeviceKey, i32, i32)> {
+    devices.iter().find(|(_, x0, x1)| (*x0..*x1).contains(&x))
+}
+
+/// The window procedure of the widget. Clicks open the menu and the cursor's moves and
+/// leaving drive the hover card, all through messages posted to the host window; nothing
 /// here touches the UI state.
 pub unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -371,6 +458,23 @@ pub unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 return LRESULT(0);
             }
             post(WM_APP_MENU);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            // Asks for WM_MOUSELEAVE (again: each one ends the tracking).
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // SAFETY: `track` outlives the call; our own window.
+            let _ = unsafe { TrackMouseEvent(&mut track) };
+            super::schedule_hover();
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            post(WM_APP_HOVER_END);
             LRESULT(0)
         }
         WM_DPICHANGED_AFTERPARENT => {
@@ -409,6 +513,7 @@ fn create(bar: HWND, primary: bool) -> Result<Widget, CreateFailed> {
         painted: None,
         pos: None,
         bar_width: 0,
+        devices: Vec::new(),
     })
 }
 
@@ -421,10 +526,11 @@ fn destroy(hwnd: HWND) {
     }
 }
 
-/// Renders the views and hands the bitmap to the window (per-pixel alpha). The position is
-/// set separately; a changed width moves the window at the next [`position`].
+/// Renders the views and hands the bitmap to the window (per-pixel alpha), and keeps each
+/// device's columns for [`Widgets::hit`]. The position is set separately; a changed width
+/// moves the window at the next [`position`].
 fn paint(w: &mut Widget, views: &[DeviceView], dpi: u32, height: i32, light: bool) {
-    let Some(painter) = render::widget_strip(views, dpi, height, light) else {
+    let Some((painter, columns)) = render::widget_strip(views, dpi, height, light) else {
         return;
     };
     let size = painter.size();
@@ -455,6 +561,11 @@ fn paint(w: &mut Widget, views: &[DeviceView], dpi: u32, height: i32, light: boo
             light,
             size,
         });
+        w.devices = views
+            .iter()
+            .zip(columns)
+            .map(|(v, (x0, x1))| (v.key.clone(), x0, x1))
+            .collect();
     }
 }
 
@@ -530,6 +641,95 @@ fn taskbars() -> Vec<(HWND, bool)> {
         }
     }
     out
+}
+
+/// The taskbars that get a widget for `choice`, from `bars` (taskbar, primary) in
+/// [`taskbars`] order; `device` names a taskbar's monitor, `anchored` says whether a widget
+/// on it can be placed now ([`anchor_x`]). Every taskbar while none of the chosen ones can:
+/// the named monitor is disconnected or has no taskbar, or a secondary taskbar's clock is
+/// not known yet (UI Automation answers after the widgets are made). So a widget shows at
+/// once next to the primary's notification area, and the widgets narrow to the choice when
+/// its anchor arrives ([`Widgets::take_clocks`], then a layout).
+fn select<T: Copy>(
+    bars: &[(T, bool)],
+    choice: &MonitorChoice,
+    device: impl Fn(T) -> String,
+    anchored: impl Fn(T) -> bool,
+) -> Vec<(T, bool)> {
+    let chosen: Vec<(T, bool)> = bars
+        .iter()
+        .copied()
+        .filter(|&(bar, primary)| match choice {
+            MonitorChoice::All => true,
+            MonitorChoice::Main => primary,
+            MonitorChoice::Named(name) => device(bar) == *name,
+        })
+        .collect();
+    if chosen.iter().any(|&(bar, _)| anchored(bar)) {
+        chosen
+    } else {
+        bars.to_vec()
+    }
+}
+
+/// The device name (`szDevice`) of the monitor `hwnd` is mostly on; reads window-manager
+/// state only.
+fn monitor_device(hwnd: HWND) -> String {
+    // SAFETY: plain handle query.
+    monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
+        .map(|(device, _, _)| device)
+        .unwrap_or_default()
+}
+
+/// (device name, rectangle, primary) of `monitor`.
+fn monitor_info(monitor: HMONITOR) -> Option<(String, RECT, bool)> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    // SAFETY: `info` is a MONITORINFOEXW with its size set, as the call expects.
+    unsafe { GetMonitorInfoW(monitor, &raw mut info.monitorInfo) }
+        .as_bool()
+        .then(|| {
+            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(32);
+            (
+                String::from_utf16_lossy(&info.szDevice[..len]),
+                info.monitorInfo.rcMonitor,
+                info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            )
+        })
+}
+
+/// The monitors, in the order of their numbers ("Display N"); for the menu. Reads
+/// window-manager state only.
+pub fn monitors() -> Vec<MonitorInfo> {
+    unsafe extern "system" fn add(monitor: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> BOOL {
+        // SAFETY: `list` is the `Vec` passed below, alive for the whole enumeration.
+        let list = unsafe { &mut *(list.0 as *mut Vec<HMONITOR>) };
+        list.push(monitor);
+        BOOL(1)
+    }
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    // SAFETY: `add` matches MONITORENUMPROC; `handles` outlives the call.
+    let _ =
+        unsafe { EnumDisplayMonitors(None, None, Some(add), LPARAM(&raw mut handles as isize)) };
+    let mut out: Vec<MonitorInfo> = handles
+        .into_iter()
+        .filter_map(monitor_info)
+        .enumerate()
+        .map(|(i, (device, r, primary))| {
+            MonitorInfo::new(device, i, r.right - r.left, r.bottom - r.top, primary)
+        })
+        .collect();
+    out.sort_by_key(|m| display_number(&m.device).unwrap_or(usize::MAX));
+    out
+}
+
+/// Whether the primary taskbar has a visible notification area: the anchor without which no
+/// new widget shows at once ([`Widgets::shown`] right after [`Widgets::new`]). Reads
+/// window-manager state only.
+pub fn primary_anchor_ready() -> bool {
+    // SAFETY: literal class name.
+    unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }
+        .is_ok_and(|bar| tray_notify(bar).is_some())
 }
 
 /// The visible, non-empty notification area of `bar`.
@@ -763,5 +963,59 @@ mod tests {
         // No taskbar at all (Explorer not running): tray icons cannot show either, and
         // `TaskbarCreated` starts the check again.
         assert!(!needs_tray(false, false));
+    }
+
+    #[test]
+    fn hit_maps_x_to_device() {
+        let key = |k: &str| DeviceKey(k.into());
+        let devices = [(key("A"), 0, 57), (key("B"), 57, 120)];
+        let at = |x| device_at(&devices, x).map(|d| d.0.clone());
+        assert_eq!(at(0), Some(key("A")));
+        assert_eq!(at(56), Some(key("A")));
+        assert_eq!(at(57), Some(key("B")));
+        assert_eq!(at(119), Some(key("B")));
+        assert_eq!(at(120), None);
+        assert_eq!(at(-1), None);
+        assert_eq!(device_at(&[], 5), None);
+    }
+
+    #[test]
+    fn monitor_choice_selects_taskbars() {
+        let bars = [(1, true), (2, false), (3, false)];
+        let device = |bar: i32| format!(r"\\.\DISPLAY{bar}");
+        let pick = |choice| select(&bars, &choice, device, |_| true);
+        assert_eq!(pick(MonitorChoice::All), bars);
+        assert_eq!(pick(MonitorChoice::Main), [(1, true)]);
+        assert_eq!(
+            pick(MonitorChoice::Named(r"\\.\DISPLAY3".into())),
+            [(3, false)]
+        );
+        // Disconnected, or without a taskbar: every taskbar rather than none.
+        assert_eq!(pick(MonitorChoice::Named(r"\\.\DISPLAY9".into())), bars);
+        // No primary taskbar (Explorer starting): the secondary ones.
+        assert_eq!(
+            select(&bars[1..], &MonitorChoice::Main, device, |_| true),
+            bars[1..]
+        );
+    }
+
+    #[test]
+    fn unanchored_choice_shows_on_every_taskbar_until_anchored() {
+        let bars = [(1, true), (2, false), (3, false)];
+        let device = |bar: i32| format!(r"\\.\DISPLAY{bar}");
+        let display3 = MonitorChoice::Named(r"\\.\DISPLAY3".into());
+        // Display 3's clock is not known yet (UI Automation answers later): every
+        // taskbar, so the primary's widget shows at once.
+        assert_eq!(select(&bars, &display3, device, |bar| bar == 1), bars);
+        // Known: Display 3 only.
+        assert_eq!(
+            select(&bars, &display3, device, |bar| bar != 2),
+            [(3, false)]
+        );
+        // The primary's notification area is not laid out yet: every taskbar.
+        assert_eq!(
+            select(&bars, &MonitorChoice::Main, device, |bar| bar != 1),
+            bars
+        );
     }
 }

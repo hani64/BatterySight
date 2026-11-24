@@ -19,7 +19,7 @@ use windows::Win32::System::IO::{
     PostQueuedCompletionStatus,
 };
 
-use crate::hid_enum::{HidInterface, OwnedHandle};
+use crate::hid_enum::{ContainerId, HidInterface, OwnedHandle};
 use crate::hid_io::{self, Kind, Op};
 
 /// Completion key of every HID handle; the packet's `OVERLAPPED` pointer is an [`Op`].
@@ -50,6 +50,14 @@ pub enum OsEvent {
     InterfaceRemoved { path: Vec<u16> },
     /// The system resumed from sleep.
     Resume,
+    /// The render endpoints of `container` got their first active audio session (`active`)
+    /// or lost their last one.
+    AudioActive {
+        container: ContainerId,
+        active: bool,
+    },
+    /// Audio activity is not (fully) watched: `stage` failed on the audio thread.
+    AudioUnavailable { stage: &'static str },
     /// Posted by another thread to make [`Reactor::wait`] return.
     Wake,
 }
@@ -367,6 +375,7 @@ pub(crate) mod tests {
                 feature_len: 0,
                 product: String::new(),
             },
+            container: None,
         }
     }
 

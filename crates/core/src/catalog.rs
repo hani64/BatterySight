@@ -20,6 +20,9 @@ pub struct Quirks {
     pub voltage_curve: Option<String>,
     /// An active battery query wakes the device, so it is only queried on user activity.
     pub query_wakes: bool,
+    /// The device reports its battery only when it powers on or off, never while in use,
+    /// so it is read on observed activity (audio playing to it), at most every 5 minutes.
+    pub no_in_use_push: bool,
 }
 
 /// Engine support for every device of a vendor that has no specific entry.
@@ -342,6 +345,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let cat = Catalog::parse(&toml).unwrap();
         let q = &cat.device(0x046D, 0x0ABA).unwrap().quirks;
         assert!(!q.query_wakes);
+        assert!(!q.no_in_use_push);
         assert_eq!(q.voltage_curve, None);
     }
 
@@ -364,6 +368,18 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let q = &cat.device(0x046D, 0x0ABA).unwrap().quirks;
         assert!(q.query_wakes);
         assert_eq!(q.voltage_curve.as_deref(), Some("pro-x-wireless-ghub"));
+    }
+
+    #[test]
+    fn no_in_use_push_parses() {
+        let toml = SAMPLE.replace(
+            "quirks = { voltage_curve = \"pro-x-wireless-ghub\" }",
+            "quirks = { no_in_use_push = true }",
+        );
+        let cat = Catalog::parse(&toml).unwrap();
+        let q = &cat.device(0x046D, 0x0ABA).unwrap().quirks;
+        assert!(q.no_in_use_push);
+        assert!(!q.query_wakes);
     }
 
     #[test]
@@ -433,12 +449,15 @@ source = "test"
                 dev.quirks.voltage_curve.as_deref(),
                 Some("pro-x-wireless-ghub")
             );
+            // Reports its battery only at power on and off: read on audio activity.
+            assert!(dev.quirks.no_in_use_push);
         }
         // The owner's mouse behind its LIGHTSPEED receiver, by wireless PID only.
         let mouse = cat.device_by_wpid(0x046D, 0x4093).unwrap();
         assert_eq!(mouse.name, "PRO X Superlight");
         assert_eq!(mouse.kind, DeviceKind::Mouse);
         assert_eq!(mouse.status, Verification::HardwareTested);
+        assert!(!mouse.quirks.no_in_use_push);
         // The same mouse on its cable: same name, cable path untested.
         let cabled = cat.device(0x046D, 0xC094).unwrap();
         assert_eq!(cabled.name, "PRO X Superlight");

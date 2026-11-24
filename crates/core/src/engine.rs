@@ -36,10 +36,17 @@ pub enum Action {
     Update(DeviceUpdate),
     /// The device sleeps or lost its link: stop asking it.
     Asleep(DeviceKey),
-    /// A link to `key` (a device or this engine's group key) was established.
-    /// The only grant an engine can ask for: the hub requests
-    /// [`Trigger::Connected`](crate::scheduler::Trigger::Connected) for it.
+    /// A link to `key` (a device or this engine's group key) was established: the hub
+    /// requests [`Trigger::Connected`](crate::scheduler::Trigger::Connected) for it.
     Connected(DeviceKey),
+    /// The group's discovery registered nothing and is due again: the hub requests
+    /// [`Trigger::Rediscovery`](crate::scheduler::Trigger::Rediscovery) on the group key
+    /// while the group has no registered device.
+    Rediscover,
+    /// The group's discovery ended without registering a device. The engine reports
+    /// [`Action::Rediscover`] at `retry_at`; `None` means it gave up until the next
+    /// arrival, resume or refresh.
+    DiscoveryFailed { retry_at: Option<Ms> },
 }
 
 pub trait Engine {
