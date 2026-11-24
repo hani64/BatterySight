@@ -11,7 +11,7 @@
 //! (asleep, or pushing their battery) are not metered. Without an active session it sets no
 //! deadline for this, so a silent PC never wakes the thread.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -158,6 +158,7 @@ fn device_thread(
         products: HashMap::new(),
         guard: ReadFailureGuard::default(),
         release_at: None,
+        held: BTreeMap::new(),
         audio: AudioActivity::default(),
         trace: Trace::from_env(),
         states,
@@ -199,6 +200,8 @@ struct Device {
     /// When the first present group the reopen cap holds back may open; the device thread
     /// rescans once then.
     release_at: Option<Ms>,
+    /// The present groups the reopen cap held back at the last scan, with their release.
+    held: BTreeMap<PathSet, Ms>,
     audio: AudioActivity,
     trace: Option<Trace>,
     states: Arc<Mutex<Vec<DeviceState>>>,
@@ -484,18 +487,33 @@ impl Device {
             self.guard.on_removed(gone.paths, now);
         }
         self.release_at = None;
+        let mut held = BTreeMap::new();
         for (index, (group, members, paths)) in scanned.into_iter().enumerate() {
             if !new.contains(&index) {
                 continue;
             }
             match self.guard.admission(&paths, now) {
-                Admission::Open => self.arrive(group, members, paths, now),
+                Admission::Open => {
+                    if self.held.contains_key(&paths)
+                        && let Some(trace) = &mut self.trace
+                    {
+                        trace.released(&paths);
+                    }
+                    self.arrive(group, members, paths, now);
+                }
                 Admission::Closed => {}
                 Admission::HeldUntil(at) => {
+                    if self.held.get(&paths) != Some(&at)
+                        && let Some(trace) = &mut self.trace
+                    {
+                        trace.held(&paths, at.saturating_sub(now));
+                    }
                     self.release_at = Some(self.release_at.map_or(at, |release| release.min(at)));
+                    held.insert(paths, at);
                 }
             }
         }
+        self.held = held;
     }
 
     /// Fills in the product strings of the collections an engine reads, opens those and
@@ -553,6 +571,11 @@ impl Device {
                     }
                 }
                 HubOutput::StateChanged => changed = true,
+                HubOutput::DiscoveryFailed { group, retry_at } => {
+                    if let Some(trace) = &mut self.trace {
+                        trace.discovery_failed(&group, retry_at.map(|at| at.saturating_sub(now)));
+                    }
+                }
             }
         }
         if changed {
@@ -1100,6 +1123,87 @@ mod tests {
         assert_eq!(device.groups.len(), 1);
     }
 
+    /// A trace appending to a fresh file of its own, and that file's path.
+    fn temp_trace(name: &str) -> (Trace, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "batterysight-test-{name}-{}.log",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        (Trace::to_file(file), path)
+    }
+
+    #[test]
+    fn held_back_group_is_traced_until_released() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let (trace, log) = temp_trace("held");
+        device.trace = Some(trace);
+        let path = paths.first().unwrap().clone();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 7_000);
+        // Still held at the next scan: no second line.
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 8_000);
+        let release = base + 61_000;
+        assert!(device.release_due(release));
+        device.apply_scan(Some(vec![hidpp]), release);
+        assert_eq!(device.groups.len(), 1);
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        // The reopened group's arrival ping is traced too: only the cap's lines matter here.
+        let words: Vec<Vec<&str>> = text
+            .lines()
+            .map(|line| line.split(' ').skip(1).collect::<Vec<_>>())
+            .filter(|words| matches!(words.first(), Some(&("held" | "released"))))
+            .collect();
+        assert_eq!(words.len(), 2, "{text}");
+        assert_eq!(words[0][..3], ["held", path.as_str(), "until"], "{text}");
+        let held_at: u64 = text.split(' ').next().unwrap().parse().unwrap();
+        let until: u64 = words[0][3].parse().unwrap();
+        assert_eq!(until - held_at, 54_000, "{text}");
+        assert_eq!(words[1], ["released", path.as_str()], "{text}");
+    }
+
+    #[test]
+    fn failed_discovery_is_traced() {
+        let mut device = device();
+        let (trace, log) = temp_trace("discovery");
+        device.trace = Some(trace);
+        let group = HidGroup {
+            id: GroupId(9),
+            collections: vec![Collection {
+                id: CollectionId(u32::MAX),
+                vid: 0x046D,
+                pid: 0x0ABA,
+                usage_page: 0xFF43,
+                usage: 0x0202,
+                input_len: 20,
+                output_len: 20,
+                feature_len: 0,
+                product: "PRO X Wireless Gaming Headset".into(),
+            }],
+        };
+
+        // The ping (to a collection that is not open) goes unanswered.
+        device.feed(HubInput::GroupArrived(group), 0);
+        device.feed(HubInput::Tick, 4_000);
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let words: Vec<&str> = text.trim_end().split(' ').collect();
+        assert_eq!(
+            words[1..5],
+            ["discovery", "logi-group:0ABA:9", "failed,", "retry"],
+            "{text}"
+        );
+        let at: u64 = words[0].parse().unwrap();
+        let retry_at: u64 = words[6].parse().unwrap();
+        assert_eq!(retry_at - at, 2_000, "{text}");
+    }
+
     #[test]
     fn absent_held_back_group_sets_no_deadline() {
         let (mut device, _server, hidpp, paths) = dongle_device();
@@ -1156,6 +1260,7 @@ mod tests {
             products: HashMap::new(),
             guard: ReadFailureGuard::default(),
             release_at: None,
+            held: BTreeMap::new(),
             audio: AudioActivity::default(),
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),

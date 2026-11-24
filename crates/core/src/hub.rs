@@ -40,12 +40,19 @@ pub enum HubOutput {
     },
     /// The snapshot changed during this call.
     StateChanged,
+    /// The discovery of the group with key `group` registered no device; it is retried at
+    /// `retry_at`, or not at all until the next arrival, resume or refresh (`None`).
+    DiscoveryFailed {
+        group: DeviceKey,
+        retry_at: Option<Ms>,
+    },
 }
 
 type EngineFactory = Box<dyn Fn(&HidGroup, &Catalog) -> Option<Box<dyn Engine>>>;
 
-/// A group key only ever gets its one arrival conversation, plus `Connected`
-/// grants its engine asks for (e.g. to discover a newly paired device).
+/// A group key gets its arrival conversation, `Rediscovery` grants while its engine
+/// registered no device, an arrival again on resume or refresh in that case, and the
+/// `Connected` grants its engine asks for (e.g. to discover a newly paired device).
 const GROUP_CAPS: Capabilities = Capabilities {
     pushes_battery: false,
     query_wakes: false,
@@ -273,7 +280,8 @@ impl Hub {
         }
     }
 
-    /// Asks the scheduler for `trigger` on every registered device (never group keys).
+    /// Asks the scheduler for `trigger` on every registered device, then discovers each
+    /// group whose engine registered no device again, as on its arrival.
     fn request_all(&mut self, trigger: Trigger, now: Ms, pass: &mut Pass) {
         let devices: Vec<(DeviceKey, GroupId)> = self
             .owners
@@ -286,6 +294,23 @@ impl Hub {
                 self.grant(gid, &key, trigger, now, pass);
             }
         }
+        let empty: Vec<(GroupId, DeviceKey)> = self
+            .engines
+            .iter()
+            .filter(|&(&gid, _)| !self.registers_any(gid))
+            .map(|(&gid, slot)| (gid, slot.key.clone()))
+            .collect();
+        for (gid, key) in empty {
+            if self.engines.contains_key(&gid) && !self.registers_any(gid) {
+                self.scheduler.rearm_arrival(&key);
+                self.grant(gid, &key, Trigger::Arrival, now, pass);
+            }
+        }
+    }
+
+    /// Whether `gid`'s engine is a registrant of any device.
+    fn registers_any(&self, gid: GroupId) -> bool {
+        self.owners.values().any(|groups| groups.contains(&gid))
     }
 
     /// Requests a grant on `key` and, if the scheduler allows it, hands it to `gid`'s engine.
@@ -475,6 +500,21 @@ impl Hub {
                         pass.changed = true;
                     }
                     self.grant(gid, &key, Trigger::Connected, now, pass);
+                }
+                Action::Rediscover => {
+                    if !self.registers_any(gid)
+                        && let Some(key) = self.engines.get(&gid).map(|slot| slot.key.clone())
+                    {
+                        self.grant(gid, &key, Trigger::Rediscovery, now, pass);
+                    }
+                }
+                Action::DiscoveryFailed { retry_at } => {
+                    if let Some(slot) = self.engines.get(&gid) {
+                        pass.out.push(HubOutput::DiscoveryFailed {
+                            group: slot.key.clone(),
+                            retry_at,
+                        });
+                    }
                 }
             }
         }
@@ -842,7 +882,7 @@ source = "test"
         out.iter()
             .filter_map(|o| match o {
                 HubOutput::Send { bytes, .. } => Some(bytes.clone()),
-                HubOutput::StateChanged => None,
+                HubOutput::StateChanged | HubOutput::DiscoveryFailed { .. } => None,
             })
             .collect()
     }
@@ -959,7 +999,7 @@ source = "test"
     }
 
     #[test]
-    fn resume_requests_grants_for_registered_devices_only() {
+    fn resume_and_refresh_read_registered_devices_and_rediscover_empty_groups() {
         let f = fake();
         let a = dev("dev-a");
         f.borrow_mut().on_grant.push_back(vec![register(&a, None)]);
@@ -967,13 +1007,17 @@ source = "test"
             .on_grant
             .push_back(vec![send(THIS_GRANT, coll(1), 0xD0)]);
         let idle = fake();
+        idle.borrow_mut().on_grant.push_back(Vec::new());
+        idle.borrow_mut()
+            .on_grant
+            .push_back(vec![send(THIS_GRANT, coll(2), 0xD2)]);
         let mut hub = hub(&[(1, &f), (2, &idle)]);
         hub.handle(logi(1), 0);
         hub.handle(logi(2), 0);
 
         let out = hub.handle(HubInput::Resume, 1_000);
 
-        assert_eq!(sends(&out), vec![vec![0xD0]]);
+        assert_eq!(sends(&out), vec![vec![0xD0], vec![0xD2]]);
         assert_eq!(
             grants(&f),
             vec![
@@ -981,11 +1025,111 @@ source = "test"
                 (a.clone(), Trigger::Resume)
             ]
         );
-        assert_eq!(grants(&idle), vec![(group_key(2), Trigger::Arrival)]);
+        // The group that registered nothing is discovered again, as on arrival.
+        assert_eq!(
+            grants(&idle),
+            vec![
+                (group_key(2), Trigger::Arrival),
+                (group_key(2), Trigger::Arrival)
+            ]
+        );
 
         hub.handle(HubInput::RefreshNow, 2_000);
         assert_eq!(grants(&f).last(), Some(&(a, Trigger::RefreshNow)));
-        assert_eq!(grants(&idle).len(), 1);
+        assert_eq!(grants(&f).len(), 3);
+        assert_eq!(grants(&idle).len(), 3);
+        assert_eq!(
+            grants(&idle).last(),
+            Some(&(group_key(2), Trigger::Arrival))
+        );
+    }
+
+    #[test]
+    fn rediscover_is_granted_three_times_to_a_group_without_devices() {
+        let f = fake();
+        for _ in 0..4 {
+            f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        }
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        for now in 1..=4 {
+            hub.handle(report(1), now);
+        }
+
+        let rediscovery = (group_key(1), Trigger::Rediscovery);
+        assert_eq!(
+            grants(&f),
+            vec![
+                (group_key(1), Trigger::Arrival),
+                rediscovery.clone(),
+                rediscovery.clone(),
+                rediscovery
+            ]
+        );
+
+        // A refresh starts over: one arrival grant, then three rediscoveries again.
+        hub.handle(HubInput::RefreshNow, 5);
+        for _ in 0..4 {
+            f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        }
+        for now in 6..=9 {
+            hub.handle(report(1), now);
+        }
+        let after: Vec<Trigger> = grants(&f)[4..].iter().map(|(_, t)| *t).collect();
+        assert_eq!(
+            after,
+            [
+                Trigger::Arrival,
+                Trigger::Rediscovery,
+                Trigger::Rediscovery,
+                Trigger::Rediscovery
+            ]
+        );
+    }
+
+    #[test]
+    fn rediscover_is_refused_to_a_group_with_a_registered_device() {
+        let f = fake();
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&dev("dev-a"), None)]);
+        f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        hub.handle(report(1), 1);
+
+        assert_eq!(grants(&f), vec![(group_key(1), Trigger::Arrival)]);
+    }
+
+    #[test]
+    fn discovery_failure_is_reported_with_the_group_key() {
+        let f = fake();
+        f.borrow_mut().on_report.push_back(vec![
+            Action::DiscoveryFailed {
+                retry_at: Some(2_001),
+            },
+            Action::DiscoveryFailed { retry_at: None },
+        ]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        let out = hub.handle(report(1), 1);
+
+        assert_eq!(
+            out,
+            vec![
+                HubOutput::DiscoveryFailed {
+                    group: group_key(1),
+                    retry_at: Some(2_001),
+                },
+                HubOutput::DiscoveryFailed {
+                    group: group_key(1),
+                    retry_at: None,
+                },
+            ]
+        );
     }
 
     #[test]

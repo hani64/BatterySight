@@ -190,7 +190,7 @@ fn sends(out: Vec<HubOutput>) -> Vec<(CollectionId, Vec<u8>)> {
     out.into_iter()
         .filter_map(|o| match o {
             HubOutput::Send { collection, bytes } => Some((collection, bytes)),
-            HubOutput::StateChanged => None,
+            HubOutput::StateChanged | HubOutput::DiscoveryFailed { .. } => None,
         })
         .collect()
 }
@@ -426,4 +426,16 @@ fn headset_resume() {
     );
     // 0x0F62 = 3938 mV: 80 + 5 * (3938 - 3915) / (3950 - 3915), truncated.
     check(&hub, name, &pro_x_headset(83, 3938, Presence::Online));
+}
+
+#[test]
+fn headset_stalled_discovery_is_retried() {
+    let name = "0aba-headset-stalled-discovery.txt";
+    let text = include_str!("fixtures/hidpp/0aba-headset-stalled-discovery.txt");
+    // Before the retry nothing is registered, the broadcast included.
+    let hub = replay(name, &until(text, "11 FF 06 00 0E B2 01"), headset());
+    assert!(hub.snapshot().is_empty(), "{:?}", hub.snapshot());
+    // 0x0EB2 = 3762 mV on the PRO X curve: 50 + 5 * (3762 - 3758) / (3772 - 3758), truncated.
+    let hub = replay(name, text, headset());
+    check(&hub, name, &pro_x_headset(51, 3762, Presence::Online));
 }

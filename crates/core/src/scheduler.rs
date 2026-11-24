@@ -16,6 +16,9 @@ use crate::time::Ms;
 pub enum Trigger {
     /// Device appeared (app start counts as arrival).
     Arrival,
+    /// A group's discovery registered nothing and is tried again: at most
+    /// [`REDISCOVERIES`] times after each arrival grant.
+    Rediscovery,
     /// Connect notification from the receiver/link.
     Connected,
     /// System resume.
@@ -27,6 +30,9 @@ pub enum Trigger {
     /// proves nothing about the device itself.
     Activity,
 }
+
+/// How many [`Trigger::Rediscovery`] grants a key gets after each arrival grant.
+pub const REDISCOVERIES: u8 = 3;
 
 /// What an engine declares about a registered device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +87,8 @@ struct DeviceSlot {
     caps: Capabilities,
     last_grant_ms: Option<Ms>,
     arrival_used: bool,
+    /// Rediscovery grants since the last arrival grant.
+    rediscoveries: u8,
     asleep: bool,
 }
 
@@ -121,8 +129,18 @@ impl Scheduler {
                 caps,
                 last_grant_ms: None,
                 arrival_used: false,
+                rediscoveries: 0,
                 asleep: false,
             });
+    }
+
+    /// Lets `key` have another arrival grant, and with it [`REDISCOVERIES`] more
+    /// rediscovery grants: for a group that registered no device, a resume or refresh
+    /// starts over as an arrival.
+    pub fn rearm_arrival(&mut self, key: &DeviceKey) {
+        if let Some(slot) = self.devices.get_mut(key) {
+            slot.arrival_used = false;
+        }
     }
 
     /// Forgets `key` and revokes its open grants.
@@ -141,6 +159,7 @@ impl Scheduler {
         let caps = slot.caps;
         let allowed = match trigger {
             Trigger::Arrival => !caps.query_wakes && !slot.arrival_used,
+            Trigger::Rediscovery => !caps.query_wakes && slot.rediscoveries < REDISCOVERIES,
             Trigger::Connected => !caps.query_wakes,
             Trigger::Resume | Trigger::RefreshNow => !caps.query_wakes && !slot.asleep,
             // Checked above.
@@ -153,13 +172,17 @@ impl Scheduler {
         slot.last_grant_ms = Some(now);
         // Only a push, a link-up or a successful read wakes an asleep device.
         match trigger {
-            Trigger::Arrival => slot.arrival_used = true,
+            Trigger::Arrival => {
+                slot.arrival_used = true;
+                slot.rediscoveries = 0;
+            }
+            Trigger::Rediscovery => slot.rediscoveries += 1,
             Trigger::Connected => slot.asleep = false,
             Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => {}
         }
 
         let (max_requests, duration) = match trigger {
-            Trigger::Arrival | Trigger::Connected => {
+            Trigger::Arrival | Trigger::Rediscovery | Trigger::Connected => {
                 (self.policy.discovery_budget, self.policy.discovery_ms)
             }
             Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => {
@@ -253,8 +276,9 @@ impl Scheduler {
 mod tests {
     use super::*;
 
-    const ALL_TRIGGERS: [Trigger; 5] = [
+    const ALL_TRIGGERS: [Trigger; 6] = [
         Trigger::Arrival,
+        Trigger::Rediscovery,
         Trigger::Connected,
         Trigger::Resume,
         Trigger::RefreshNow,
@@ -295,6 +319,26 @@ mod tests {
     }
 
     #[test]
+    fn rediscovery_is_granted_three_times_per_arrival() {
+        let mut s = scheduler_with(caps(false, false, 0));
+        assert!(s.request(&key(), Trigger::Arrival, 0).is_some());
+        for now in 1..=3 {
+            assert!(
+                s.request(&key(), Trigger::Rediscovery, now).is_some(),
+                "{now}"
+            );
+        }
+        assert_eq!(s.request(&key(), Trigger::Rediscovery, 4), None);
+
+        // A resume or refresh rearms the arrival, whose grant restarts the count.
+        s.rearm_arrival(&key());
+        assert_eq!(s.request(&key(), Trigger::Rediscovery, 5), None);
+        assert!(s.request(&key(), Trigger::Arrival, 6).is_some());
+        assert_eq!(s.request(&key(), Trigger::Arrival, 7), None);
+        assert!(s.request(&key(), Trigger::Rediscovery, 8).is_some());
+    }
+
+    #[test]
     fn pushing_device_ignores_activity() {
         // A gap of its own, so only the pushing rule refuses.
         let mut s = scheduler_with(caps(true, false, 300_000));
@@ -323,6 +367,7 @@ mod tests {
         let mut s = scheduler_with(caps(false, true, gap));
         for trigger in [
             Trigger::Arrival,
+            Trigger::Rediscovery,
             Trigger::Resume,
             Trigger::RefreshNow,
             Trigger::Connected,
@@ -449,7 +494,7 @@ mod tests {
         for (now, trigger) in (1_000..).zip(ALL_TRIGGERS) {
             let grant = s.request(&key(), trigger, now).unwrap();
             let (budget, duration) = match trigger {
-                Trigger::Arrival | Trigger::Connected => (96, 10_000),
+                Trigger::Arrival | Trigger::Rediscovery | Trigger::Connected => (96, 10_000),
                 Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => (4, 3_000),
             };
             assert_eq!(grant.subject, key());
@@ -460,7 +505,14 @@ mod tests {
         }
         assert_eq!(
             ids,
-            [GrantId(1), GrantId(2), GrantId(3), GrantId(4), GrantId(5)]
+            [
+                GrantId(1),
+                GrantId(2),
+                GrantId(3),
+                GrantId(4),
+                GrantId(5),
+                GrantId(6)
+            ]
         );
     }
 
