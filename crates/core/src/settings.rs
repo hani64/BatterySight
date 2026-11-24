@@ -20,6 +20,16 @@ pub enum Threshold {
     Percent(u8),
 }
 
+impl Threshold {
+    /// `self` with a percent clamped to 1..=100, the range a settings file accepts.
+    fn clamped(self) -> Threshold {
+        match self {
+            Threshold::Off => Threshold::Off,
+            Threshold::Percent(p) => Threshold::Percent(p.clamp(1, 100)),
+        }
+    }
+}
+
 /// Threshold of a device without a settings entry.
 pub const DEFAULT_THRESHOLD: Threshold = Threshold::Percent(15);
 
@@ -152,7 +162,7 @@ impl Settings {
         let _ = writeln!(out, "autostart = {}", self.autostart);
         out.push_str("\n[thresholds]\n");
         for (key, threshold) in &self.thresholds {
-            let value = match threshold {
+            let value = match threshold.clamped() {
                 Threshold::Off => quote("off"),
                 Threshold::Percent(p) => p.to_string(),
             };
@@ -200,8 +210,9 @@ impl Settings {
         }
     }
 
+    /// Sets `key`'s threshold; a percent outside 1..=100 is clamped into it.
     pub fn set_threshold(&mut self, key: &DeviceKey, threshold: Threshold) {
-        self.thresholds.insert(key.clone(), threshold);
+        self.thresholds.insert(key.clone(), threshold.clamped());
     }
 
     fn shift(&mut self, key: &DeviceKey, visible: &[DeviceKey], left: bool) {
@@ -453,5 +464,22 @@ mod tests {
         settings.set_threshold(&key("a"), Threshold::Percent(25));
         assert!(settings.hidden.is_empty());
         assert_eq!(settings.threshold(&key("a")), Threshold::Percent(25));
+    }
+
+    #[test]
+    fn thresholds_out_of_range_are_clamped_never_saved() {
+        let mut settings = Settings::default();
+        settings.set_threshold(&key("low"), Threshold::Percent(0));
+        settings.set_threshold(&key("high"), Threshold::Percent(200));
+        assert_eq!(settings.threshold(&key("low")), Threshold::Percent(1));
+        assert_eq!(settings.threshold(&key("high")), Threshold::Percent(100));
+
+        // Written directly into the map: the file still loads.
+        settings
+            .thresholds
+            .insert(key("direct"), Threshold::Percent(0));
+        let loaded = Settings::from_toml(&settings.to_toml()).unwrap();
+        assert_eq!(loaded.threshold(&key("direct")), Threshold::Percent(1));
+        assert_eq!(loaded.threshold(&key("high")), Threshold::Percent(100));
     }
 }
