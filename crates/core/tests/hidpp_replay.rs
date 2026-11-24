@@ -389,10 +389,7 @@ fn c547_superlight_arrival() {
         receiver(),
     );
     check(&hub, name, &superlight(80, Presence::Online));
-    assert_eq!(
-        hub.snapshot()[0].verification,
-        Verification::HardwareTested
-    );
+    assert_eq!(hub.snapshot()[0].verification, Verification::HardwareTested);
 }
 
 #[test]
