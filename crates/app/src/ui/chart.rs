@@ -7,8 +7,8 @@
 
 use std::time::Duration;
 
-use batterysight_core::history::Sample;
-use batterysight_core::model::{Charge, CoarseLevel, Level, Presence, Source};
+use batterysight_core::history::{Sample, provisional};
+use batterysight_core::model::{Charge, CoarseLevel, Level, Presence};
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FillRect, GetTextExtentPoint32W,
@@ -19,8 +19,6 @@ use windows::Win32::Graphics::Gdi::{
 /// Percent lines across the chart; the first, middle and last are labelled.
 const GRID: [u8; 5] = [0, 25, 50, 75, 100];
 const NO_DATA: &str = "No readings in this period";
-/// A wake reading followed this soon by an awake reading gives way to it ([`provisional`]).
-const PROVISIONAL_MS: u64 = 10 * 60 * 1000;
 
 /// What the chart shows, in unix milliseconds and percent.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -76,35 +74,6 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     plot.drawn = plot.lines.iter().flatten().any(|&(t, _)| t >= from)
         || plot.charging.iter().any(|&(_, to)| to > from);
     plot
-}
-
-/// Whether `samples[i]` is a wake reading that gives way to a later one: a level from
-/// the voltage (with millivolts) that the device pushed as it woke (the sample before it
-/// is not awake, or a session break, or there is none), followed within
-/// [`PROVISIONAL_MS`] by an awake reading that is not one too. A battery that has rested
-/// reads several points higher than in use minutes later, which would draw a spike at
-/// every wake; the reading in use stands for it. A wake reading with nothing soon after
-/// (the latest, say) is drawn.
-fn provisional(samples: &[Sample], i: usize) -> bool {
-    let woke = |i: usize| {
-        let s = &samples[i];
-        s.presence == Presence::Online
-            && s.source == Source::Push
-            && s.millivolts.is_some()
-            && s.level.is_some()
-            && i.checked_sub(1)
-                .is_none_or(|p| samples[p].presence != Presence::Online || samples[p].is_break())
-    };
-    if !woke(i) {
-        return false;
-    }
-    let at = samples[i].at_unix_ms;
-    samples
-        .iter()
-        .enumerate()
-        .skip(i + 1)
-        .take_while(|(_, s)| s.at_unix_ms - at <= PROVISIONAL_MS)
-        .any(|(j, s)| s.presence == Presence::Online && s.level.is_some() && !woke(j))
 }
 
 /// Where a level is drawn, in percent; a coarse level at a fixed height in its band.
