@@ -16,6 +16,9 @@ use crate::model::{Charge, CoarseLevel, DeviceKey, DeviceState, Level, Presence,
 pub const RECORD_EVERY_MS: u64 = 30 * 60 * 1000;
 /// Samples are kept this long (30 days).
 pub const KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// [`read`] keeps samples dated up to this long after now (1 day: a clock corrected back
+/// a little, or one a few hours off for a while); later ones it drops.
+pub const FUTURE_SLACK_MS: u64 = 24 * 60 * 60 * 1000;
 /// A time-left estimate needs a discharge span at least this long (2 h)…
 const MIN_SPAN_MS: u64 = 2 * 60 * 60 * 1000;
 /// …with at least this many samples.
@@ -100,7 +103,7 @@ impl Sample {
 
     /// The sample of a [`Sample::to_line`] line; `None` unless it has exactly its fields,
     /// each with a value `to_line` writes (so a torn line, or one that ran on into the
-    /// next, is rejected).
+    /// next, is rejected). A percentage above 100 is rejected too.
     pub fn parse(line: &str) -> Option<Sample> {
         let mut fields = line.split('\t');
         let mut next = || fields.next();
@@ -109,7 +112,8 @@ impl Sample {
         let level = match next()? {
             NONE => None,
             text => Some(match number(text) {
-                Some(p) => Level::Percent(p),
+                Some(p) if p <= 100 => Level::Percent(p),
+                Some(_) => return None,
                 None => Level::Coarse(value(&COARSE, text)?),
             }),
         };
@@ -264,20 +268,52 @@ impl Recorder {
     }
 }
 
-/// The samples of `text` (a `history.tsv`) taken at or after `since_unix_ms`, in file
-/// order, and whether the file holds anything else: older samples, malformed or torn
-/// lines, or a last line without its line break. Rewriting it from the samples drops
-/// those.
-pub fn read(text: &str, since_unix_ms: u64) -> (Vec<Sample>, bool) {
-    let mut dirty = !text.is_empty() && !text.ends_with('\n');
-    let mut kept = Vec::new();
-    for line in text.lines() {
+/// What [`read`] makes of a `history.tsv`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Parsed {
+    /// The samples kept, in file order.
+    pub samples: Vec<Sample>,
+    /// Whether the file holds anything else, which rewriting it from `samples` drops:
+    /// samples older than [`KEEP_MS`], `suspect` lines, or a last line without its line
+    /// break (torn by a crash, for one).
+    pub dirty: bool,
+    /// Whether what is dropped includes complete lines that are not merely old: lines
+    /// that do not parse (a later version's format, or an append that ran on after a
+    /// torn line) or samples dated more than [`FUTURE_SLACK_MS`] after now. Such a file
+    /// is worth a copy before the rewrite.
+    pub suspect: bool,
+}
+
+/// The samples of `text` (a `history.tsv`) from the [`KEEP_MS`] before `now_unix_ms` to
+/// [`FUTURE_SLACK_MS`] after it, and what else the file holds.
+pub fn read(text: &str, now_unix_ms: u64) -> Parsed {
+    let since = now_unix_ms.saturating_sub(KEEP_MS);
+    let until = now_unix_ms.saturating_add(FUTURE_SLACK_MS);
+    let mut parsed = Parsed {
+        samples: Vec::new(),
+        dirty: false,
+        suspect: false,
+    };
+    for chunk in text.split_inclusive('\n') {
+        let (line, complete) = match chunk.strip_suffix('\n') {
+            Some(line) => (line.strip_suffix('\r').unwrap_or(line), true),
+            None => (chunk, false),
+        };
+        parsed.dirty |= !complete;
         match Sample::parse(line) {
-            Some(s) if s.at_unix_ms >= since_unix_ms => kept.push(s),
-            _ => dirty = true,
+            Some(s) if s.at_unix_ms < since => parsed.dirty = true,
+            Some(s) if s.at_unix_ms > until => {
+                parsed.dirty = true;
+                parsed.suspect = true;
+            }
+            Some(s) => parsed.samples.push(s),
+            None => {
+                parsed.dirty = true;
+                parsed.suspect |= complete;
+            }
         }
     }
-    (kept, dirty)
+    parsed
 }
 
 /// Adds `samples` to `history` (each device's samples in time order) and drops every
@@ -459,6 +495,8 @@ mod tests {
             format!("{good}\textra"),
             good.replace("\tquery", ""),
             good.replace("\t80\t", "\t101x\t"),
+            good.replace("\t80\t", "\t101\t"),
+            good.replace("\t80\t", "\t255\t"),
             good.replace("\t80\t", "\t+80\t"),
             good.replace("discharging", "draining"),
             good.replace("online", "Online"),
@@ -477,9 +515,11 @@ mod tests {
         // The last append stopped half-way: no line break, missing fields.
         let torn = &lines[2][..lines[2].len() / 2];
         let text = format!("{}\n{}\n{torn}", lines[0], lines[1]);
-        let (kept, dirty) = read(&text, 0);
-        assert_eq!(kept, [sample(T0, 90), sample(T0 + HOUR, 90)]);
-        assert!(dirty, "the torn line is to be dropped from the file");
+        let now = T0 + 2 * HOUR;
+        let parsed = read(&text, now);
+        assert_eq!(parsed.samples, [sample(T0, 90), sample(T0 + HOUR, 90)]);
+        assert!(parsed.dirty, "the torn line is to be dropped from the file");
+        assert!(!parsed.suspect, "a torn last line is no reason for a copy");
 
         // The next append ran on after it: the merged line is rejected whole.
         for cut in [3, 15, lines[2].len() - 1] {
@@ -489,12 +529,31 @@ mod tests {
 
         // A clean file within the window has nothing to drop.
         let clean = format!("{}\n{}\n", lines[0], lines[1]);
-        assert_eq!(
-            read(&clean, 0),
-            (vec![sample(T0, 90), sample(T0 + HOUR, 90)], false)
-        );
-        // Older samples are dropped.
-        assert_eq!(read(&clean, T0 + 1), (vec![sample(T0 + HOUR, 90)], true));
+        let parsed = read(&clean, now);
+        assert_eq!(parsed.samples, [sample(T0, 90), sample(T0 + HOUR, 90)]);
+        assert!(!parsed.dirty);
+        // Older samples are dropped, without a copy.
+        let parsed = read(&clean, T0 + KEEP_MS + 1);
+        assert_eq!(parsed.samples, [sample(T0 + HOUR, 90)]);
+        assert!(parsed.dirty && !parsed.suspect);
+    }
+
+    #[test]
+    fn unparseable_or_future_lines_are_suspect() {
+        let now = T0;
+        let good = sample(now, 90).to_line();
+        // A complete line that does not parse.
+        let parsed = read(&format!("{good}\nfrom a later version\n"), now);
+        assert_eq!(parsed.samples, [sample(now, 90)]);
+        assert!(parsed.dirty && parsed.suspect);
+        // Up to a day ahead is kept; later is dropped.
+        let ahead = sample(now + FUTURE_SLACK_MS, 80);
+        let future = sample(now + FUTURE_SLACK_MS + 1, 70);
+        let parsed = read(&format!("{}\n{}\n", ahead.to_line(), future.to_line()), now);
+        assert_eq!(parsed.samples, std::slice::from_ref(&ahead));
+        assert!(parsed.dirty && parsed.suspect);
+        let parsed = read(&format!("{}\n", ahead.to_line()), now);
+        assert!(!parsed.dirty && !parsed.suspect);
     }
 
     #[test]
