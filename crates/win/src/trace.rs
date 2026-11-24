@@ -7,9 +7,9 @@
 //! adds `"<unix ms> audio <container hex> active|idle"` when a device's audio sessions start
 //! or stop (`"<unix ms> audio unavailable <stage>"` when they cannot be watched), the UI
 //! adds `"<unix ms> ui <text>"` lines ([`ui_line`]) and the settings and history store
-//! `"<unix ms> store <text>"` lines when a file cannot be read or written. Tracing only
-//! records what the runtime already does, so it adds no device traffic, and it never fails
-//! the app: an unwritable file just means no trace.
+//! `"<unix ms> store <text>"` lines when a file cannot be read or written or is set aside.
+//! Tracing only records what the runtime already does, so it adds no device traffic, and
+//! it never fails the app: an unwritable file just means no trace.
 
 use std::env;
 use std::ffi::OsStr;

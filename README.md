@@ -4,7 +4,7 @@ BatterySight is a free, open-source (GPLv3) Windows app that shows the battery l
 
 ## Status
 
-Milestone 1: Logitech devices that speak HID++ only. The goal is to cover wireless mice, keyboards, headsets and controllers of other vendors too; none is supported yet.
+Milestone 2: Logitech devices that speak HID++ only. The goal is to cover wireless mice, keyboards, headsets and controllers of other vendors too; none is supported yet.
 
 Tested on the maintainer's hardware (Windows 11 build 26300 only); the levels shown matched G HUB's within 1 point (BatterySight rounds down):
 
@@ -31,11 +31,11 @@ Otherwise it only listens. Opening the menu never queries; it shows the last kno
 
 ## Privacy
 
-BatterySight collects no telemetry. Its only network call is the update check (arriving in milestone 4).
+BatterySight collects no telemetry and makes no network calls; an update check is not yet available.
 
-Settings and battery history live in `%LOCALAPPDATA%\BatterySight` (`settings.toml`, `history.tsv`) and contain device ids, such as unit ids, as keys; they stay on your PC. `history.tsv` holds one line per sample (time, device key, level, charging state, awake/asleep/offline, millivolts when known, where the reading came from); a line with no level, `unknown`, `offline` and `os` marks time around it that was not observed: before it when BatterySight starts or the PC wakes up, after it when the PC goes to sleep. Samples older than 30 days are removed when BatterySight starts.
+Settings and battery history live in `%LOCALAPPDATA%\BatterySight` (`settings.toml`, `history.tsv`) and contain device ids, such as unit ids, as keys; they stay on your PC. `history.tsv` holds one line per sample (time, device key, level, charging state, awake/asleep/offline, millivolts when known, where the reading came from); a line with no level, `unknown`, `offline` and `os` marks time around it that was not observed: before it when BatterySight starts or the PC wakes up, after it when the PC goes to sleep. Samples older than 30 days and lines it cannot read are removed when BatterySight starts; if that would remove complete lines it cannot read, or samples dated more than a day ahead, the file is first copied to `history.tsv.bad`.
 
-For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it write every HID++ frame it sends and receives to `%LOCALAPPDATA%\BatterySight\sends.log`, along with when audio starts and stops on a device or cannot be watched (`audio` lines) and why it switched to tray icons (`ui fallback` lines). Tracing is off by default. The frames include device unit ids and other serial-like values, so review the file before sharing it.
+For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it append to `%LOCALAPPDATA%\BatterySight\sends.log`: every HID++ frame it sends and receives, when audio starts and stops on a device or cannot be watched (`audio` lines), why it switched to tray icons (`ui fallback` lines), why "Start with Windows" could not be changed (`ui autostart not changed` lines), and when the settings or history file cannot be read or written or is set aside (`store` lines). Tracing is off by default. These lines may contain device ids (unit ids, audio container ids and other serial-like values), so review the file before sharing it.
 
 ## Usage
 

@@ -275,10 +275,13 @@ fn view(
         DeviceKind::Other => '\u{E83F}',
     };
     let connected = s.presence != Presence::Offline;
-    let low = match (s.level, threshold) {
-        (Some(Level::Percent(p)), Threshold::Percent(t)) => connected && p <= t,
-        _ => false,
-    };
+    let low = connected
+        && match (s.level, threshold) {
+            (Some(Level::Percent(p)), Threshold::Percent(t)) => p <= t,
+            // As for alerts: a coarse low or critical is at any threshold.
+            (Some(Level::Coarse(c)), Threshold::Percent(_)) => c <= CoarseLevel::Low,
+            _ => false,
+        };
     let text = if connected {
         s.level.map_or_else(|| "?".to_owned(), level_text)
     } else {
@@ -946,10 +949,11 @@ impl Ui {
         };
         // SAFETY: our own window and timer (killing one that is not set fails harmlessly).
         let _ = unsafe { KillTimer(Some(self.host), SELF_RETRY_TIMER) };
-        start_widget_checks(self.host);
         self.tray_reason = None;
-        // Dropping the tray removes its icons.
+        // Dropping the tray removes its icons, before the watchdog is armed: a hung
+        // Explorer stalls those calls, not the widget.
         self.set_surface(Surface::Widgets(widgets));
+        start_widget_checks(self.host);
         true
     }
 
@@ -965,10 +969,10 @@ impl Ui {
         self.self_retry = None;
         match Widgets::new(&self.views, self.light, &self.settings.monitors) {
             Ok(widgets) => {
-                start_widget_checks(self.host);
                 self.tray_reason = None;
-                // Dropping the tray removes its icons.
+                // Dropping the tray removes its icons, before the watchdog is armed.
                 self.set_surface(Surface::Widgets(widgets));
+                start_widget_checks(self.host);
             }
             Err(_) => {
                 self.tray_reason = Some(TrayReason::CreateFailed);
@@ -1498,6 +1502,31 @@ mod tests {
         let v = shown(&[percent("A", 25), percent("C", 15)], &Settings::default());
         assert!(!v[0].low);
         assert!(v[1].low);
+    }
+
+    #[test]
+    fn coarse_low_and_critical_are_low() {
+        let coarse =
+            |name: &str, c: CoarseLevel| state(name, DeviceKind::Headset, Some(Level::Coarse(c)));
+        let states = [
+            coarse("C", CoarseLevel::Critical),
+            coarse("L", CoarseLevel::Low),
+            coarse("G", CoarseLevel::Good),
+            coarse("F", CoarseLevel::Full),
+        ];
+        assert_eq!(
+            all(&states).iter().map(|v| v.low).collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        // Off is never low; neither is a disconnected device.
+        let mut settings = Settings::default();
+        settings.set_threshold(&DeviceKey("L".into()), Threshold::Off);
+        let off = DeviceState {
+            presence: Presence::Offline,
+            ..coarse("C", CoarseLevel::Critical)
+        };
+        let v = shown(&[coarse("L", CoarseLevel::Low), off], &settings);
+        assert!(!v[0].low && !v[1].low);
     }
 
     #[test]

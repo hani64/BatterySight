@@ -9,7 +9,9 @@
 //! whole file again. An existing settings file is never replaced unless it was read and
 //! parsed: otherwise the first save sets it aside as `settings.toml.bad`. History lines are
 //! appended without flushing to disk; the history is rewritten only at startup, to drop
-//! what is older than 30 days or cannot be read (such as a line torn by a crash).
+//! what is older than 30 days or cannot be read (such as a line torn by a crash). A
+//! rewrite that would drop lines that do not parse or are dated in the future first copies
+//! the file to `history.tsv.bad`.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +24,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use batterysight_core::history::{self, KEEP_MS, Sample};
+use batterysight_core::history::{self, Sample};
 use batterysight_core::settings::Settings;
 
 use crate::trace;
@@ -33,6 +35,8 @@ const SETTINGS_BAD: &str = "settings.toml.bad";
 /// A save in progress, renamed over [`SETTINGS`] once complete.
 const SETTINGS_TMP: &str = "settings.toml.tmp";
 const HISTORY: &str = "history.tsv";
+/// A copy of the history taken before a rewrite drops more than old samples.
+const HISTORY_BAD: &str = "history.tsv.bad";
 /// A rewrite of the history in progress, renamed over [`HISTORY`] once complete.
 const HISTORY_TMP: &str = "history.tsv.tmp";
 
@@ -138,11 +142,12 @@ impl Store {
         let _ = self.jobs.send(Job::Append(line));
     }
 
-    /// The samples of `history.tsv` from the 30 days before `now_unix_ms`, in file order;
-    /// lines that do not parse (torn by a crash, for one) are skipped. If the file holds
-    /// anything else, the writer rewrites it without that before any later append. Empty
-    /// when there is no file or it cannot be read (then it is left as it is). Blocks on the
-    /// disk like [`Store::load_settings`]: call it once at startup, before any window exists.
+    /// The samples of `history.tsv` from the 30 days before `now_unix_ms` (and up to a day
+    /// after it), in file order; lines that do not parse (torn by a crash, for one) are
+    /// skipped. If the file holds anything else, the writer rewrites it without that before
+    /// any later append. Empty when there is no file or it cannot be read (then it is left
+    /// as it is). Blocks on the disk like [`Store::load_settings`]: call it once at startup,
+    /// before any window exists.
     pub fn load_history(&self, now_unix_ms: u64) -> Vec<Sample> {
         let Some(root) = &self.root else {
             return Vec::new();
@@ -156,13 +161,12 @@ impl Store {
                 return Vec::new();
             }
         };
-        let since = now_unix_ms.saturating_sub(KEEP_MS);
-        let (samples, dirty) = history::read(&String::from_utf8_lossy(&bytes), since);
-        if dirty {
+        let parsed = history::read(&String::from_utf8_lossy(&bytes), now_unix_ms);
+        if parsed.dirty {
             let root = root.clone();
-            self.run(Box::new(move || prune_history(&root, since)));
+            self.run(Box::new(move || prune_history(&root, now_unix_ms)));
         }
-        samples
+        parsed.samples
     }
 
     /// Queues `job` (other blocking work, such as a registry write) on the writer thread.
@@ -275,15 +279,18 @@ fn save(root: &Path, settings: &Settings, keep_existing: &AtomicBool) -> io::Res
 /// Writes `bytes` to `tmp`, flushes it to disk and renames it over `path`, so `path` holds
 /// either its old or its new content.
 fn replace(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
-    let written = File::create(tmp).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    let result = written.and_then(|()| fs::rename(tmp, path));
+    let result = write_synced(tmp, bytes).and_then(|()| fs::rename(tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(tmp);
     }
     result
+}
+
+/// Creates or truncates `path`, writes `bytes` and flushes them to disk.
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn append(root: &Path, text: &str) -> io::Result<()> {
@@ -295,17 +302,23 @@ fn append(root: &Path, text: &str) -> io::Result<()> {
         .write_all(text.as_bytes())
 }
 
-/// Rewrites `history.tsv` with only its samples from `since_unix_ms` on (read again here,
-/// on the writer thread), if it holds anything else. A failure is traced; the file is then
+/// Rewrites `history.tsv` with only its samples kept by [`history::read`] at
+/// `now_unix_ms` (read again here, on the writer thread), if it holds anything else. If
+/// that drops lines that do not parse or are dated in the future, the file is first copied
+/// to `history.tsv.bad` (replacing an older copy). A failure is traced; the file is then
 /// left as it is.
-fn prune_history(root: &Path, since_unix_ms: u64) {
+fn prune_history(root: &Path, now_unix_ms: u64) {
     let path = root.join(HISTORY);
     let result = fs::read(&path).and_then(|bytes| {
-        let (samples, dirty) = history::read(&String::from_utf8_lossy(&bytes), since_unix_ms);
-        if !dirty {
+        let parsed = history::read(&String::from_utf8_lossy(&bytes), now_unix_ms);
+        if !parsed.dirty {
             return Ok(());
         }
-        let text: String = samples.iter().map(|s| s.to_line() + "\n").collect();
+        if parsed.suspect {
+            write_synced(&root.join(HISTORY_BAD), &bytes)?;
+            trace::store_line("history set aside as history.tsv.bad");
+        }
+        let text: String = parsed.samples.iter().map(|s| s.to_line() + "\n").collect();
         replace(&path, &root.join(HISTORY_TMP), text.as_bytes())
     });
     if let Err(e) = result {
@@ -664,6 +677,63 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&file).unwrap(), text);
         assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn unparseable_history_is_set_aside_before_the_prune() {
+        let dir = TempDir::new();
+        let file = dir.path().join("history.tsv");
+        let bad = dir.path().join("history.tsv.bad");
+        fs::write(&bad, "an older copy").unwrap();
+        let kept = sample(NOW - 1_000, 80);
+        let text = format!("{}from a later version\n", lines(&[&kept]));
+        fs::write(&file, &text).unwrap();
+        let store = open(&dir);
+        assert_eq!(store.load_history(NOW), std::slice::from_ref(&kept));
+        store.stop();
+
+        assert_eq!(fs::read_to_string(&bad).unwrap(), text);
+        assert_eq!(fs::read_to_string(&file).unwrap(), lines(&[&kept]));
+    }
+
+    #[test]
+    fn future_history_is_set_aside_before_the_prune() {
+        let dir = TempDir::new();
+        let file = dir.path().join("history.tsv");
+        // Within a day ahead is kept (a clock corrected back a little).
+        let ahead = sample(NOW + 60 * 60 * 1000, 80);
+        let future = sample(NOW + 2 * 24 * 60 * 60 * 1000, 70);
+        let text = lines(&[&ahead, &future]);
+        fs::write(&file, &text).unwrap();
+        let store = open(&dir);
+        assert_eq!(store.load_history(NOW), std::slice::from_ref(&ahead));
+        store.stop();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("history.tsv.bad")).unwrap(),
+            text
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), lines(&[&ahead]));
+    }
+
+    #[test]
+    fn old_samples_and_a_torn_last_line_are_pruned_without_a_copy() {
+        let dir = TempDir::new();
+        let file = dir.path().join("history.tsv");
+        let kept = sample(NOW - 1_000, 80);
+        let torn = sample(NOW - 500, 79).to_line();
+        let text = format!(
+            "{}{}",
+            lines(&[&sample(NOW - KEEP_MS - 1, 95), &kept]),
+            &torn[..torn.len() / 2]
+        );
+        fs::write(&file, &text).unwrap();
+        let store = open(&dir);
+        assert_eq!(store.load_history(NOW), std::slice::from_ref(&kept));
+        store.stop();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), lines(&[&kept]));
+        assert!(!dir.path().join("history.tsv.bad").exists());
     }
 
     #[test]
