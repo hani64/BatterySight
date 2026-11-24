@@ -35,8 +35,8 @@ pub struct Capabilities {
     pub pushes_battery: bool,
     /// A query wakes the device: only observed activity may justify one.
     pub query_wakes: bool,
-    /// Minimum time since the last granted request (any trigger) before an `Activity`
-    /// grant; the other triggers ignore it.
+    /// Minimum time since the last granted request (any trigger) or noted read
+    /// ([`Scheduler::note_read`]) before an `Activity` grant; the other triggers ignore it.
     pub min_query_gap_ms: Ms,
 }
 
@@ -132,22 +132,20 @@ impl Scheduler {
 
     /// Grants permission to query `key` for `trigger`, or `None` if any rule refuses it.
     pub fn request(&mut self, key: &DeviceKey, trigger: Trigger, now: Ms) -> Option<Grant> {
+        // A clock that went backwards counts as no time passed.
+        if trigger == Trigger::Activity && self.activity_ready_at(key).is_none_or(|at| now < at) {
+            return None;
+        }
         let slot = self.devices.get_mut(key)?;
         let caps = slot.caps;
         let allowed = match trigger {
             Trigger::Arrival => !caps.query_wakes && !slot.arrival_used,
             Trigger::Connected => !caps.query_wakes,
             Trigger::Resume | Trigger::RefreshNow => !caps.query_wakes && !slot.asleep,
-            Trigger::Activity => !caps.pushes_battery && !slot.asleep,
+            // Checked above.
+            Trigger::Activity => true,
         };
         if !allowed {
-            return None;
-        }
-        // A clock that went backwards counts as no time passed.
-        if trigger == Trigger::Activity
-            && let Some(last) = slot.last_grant_ms
-            && now.saturating_sub(last) < caps.min_query_gap_ms
-        {
             return None;
         }
 
@@ -222,6 +220,29 @@ impl Scheduler {
 
     pub fn is_asleep(&self, key: &DeviceKey) -> bool {
         self.devices.get(key).is_some_and(|slot| slot.asleep)
+    }
+
+    /// When `key` may next get an [`Trigger::Activity`] grant: `min_query_gap_ms` after its
+    /// last grant or read (at once without one). `None` while no activity can justify a
+    /// query: the device is unknown, pushes its battery or is asleep.
+    pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
+        let slot = self.devices.get(key)?;
+        if slot.caps.pushes_battery || slot.asleep {
+            return None;
+        }
+        let gap = slot.caps.min_query_gap_ms;
+        Some(
+            slot.last_grant_ms
+                .map_or(0, |last| last.saturating_add(gap)),
+        )
+    }
+
+    /// `key` was read without a grant of its own (its discovery's first battery read): the
+    /// activity gap counts from `now`, unless a later grant already restarted it.
+    pub fn note_read(&mut self, key: &DeviceKey, now: Ms) {
+        if let Some(slot) = self.devices.get_mut(key) {
+            slot.last_grant_ms = Some(slot.last_grant_ms.map_or(now, |last| last.max(now)));
+        }
     }
 }
 
@@ -354,6 +375,35 @@ mod tests {
             assert_eq!(granted, !asleep, "asleep = {asleep}");
             assert_eq!(s.is_asleep(&key()), asleep);
         }
+    }
+
+    #[test]
+    fn activity_ready_at_mirrors_the_activity_rules() {
+        let mut s = scheduler_with(caps(false, false, 300_000));
+        assert_eq!(s.activity_ready_at(&key()), Some(0));
+        assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(301_000));
+        assert_eq!(s.request(&key(), Trigger::Activity, 300_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 301_000).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(601_000));
+
+        s.mark_asleep(&key());
+        assert_eq!(s.activity_ready_at(&key()), None, "asleep");
+        let pushing = scheduler_with(caps(true, false, 0));
+        assert_eq!(pushing.activity_ready_at(&key()), None, "pushes");
+        let empty = Scheduler::new(Policy::default());
+        assert_eq!(empty.activity_ready_at(&key()), None, "unknown");
+    }
+
+    #[test]
+    fn a_read_outside_a_grant_restarts_the_activity_gap() {
+        let mut s = scheduler_with(caps(false, false, 300_000));
+        s.note_read(&key(), 1_000);
+        assert_eq!(s.request(&key(), Trigger::Activity, 300_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 301_000).is_some());
+        // An older read does not move the clock back.
+        s.note_read(&key(), 5);
+        assert_eq!(s.activity_ready_at(&key()), Some(601_000));
     }
 
     #[test]

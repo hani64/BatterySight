@@ -5,7 +5,8 @@
 //! is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
 //! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread, which also
 //! adds `"<unix ms> audio <container hex> active|idle"` when a device's audio sessions start
-//! or stop, and the UI adds `"<unix ms> ui <text>"` lines ([`ui_line`]). Tracing only
+//! or stop (`"<unix ms> audio unavailable <stage>"` when they cannot be watched), and the UI
+//! adds `"<unix ms> ui <text>"` lines ([`ui_line`]). Tracing only
 //! records what the runtime already does, so it adds no device traffic, and it never fails
 //! the app: an unwritable file just means no trace.
 
@@ -51,6 +52,14 @@ impl Trace {
     /// Appends an audio activity change of `container`; write errors are ignored.
     pub(crate) fn audio(&mut self, container: &ContainerId, active: bool) {
         let mut text = audio_text(unix_ms(), container, active);
+        text.push('\n');
+        let _ = self.0.write_all(text.as_bytes());
+    }
+
+    /// Appends that audio activity is not (fully) watched because `stage` failed; write
+    /// errors are ignored.
+    pub(crate) fn audio_unavailable(&mut self, stage: &str) {
+        let mut text = audio_unavailable_text(unix_ms(), stage);
         text.push('\n');
         let _ = self.0.write_all(text.as_bytes());
     }
@@ -108,6 +117,11 @@ fn audio_text(unix_ms: u64, container: &ContainerId, active: bool) -> String {
     format!("{unix_ms} audio {} {state}", container_hex(container))
 }
 
+/// `"<unix ms> audio unavailable <stage>"`.
+fn audio_unavailable_text(unix_ms: u64, stage: &str) -> String {
+    format!("{unix_ms} audio unavailable {stage}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +172,14 @@ mod tests {
         assert_eq!(
             audio_text(10, &container, false),
             "10 audio AB000000000000000000000000000001 idle"
+        );
+    }
+
+    #[test]
+    fn audio_unavailable_line_names_the_stage() {
+        assert_eq!(
+            audio_unavailable_text(11, "endpoints"),
+            "11 audio unavailable endpoints"
         );
     }
 }

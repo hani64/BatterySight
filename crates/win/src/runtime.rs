@@ -6,9 +6,10 @@
 //!
 //! While audio plays to a physical device (its container has an active audio session and a
 //! peak level above zero), the device thread hands the hub an activity input for each of
-//! that device's registered devices at most every [`ACTIVITY_GAP_MS`]; the scheduler decides
-//! whether it becomes a read. Without an active session it sets no deadline for this, so a
-//! silent PC never wakes the thread.
+//! that device's registered devices as soon as the scheduler would grant one (for the PRO X
+//! Wireless, 5 minutes after its last read). Devices the scheduler would refuse (asleep, or
+//! pushing their battery) are not metered. Without an active session it sets no deadline
+//! for this, so a silent PC never wakes the thread.
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -19,7 +20,6 @@ use std::time::Duration;
 
 use batterysight_core::catalog::Catalog;
 use batterysight_core::engines;
-use batterysight_core::engines::hidpp::engine::ACTIVITY_GAP_MS;
 use batterysight_core::hid::{CollectionId, GroupId, HidGroup};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
 use batterysight_core::model::{DeviceKey, DeviceState};
@@ -143,9 +143,14 @@ fn device_thread(
         }
     };
     let _ = ready.send(Ok(reactor.poster()));
-    // Without it (no thread could be started) no device is read on audio activity; every
-    // other trigger still works.
-    let _audio = audio::start(reactor.poster()).ok();
+    // Without it no device is read on audio activity; every other trigger still works.
+    let _audio = audio::start(reactor.poster())
+        .inspect_err(|_| {
+            reactor
+                .poster()
+                .post(OsEvent::AudioUnavailable { stage: "thread" });
+        })
+        .ok();
     Device {
         hub: Hub::new(Catalog::builtin(), Policy::default()),
         reactor,
@@ -205,24 +210,40 @@ struct Device {
 struct AudioActivity {
     /// Containers whose render endpoints have an active audio session.
     active: BTreeSet<ContainerId>,
-    /// When each device was last handed an activity input.
-    last: HashMap<DeviceKey, Ms>,
     /// Active containers found silent, and when to look at them again.
-    silent_until: HashMap<ContainerId, Ms>,
+    silent: HashMap<ContainerId, Silence>,
+}
+
+/// An active container found silent at its last check.
+struct Silence {
+    /// When to look at it again.
+    until: Ms,
+    /// How long it waits after that check; doubles up to [`SILENT_RECHECK_MAX_MS`].
+    wait: Ms,
 }
 
 impl AudioActivity {
-    /// Records whether `container` has an active audio session as of `now`.
-    fn set(&mut self, container: ContainerId, active: bool, now: Ms) {
+    /// Records whether `container` has an active audio session.
+    fn set(&mut self, container: ContainerId, active: bool) {
         if active {
             self.active.insert(container);
         } else {
             self.active.remove(&container);
-            self.silent_until.remove(&container);
-            // An input older than the gap no longer holds the next one back.
-            self.last
-                .retain(|_, &mut at| now.saturating_sub(at) < ACTIVITY_GAP_MS);
+            self.silent.remove(&container);
         }
+    }
+
+    /// `container` was silent at `now`: looked at again [`SILENT_RECHECK_MS`] later, twice
+    /// as late after each further silent check, at most [`SILENT_RECHECK_MAX_MS`] later.
+    fn silent_at(&mut self, container: ContainerId, now: Ms) {
+        let wait = self
+            .silent
+            .get(&container)
+            .map_or(SILENT_RECHECK_MS, |silence| {
+                silence.wait.saturating_mul(2).min(SILENT_RECHECK_MAX_MS)
+            });
+        let until = now.saturating_add(wait);
+        self.silent.insert(container, Silence { until, wait });
     }
 }
 
@@ -323,7 +344,13 @@ impl Device {
                 if let Some(trace) = &mut self.trace {
                     trace.audio(&container, active);
                 }
-                self.audio.set(container, active, now_ms());
+                self.audio.set(container, active);
+                false
+            }
+            OsEvent::AudioUnavailable { stage } => {
+                if let Some(trace) = &mut self.trace {
+                    trace.audio_unavailable(stage);
+                }
                 false
             }
             OsEvent::WriteFailed { .. } | OsEvent::Wake => false,
@@ -359,63 +386,77 @@ impl Device {
     }
 
     /// Every registered device of an opened group whose container has an active audio
-    /// session, with that container.
-    fn activity_candidates(&self) -> Vec<(ContainerId, DeviceKey)> {
+    /// session and that the scheduler could grant an activity read, with that container and
+    /// when the scheduler could grant it ([`Hub::activity_ready_at`]).
+    fn activity_candidates(&self) -> Vec<(ContainerId, DeviceKey, Ms)> {
         let mut candidates = Vec::new();
         if self.audio.active.is_empty() {
             return candidates;
         }
         for group in &self.groups {
-            if let Some(container) = group.container
-                && self.audio.active.contains(&container)
-            {
-                let keys = self.hub.keys_of(group.id);
-                candidates.extend(keys.into_iter().map(|key| (container, key)));
+            let Some(container) = group.container else {
+                continue;
+            };
+            if !self.audio.active.contains(&container) {
+                continue;
+            }
+            for key in self.hub.keys_of(group.id) {
+                if let Some(ready) = self.hub.activity_ready_at(&key) {
+                    candidates.push((container, key, ready));
+                }
             }
         }
         candidates
     }
 
-    /// When `key`, a device of `container`, may next be checked for activity:
-    /// [`ACTIVITY_GAP_MS`] after its last activity input, and not while its container is
-    /// known to be silent.
-    fn activity_check_at(&self, container: &ContainerId, key: &DeviceKey) -> Ms {
-        let after_gap = self
+    /// When a device of `container` that the scheduler could grant at `ready` may next be
+    /// checked: not while its container is known to be silent.
+    fn activity_check_at(&self, container: &ContainerId, ready: Ms) -> Ms {
+        let silent_until = self
             .audio
-            .last
-            .get(key)
-            .map_or(0, |&last| last.saturating_add(ACTIVITY_GAP_MS));
-        let after_silence = self.audio.silent_until.get(container).copied();
-        after_gap.max(after_silence.unwrap_or(0))
+            .silent
+            .get(container)
+            .map(|silence| silence.until);
+        ready.max(silent_until.unwrap_or(0))
     }
 
-    /// When an activity check is next due. `None` while no opened device's container has an
-    /// active audio session: silence never wakes the device thread.
+    /// When an activity check is next due. `None` while no device the scheduler could grant
+    /// an activity read has an active audio session: silence, an asleep device or one that
+    /// pushes its battery never wakes the device thread.
     fn activity_deadline(&self) -> Option<Ms> {
         self.activity_candidates()
             .iter()
-            .map(|(container, key)| self.activity_check_at(container, key))
+            .map(|(container, _, ready)| self.activity_check_at(container, *ready))
             .min()
     }
 
-    /// Hands [`HubInput::Activity`] to each device whose check is due at `now` and whose
-    /// container plays something by `peak`, read once per container. A container found
-    /// silent is looked at again [`SILENT_RECHECK_MS`] later.
+    /// Reads the `peak` of each container with a device due at `now`, once, and hands
+    /// [`HubInput::Activity`] to its due devices if it plays something. A silent container
+    /// is looked at again later ([`AudioActivity::silent_at`]); an audible one starts over.
     fn check_activity(&mut self, now: Ms, peak: impl Fn(&ContainerId) -> Option<f32>) {
-        let mut peaks: HashMap<ContainerId, Option<f32>> = HashMap::new();
-        for (container, key) in self.activity_candidates() {
-            if now < self.activity_check_at(&container, &key) {
-                continue;
-            }
-            let level = *peaks.entry(container).or_insert_with(|| peak(&container));
-            let last = self.audio.last.get(&key).copied();
-            if activity_due(last, now, self.audio.active.contains(&container), level) {
-                self.audio.silent_until.remove(&container);
-                self.audio.last.insert(key.clone(), now);
-                self.feed(HubInput::Activity(key), now);
+        let due: Vec<(ContainerId, DeviceKey)> = self
+            .activity_candidates()
+            .into_iter()
+            .filter(|(container, _, ready)| now >= self.activity_check_at(container, *ready))
+            .map(|(container, key, _)| (container, key))
+            .collect();
+        let mut containers: Vec<ContainerId> =
+            due.iter().map(|(container, _)| *container).collect();
+        containers.sort_unstable();
+        containers.dedup();
+        for container in containers {
+            let level = peak(&container);
+            if level.is_some_and(|level| level > 0.0) {
+                self.audio.silent.remove(&container);
             } else {
-                let recheck = now.saturating_add(SILENT_RECHECK_MS);
-                self.audio.silent_until.insert(container, recheck);
+                self.audio.silent_at(container, now);
+            }
+            for (_, key) in due.iter().filter(|(of, _)| *of == container) {
+                // An earlier input of this pass may have changed what the scheduler allows.
+                let ready = self.hub.activity_ready_at(key);
+                if activity_due(ready, now, self.audio.active.contains(&container), level) {
+                    self.feed(HubInput::Activity(key.clone()), now);
+                }
             }
         }
     }
@@ -558,18 +599,20 @@ fn unmatched(sets: &[&PathSet], others: &[&PathSet]) -> Vec<usize> {
         .collect()
 }
 
-/// How long an active container found silent waits before it is looked at again: a pause
-/// between two tracks must not cost a whole [`ACTIVITY_GAP_MS`].
+/// How long an active container found silent first waits before it is looked at again: a
+/// pause between two tracks must not cost a whole activity gap.
 const SILENT_RECHECK_MS: Ms = 15_000;
+
+/// The longest wait between two looks at an active but silent container, such as one whose
+/// session a paused app or a voice chat keeps open: the PRO X Wireless activity gap.
+const SILENT_RECHECK_MAX_MS: Ms = 300_000;
 
 /// Whether a device may be handed an activity input at `now`: its container has an active
 /// audio session (`active`), its endpoints play something (`peak` above zero, `None` when
-/// they cannot be metered) and [`ACTIVITY_GAP_MS`] passed since its `last` input. A clock
-/// that went back counts as no time passed.
-fn activity_due(last: Option<Ms>, now: Ms, active: bool, peak: Option<f32>) -> bool {
-    active
-        && peak.is_some_and(|level| level > 0.0)
-        && last.is_none_or(|last| now.saturating_sub(last) >= ACTIVITY_GAP_MS)
+/// they cannot be metered) and the scheduler would grant it (`ready_at` reached; `None`
+/// while it refuses any, the device being asleep or pushing its battery).
+fn activity_due(ready_at: Option<Ms>, now: Ms, active: bool, peak: Option<f32>) -> bool {
+    active && peak.is_some_and(|level| level > 0.0) && ready_at.is_some_and(|at| now >= at)
 }
 
 /// What to do with a group whose read just failed.
@@ -732,7 +775,7 @@ mod tests {
 
     use batterysight_core::engine::{Action, Engine};
     use batterysight_core::hid::Collection;
-    use batterysight_core::model::{DeviceUpdate, Source};
+    use batterysight_core::model::{DeviceUpdate, Presence, Source};
     use batterysight_core::scheduler::{Capabilities, Grant, Trigger};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 
@@ -1185,23 +1228,28 @@ mod tests {
     }
 
     #[test]
-    fn activity_due_needs_audible_audio_and_the_gap() {
-        assert!(!activity_due(None, 0, false, Some(0.2)), "inactive");
-        assert!(!activity_due(None, 0, true, Some(0.0)), "silent");
-        assert!(!activity_due(None, 0, true, None), "no meter");
-        assert!(activity_due(None, 0, true, Some(0.2)));
-        assert!(!activity_due(Some(0), 299_999, true, Some(0.2)));
-        assert!(activity_due(Some(0), 300_000, true, Some(0.2)));
+    fn activity_due_needs_audible_audio_and_a_ready_device() {
+        assert!(!activity_due(Some(0), 0, false, Some(0.2)), "inactive");
+        assert!(!activity_due(Some(0), 0, true, Some(0.0)), "silent");
+        assert!(!activity_due(Some(0), 0, true, None), "no meter");
         assert!(
-            !activity_due(Some(10), 5, true, Some(0.2)),
-            "a clock that went back"
+            !activity_due(None, 0, true, Some(0.2)),
+            "refused: asleep or pushes"
         );
+        assert!(activity_due(Some(0), 0, true, Some(0.2)));
+        assert!(!activity_due(Some(300_000), 299_999, true, Some(0.2)));
+        assert!(activity_due(Some(300_000), 300_000, true, Some(0.2)));
     }
 
-    /// Registers `key` with `caps` on its arrival grant and records every grant's trigger.
+    /// The activity gap the fake headset registers with.
+    const GAP: Ms = 300_000;
+
+    /// Registers `key` with `caps` and `presence` on its arrival grant and records every
+    /// grant's trigger.
     struct Registering {
         key: DeviceKey,
         caps: Capabilities,
+        presence: Option<Presence>,
         grants: Rc<RefCell<Vec<Trigger>>>,
     }
 
@@ -1226,7 +1274,7 @@ mod tests {
                     level: None,
                     millivolts: None,
                     charge: None,
-                    presence: None,
+                    presence: self.presence,
                     source: Source::Query,
                 },
                 wpid: None,
@@ -1246,33 +1294,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn audio_activity_reads_audible_devices_that_do_not_push() {
-        let headset_grants: Rc<RefCell<Vec<Trigger>>> = Rc::default();
-        let mouse_grants: Rc<RefCell<Vec<Trigger>>> = Rc::default();
+    const HEADSET: ContainerId = [1; 16];
+    const MOUSE: ContainerId = [2; 16];
+
+    type Grants = Rc<RefCell<Vec<Trigger>>>;
+
+    /// A device with a headset (group 1, read on activity, registered with
+    /// `headset_presence`) and a mouse that pushes its battery (group 2), each in its own
+    /// container, both registered at 0 with audio playing to both; and their grant logs.
+    fn audio_device(headset_presence: Option<Presence>) -> (Device, Grants, Grants) {
+        let headset_grants: Grants = Rc::default();
+        let mouse_grants: Grants = Rc::default();
         let (h, m) = (Rc::clone(&headset_grants), Rc::clone(&mouse_grants));
         let mut device = device();
         device.hub = Hub::new(Catalog::builtin(), Policy::default()).with_engine_factory(Box::new(
             move |group, _| {
-                let (key, pushes_battery, grants) = if group.id == GroupId(1) {
-                    ("headset", false, &h)
-                } else {
-                    ("mouse", true, &m)
-                };
+                let headset = group.id == GroupId(1);
                 let caps = Capabilities {
-                    pushes_battery,
+                    pushes_battery: !headset,
                     query_wakes: false,
-                    min_query_gap_ms: if pushes_battery { 0 } else { ACTIVITY_GAP_MS },
+                    min_query_gap_ms: if headset { GAP } else { 0 },
                 };
                 Some(Box::new(Registering {
-                    key: DeviceKey(key.into()),
+                    key: DeviceKey(if headset { "headset" } else { "mouse" }.into()),
                     caps,
-                    grants: Rc::clone(grants),
+                    presence: if headset { headset_presence } else { None },
+                    grants: Rc::clone(if headset { &h } else { &m }),
                 }) as Box<dyn Engine>)
             },
         ));
-        let (headset, mouse) = ([1u8; 16], [2u8; 16]);
-        for (id, container) in [(1, headset), (2, mouse)] {
+        for (id, container) in [(1, HEADSET), (2, MOUSE)] {
             device.groups.push(Opened {
                 id: GroupId(id),
                 paths: set(&[&id.to_string()]),
@@ -1286,33 +1337,57 @@ mod tests {
             device.feed(HubInput::GroupArrived(group), 0);
         }
         assert_eq!(device.deadline(), None, "silence sets no deadline");
-
-        // Audio starts on both; a device that pushes its battery is never read for it.
-        for container in [headset, mouse] {
+        for container in [HEADSET, MOUSE] {
             let active = OsEvent::AudioActive {
                 container,
                 active: true,
             };
             assert!(!device.on_event(active));
         }
-        assert_eq!(device.deadline(), Some(0), "due at once");
-        let t = 1_000_000;
-        device.check_activity(t, |_| Some(0.0));
-        let quiet_end = t + SILENT_RECHECK_MS;
-        assert_eq!(device.deadline(), Some(quiet_end), "silent: look again");
-        device.check_activity(quiet_end, |_| Some(0.4));
+        (device, headset_grants, mouse_grants)
+    }
+
+    /// A peak meter for the headset's container only: the mouse is never a candidate.
+    fn headset_peak(level: f32) -> impl Fn(&ContainerId) -> Option<f32> {
+        move |container| {
+            assert_eq!(
+                *container, HEADSET,
+                "metered a container no read can follow"
+            );
+            Some(level)
+        }
+    }
+
+    #[test]
+    fn audio_activity_reads_audible_devices_that_do_not_push() {
+        let (mut device, headset_grants, mouse_grants) = audio_device(None);
+        // Registration read the battery: audio already playing waits the gap.
+        assert_eq!(device.deadline(), Some(GAP));
+        device.check_activity(GAP - 1, |_| panic!("checked before the gap"));
+
+        // Silent: looked at again after 15 s, doubling up to 5 min.
+        let mut at = GAP;
+        for wait in [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000] {
+            device.check_activity(at, headset_peak(0.0));
+            at += wait;
+            assert_eq!(device.deadline(), Some(at), "after a silent check");
+        }
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
+
+        device.check_activity(at, headset_peak(0.4));
         assert_eq!(
             *headset_grants.borrow(),
             [Trigger::Arrival, Trigger::Activity]
         );
         assert_eq!(*mouse_grants.borrow(), [Trigger::Arrival]);
+        assert_eq!(device.deadline(), Some(at + GAP));
 
-        let next = quiet_end + ACTIVITY_GAP_MS;
-        assert_eq!(device.deadline(), Some(next));
-        device.check_activity(next - 1, |_| panic!("checked before the gap"));
+        // An audible check reset the back-off.
+        device.check_activity(at + GAP, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(at + GAP + 15_000));
 
         // Audio stops: nothing wakes the device thread any more.
-        for container in [headset, mouse] {
+        for container in [HEADSET, MOUSE] {
             let idle = OsEvent::AudioActive {
                 container,
                 active: false,
@@ -1320,5 +1395,30 @@ mod tests {
             assert!(!device.on_event(idle));
         }
         assert_eq!(device.deadline(), None);
+    }
+
+    #[test]
+    fn going_idle_resets_the_silence_back_off() {
+        let (mut device, _, _) = audio_device(None);
+        device.check_activity(GAP, headset_peak(0.0));
+        device.check_activity(GAP + 15_000, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(GAP + 45_000));
+        for active in [false, true] {
+            let event = OsEvent::AudioActive {
+                container: HEADSET,
+                active,
+            };
+            device.on_event(event);
+        }
+        device.check_activity(GAP + 50_000, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(GAP + 65_000));
+    }
+
+    #[test]
+    fn asleep_device_sets_no_activity_deadline() {
+        let (mut device, headset_grants, _) = audio_device(Some(Presence::Asleep));
+        assert_eq!(device.deadline(), None);
+        device.check_activity(10 * GAP, |_| panic!("metered for an asleep device"));
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
     }
 }

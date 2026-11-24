@@ -48,9 +48,15 @@ const INSTANCE_ID_LEN: usize = 201;
 /// shared by its HID interfaces and its audio endpoints. The GUID's bytes in text order.
 pub type ContainerId = [u8; 16];
 
-/// `guid` as a [`ContainerId`].
-pub(crate) fn container_id(guid: &GUID) -> ContainerId {
-    guid.to_u128().to_be_bytes()
+/// The container Windows gives every non-removable device
+/// (`{00000000-0000-0000-FFFF-FFFFFFFFFFFF}`): shared by unrelated devices, so it
+/// identifies none of them.
+const SYSTEM_CONTAINER: u128 = 0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF;
+
+/// `guid` as a [`ContainerId`]; `None` for the shared system container.
+pub(crate) fn container_id(guid: &GUID) -> Option<ContainerId> {
+    let id = guid.to_u128();
+    (id != SYSTEM_CONTAINER).then(|| id.to_be_bytes())
 }
 
 /// `container` as 32 uppercase hex digits, in the GUID's text order without dashes.
@@ -317,7 +323,10 @@ fn container(path: &[u16]) -> Option<ContainerId> {
             0,
         )
     };
-    (status == CR_SUCCESS && kind == DEVPROP_TYPE_GUID).then(|| container_id(&guid))
+    if status != CR_SUCCESS || kind != DEVPROP_TYPE_GUID {
+        return None;
+    }
+    container_id(&guid)
 }
 
 /// The product string of the interface at `path`, or an empty string on any failure.
@@ -509,10 +518,18 @@ mod tests {
     #[test]
     fn container_id_keeps_the_guid_text_order() {
         let guid = GUID::from_u128(0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
-        let id = container_id(&guid);
+        let id = container_id(&guid).unwrap();
         assert_eq!(id[0], 0x00);
         assert_eq!(id[15], 0xFF);
         assert_eq!(container_hex(&id), "00112233445566778899AABBCCDDEEFF");
+    }
+
+    #[test]
+    fn system_container_is_no_container() {
+        // Every non-removable device shares it: onboard speakers must not count as a
+        // headset's audio.
+        let system = GUID::from_u128(0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF);
+        assert_eq!(container_id(&system), None);
     }
 
     /// Manual hardware check: `cargo test -p batterysight-win -- --ignored --nocapture`.
