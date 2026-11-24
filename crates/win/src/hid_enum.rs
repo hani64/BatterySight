@@ -2,27 +2,35 @@
 //!
 //! Interfaces are opened with access 0 and shared read/write, only long enough to read
 //! attributes and capabilities, which the HID class driver serves without a request to the
-//! device. No reports are read or written here. [`product_string`] is the one request to a
-//! device; the runtime calls it only for collections an engine reads.
+//! device; container ids come from Configuration Manager. No reports are read or written
+//! here. [`product_string`] is the one request to a device; the runtime calls it only for
+//! collections an engine reads.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
-    CM_Get_Device_Interface_ListW, CR_BUFFER_SMALL, CR_SUCCESS,
+    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_DevNode_PropertyW,
+    CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW,
+    CM_Get_Device_Interface_PropertyW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
+    CR_BUFFER_SMALL, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
     GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData,
     HidD_GetAttributes, HidD_GetPreparsedData, HidD_GetProductString, HidP_GetCaps,
     PHIDP_PREPARSED_DATA,
 };
+use windows::Win32::Devices::Properties::{
+    DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId, DEVPROP_TYPE_GUID, DEVPROP_TYPE_STRING,
+    DEVPROPTYPE,
+};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::core::PCWSTR;
+use windows::core::{GUID, PCWSTR};
 
 static NEXT_COLLECTION_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_GROUP_ID: AtomicU32 = AtomicU32::new(1);
@@ -33,12 +41,35 @@ const LIST_ATTEMPTS: usize = 4;
 /// Product string buffer in UTF-16 units: USB allows 126 characters plus the NUL.
 const PRODUCT_LEN: usize = 128;
 
+/// Device instance id buffer in UTF-16 units: `MAX_DEVICE_ID_LEN` (200) plus the NUL.
+const INSTANCE_ID_LEN: usize = 201;
+
+/// A Plug and Play container id (`DEVPKEY_Device_ContainerId`): one per physical device,
+/// shared by its HID interfaces and its audio endpoints. The GUID's bytes in text order.
+pub type ContainerId = [u8; 16];
+
+/// `guid` as a [`ContainerId`].
+pub(crate) fn container_id(guid: &GUID) -> ContainerId {
+    guid.to_u128().to_be_bytes()
+}
+
+/// `container` as 32 uppercase hex digits, in the GUID's text order without dashes.
+pub(crate) fn container_hex(container: &ContainerId) -> String {
+    let mut hex = String::with_capacity(2 * container.len());
+    for byte in container {
+        let _ = write!(hex, "{byte:02X}");
+    }
+    hex
+}
+
 /// One HID top-level collection found on the system.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HidInterface {
     /// UTF-16 device interface path including the trailing NUL, ready for `CreateFileW`.
     pub path: Vec<u16>,
     pub collection: Collection,
+    /// Container id of the interface's device node; `None` when it cannot be read.
+    pub container: Option<ContainerId>,
 }
 
 /// Lists the present HID interfaces in the order Configuration Manager returns them, or
@@ -219,6 +250,7 @@ fn query(path: &[u16]) -> Option<HidInterface> {
         return None;
     }
 
+    let container = container(&wide);
     Some(HidInterface {
         path: wide,
         collection: Collection {
@@ -232,7 +264,60 @@ fn query(path: &[u16]) -> Option<HidInterface> {
             feature_len: caps.FeatureReportByteLength,
             product: String::new(),
         },
+        container,
     })
+}
+
+/// The container id of the device node behind the interface at `path` (NUL-terminated),
+/// from Configuration Manager, or `None` when it cannot be read.
+fn container(path: &[u16]) -> Option<ContainerId> {
+    let mut instance = [0u16; INSTANCE_ID_LEN];
+    let mut kind = DEVPROPTYPE::default();
+    // The last unit is left out, so the id stays NUL-terminated whatever is written.
+    let mut size = (size_of_val(&instance) - size_of::<u16>()) as u32;
+    // SAFETY: `path` is NUL-terminated; `instance` is writable for the `size` bytes passed.
+    let status = unsafe {
+        CM_Get_Device_Interface_PropertyW(
+            PCWSTR(path.as_ptr()),
+            &DEVPKEY_Device_InstanceId,
+            &mut kind,
+            Some(instance.as_mut_ptr().cast()),
+            &mut size,
+            0,
+        )
+    };
+    if status != CR_SUCCESS || kind != DEVPROP_TYPE_STRING {
+        return None;
+    }
+
+    let mut node = 0u32;
+    // SAFETY: `node` is a valid out pointer; `instance` ends in a NUL the property read
+    // could not overwrite.
+    let status = unsafe {
+        CM_Locate_DevNodeW(
+            &mut node,
+            PCWSTR(instance.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    if status != CR_SUCCESS {
+        return None;
+    }
+
+    let mut guid = GUID::zeroed();
+    let mut size = size_of::<GUID>() as u32;
+    // SAFETY: `guid` is writable for the `size` bytes passed.
+    let status = unsafe {
+        CM_Get_DevNode_PropertyW(
+            node,
+            &DEVPKEY_Device_ContainerId,
+            &mut kind,
+            Some((&raw mut guid).cast()),
+            &mut size,
+            0,
+        )
+    };
+    (status == CR_SUCCESS && kind == DEVPROP_TYPE_GUID).then(|| container_id(&guid))
 }
 
 /// The product string of the interface at `path`, or an empty string on any failure.
@@ -314,6 +399,7 @@ mod tests {
                 feature_len: 0,
                 product: String::new(),
             },
+            container: None,
         }
     }
 
@@ -420,6 +506,15 @@ mod tests {
         assert!(group(Vec::new()).is_empty());
     }
 
+    #[test]
+    fn container_id_keeps_the_guid_text_order() {
+        let guid = GUID::from_u128(0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
+        let id = container_id(&guid);
+        assert_eq!(id[0], 0x00);
+        assert_eq!(id[15], 0xFF);
+        assert_eq!(container_hex(&id), "00112233445566778899AABBCCDDEEFF");
+    }
+
     /// Manual hardware check: `cargo test -p batterysight-win -- --ignored --nocapture`.
     #[test]
     #[ignore = "reads the HID devices of this machine"]
@@ -428,7 +523,7 @@ mod tests {
             for member in &members {
                 let c = &member.collection;
                 println!(
-                    "group {:>3}  {:04X}:{:04X}  {:04X}:{:04X}  in {:>3} out {:>3} feat {:>3}  {:?}  {}",
+                    "group {:>3}  {:04X}:{:04X}  {:04X}:{:04X}  in {:>3} out {:>3} feat {:>3}  {:?}  {}  container {}",
                     hid_group.id.0,
                     c.vid,
                     c.pid,
@@ -439,6 +534,7 @@ mod tests {
                     c.feature_len,
                     product_string(&member.path),
                     physical_key(&path_string(&member.path)),
+                    member.container.as_ref().map_or("-".into(), container_hex),
                 );
             }
         }

@@ -1,11 +1,13 @@
-//! Opt-in log of every report the runtime sends and reads, and of UI events.
+//! Opt-in log of every report the runtime sends and reads, of audio activity and of UI
+//! events.
 //!
 //! With `BATTERYSIGHT_TRACE=1`, each write the reactor started and each input report read
 //! is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
-//! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread, and the UI
-//! adds `"<unix ms> ui <text>"` lines ([`ui_line`]). Tracing only records frames the hub
-//! already exchanges, so it adds no device traffic, and it never fails the app: an
-//! unwritable file just means no trace.
+//! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread, which also
+//! adds `"<unix ms> audio <container hex> active|idle"` when a device's audio sessions start
+//! or stop, and the UI adds `"<unix ms> ui <text>"` lines ([`ui_line`]). Tracing only
+//! records what the runtime already does, so it adds no device traffic, and it never fails
+//! the app: an unwritable file just means no trace.
 
 use std::env;
 use std::ffi::OsStr;
@@ -16,6 +18,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use batterysight_core::hid::CollectionId;
+
+use crate::hid_enum::{ContainerId, container_hex};
 
 /// The open trace file: the device thread's, held for the runtime's life, or one opened
 /// for a single [`ui_line`].
@@ -40,6 +44,13 @@ impl Trace {
     /// Appends one frame; write errors are ignored.
     pub(crate) fn record(&mut self, direction: Direction, collection: CollectionId, bytes: &[u8]) {
         let mut text = line(unix_ms(), direction, collection, bytes);
+        text.push('\n');
+        let _ = self.0.write_all(text.as_bytes());
+    }
+
+    /// Appends an audio activity change of `container`; write errors are ignored.
+    pub(crate) fn audio(&mut self, container: &ContainerId, active: bool) {
+        let mut text = audio_text(unix_ms(), container, active);
         text.push('\n');
         let _ = self.0.write_all(text.as_bytes());
     }
@@ -91,6 +102,12 @@ fn ui_text(unix_ms: u64, text: &str) -> String {
     format!("{unix_ms} ui {text}")
 }
 
+/// `"<unix ms> audio <container hex> active|idle"`.
+fn audio_text(unix_ms: u64, container: &ContainerId, active: bool) -> String {
+    let state = if active { "active" } else { "idle" };
+    format!("{unix_ms} audio {} {state}", container_hex(container))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +143,21 @@ mod tests {
         assert_eq!(
             ui_text(1_763_900_000_123, "fallback NoAnchor"),
             "1763900000123 ui fallback NoAnchor"
+        );
+    }
+
+    #[test]
+    fn audio_line_has_time_container_and_state() {
+        let mut container = [0u8; 16];
+        container[0] = 0xAB;
+        container[15] = 0x01;
+        assert_eq!(
+            audio_text(9, &container, true),
+            "9 audio AB000000000000000000000000000001 active"
+        );
+        assert_eq!(
+            audio_text(10, &container, false),
+            "10 audio AB000000000000000000000000000001 idle"
         );
     }
 }

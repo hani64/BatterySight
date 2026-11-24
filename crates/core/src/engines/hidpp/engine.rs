@@ -40,6 +40,10 @@ const RECEIVER_TIMEOUT_MS: u32 = 1_000;
 /// may take over a second to wake (owner trace 2026-11-23: 443 to 1 288 ms).
 /// Source: Solaar `base.py` `_DEVICE_REQUEST_TIMEOUT` / `_PING_TIMEOUT` (4 s).
 pub const DEVICE_TIMEOUT_MS: u32 = 4_000;
+/// Least time between two activity reads of a device whose catalog entry has
+/// `no_in_use_push`: a headset's level moves about a point in 8 minutes of use (owner
+/// observation: ~5 points in 43 min), so 5 minutes keeps it current with few requests.
+pub const ACTIVITY_GAP_MS: Ms = 300_000;
 /// HID++ 1.0 sub ids from 0x80 up are register access and errors, never a feature reply.
 const FIRST_REGISTER_SUB_ID: u8 = 0x80;
 
@@ -135,6 +139,8 @@ pub struct HidppEngine {
     fallback_kind: DeviceKind,
     curve: VoltageCurve,
     query_wakes: bool,
+    /// The catalog entry's `no_in_use_push`: the device is read on activity instead.
+    no_in_use_push: bool,
     devices: BTreeMap<u8, Device>,
     in_flight: BTreeMap<u8, InFlight>,
     /// Indices whose link came up while unknown: discovered on the next group grant.
@@ -229,6 +235,7 @@ impl HidppEngine {
             fallback_kind,
             curve,
             query_wakes: quirks.is_some_and(|q| q.query_wakes),
+            no_in_use_push: quirks.is_some_and(|q| q.no_in_use_push),
             devices: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             pending: BTreeSet::new(),
@@ -437,9 +444,13 @@ impl HidppEngine {
         actions.push(Action::Register {
             key,
             caps: Capabilities {
-                pushes_battery: true,
+                pushes_battery: !self.no_in_use_push,
                 query_wakes: self.query_wakes,
-                min_query_gap_ms: 0,
+                min_query_gap_ms: if self.no_in_use_push {
+                    ACTIVITY_GAP_MS
+                } else {
+                    0
+                },
             },
             initial,
             wpid: self.wpids.get(&index).copied(),
@@ -1281,6 +1292,34 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 ..pushing()
             }
         );
+    }
+
+    #[test]
+    fn no_in_use_push_device_accepts_activity() {
+        let (mut e, a) = headset_with(&Catalog::builtin());
+        let [Action::Register { caps, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(
+            *caps,
+            Capabilities {
+                pushes_battery: false,
+                query_wakes: false,
+                min_query_gap_ms: 300_000,
+            }
+        );
+
+        // An activity grant reads the battery once, like a refresh.
+        let a = e.on_grant(&grant(6, &headset_key(), Trigger::Activity), 100);
+        assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x08, 0x0B])]);
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 110);
+        let [Action::Update(update)] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(update.presence, Some(Presence::Online));
+        assert_eq!(update.source, Source::Query);
+        assert_eq!(update.millivolts, Some(3_828));
+        assert_eq!(e.next_deadline(), None);
     }
 
     #[test]
