@@ -481,8 +481,9 @@ impl SteelseriesEngine {
                 } else {
                     station_status_charge(state)?
                 };
+                // Unknown charge alone cannot establish presence, but may update it.
                 if self.link == Some(Link::DOWN)
-                    || (self.link.is_none() && charge == Charge::Unknown)
+                    || (self.link.is_none() && !self.registered && charge == Charge::Unknown)
                 {
                     return None;
                 }

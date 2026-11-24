@@ -921,6 +921,32 @@ fn steelseries_station_unknown_push_charge_never_rearms_the_radio_edge() {
 }
 
 #[test]
+fn steelseries_station_passive_b7_updates_an_existing_reading_without_radio_evidence() {
+    // HeadsetControl PR #584: Omni can interleave 07 B7 reports with B0 replies.
+    let mut hub = hub();
+    let group = steelseries_group(0x2290, 3, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 5_000), Some((1, 64)));
+
+    let unknown = [7, 0xB7, 79, 0, 1];
+    let charging = [7, 0xB7, 80, 0, 2];
+    assert!(steelseries_input(&mut hub, OTHER, &unknown, 5_001).is_empty());
+    assert!(hub.snapshot().is_empty());
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &charging, 5_002), None);
+    steelseries_state(&hub, Presence::Online, Some(80), Charge::Charging);
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &unknown, 5_003), None);
+    steelseries_state(&hub, Presence::Online, Some(79), Charge::Unknown);
+
+    let up = [7, 0xB5, 0, 0, 8];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &up, 5_004), None);
+    let down = [7, 0xB5, 0, 0, 4];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &down, 5_005), None);
+    assert!(steelseries_input(&mut hub, OTHER, &charging, 5_006).is_empty());
+    assert!(steelseries_input(&mut hub, OTHER, &unknown, 5_007).is_empty());
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+}
+
+#[test]
 fn steelseries_station_b0_reports_link_up_even_when_charge_is_unknown() {
     let mut hub = hub();
     let group = steelseries_group(0x2290, 3, 64);
