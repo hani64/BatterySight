@@ -1,28 +1,43 @@
 //! Built-in protocol engines.
 
 pub mod hidpp;
+pub mod rapoo;
 
 use crate::catalog::{Catalog, CollectionSelector, DeviceEntry, EngineKind};
+use crate::engine::Engine;
 use crate::hid::{Collection, CollectionId, CollectionRole, GroupId, HidGroup};
 use crate::model::DeviceKey;
 
 use hidpp::HidppEngine;
+use rapoo::RapooEngine;
 
 /// A resolved protocol and its collection roles. An open failure never reselects an entry
 /// or promotes another collection to the command role.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     group: GroupId,
-    kind: EngineKind,
     direct: Option<usize>,
-    receive: Vec<CollectionId>,
-    command: CollectionId,
-    report_id: u8,
+    roles: Roles,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Roles {
+    Hidpp {
+        receive: Vec<CollectionId>,
+        command: CollectionId,
+        report_id: u8,
+    },
+    Rapoo {
+        receive: CollectionId,
+    },
 }
 
 impl Selection {
     pub fn reads(&self, id: CollectionId) -> bool {
-        self.receive.contains(&id)
+        match &self.roles {
+            Roles::Hidpp { receive, .. } => receive.contains(&id),
+            Roles::Rapoo { receive } => id == *receive,
+        }
     }
 
     pub fn opens(&self, id: CollectionId) -> bool {
@@ -30,11 +45,14 @@ impl Selection {
     }
 
     pub fn sends(&self, id: CollectionId) -> bool {
-        id == self.command
+        matches!(self.roles, Roles::Hidpp { command, .. } if id == command)
     }
 
     pub fn kind(&self) -> EngineKind {
-        self.kind
+        match self.roles {
+            Roles::Hidpp { .. } => EngineKind::Hidpp,
+            Roles::Rapoo { .. } => EngineKind::Rapoo,
+        }
     }
 
     /// The selected entry's stable index within the hub's immutable catalog, if direct.
@@ -42,39 +60,66 @@ impl Selection {
         self.direct
     }
 
-    /// The report ID used to frame commands for this selection.
-    pub fn command_report_id(&self) -> u8 {
-        self.report_id
+    /// The report ID used to frame commands, if this selection sends any.
+    pub fn command_report_id(&self) -> Option<u8> {
+        match self.roles {
+            Roles::Hidpp { report_id, .. } => Some(report_id),
+            Roles::Rapoo { .. } => None,
+        }
     }
 
     pub(crate) fn send_role(&self, id: CollectionId) -> Option<CollectionRole> {
-        if !self.sends(id) {
-            return None;
-        }
-        Some(match self.kind {
-            EngineKind::Hidpp => hidpp::engine::COMMAND_ROLE,
-        })
+        self.sends(id).then_some(hidpp::engine::COMMAND_ROLE)
     }
 
     pub fn ready(&self, group: &HidGroup) -> bool {
         group.id == self.group
-            && group.collections.iter().any(|c| c.id == self.command)
-            && group.collections.iter().any(|c| self.reads(c.id))
+            && match &self.roles {
+                Roles::Hidpp {
+                    receive, command, ..
+                } => {
+                    group.collections.iter().any(|c| c.id == *command)
+                        && group.collections.iter().any(|c| receive.contains(&c.id))
+                }
+                Roles::Rapoo { receive } => group.collections.iter().any(|c| c.id == *receive),
+            }
+    }
+
+    pub(crate) fn engine(&self, group: &HidGroup, catalog: &Catalog) -> Option<Box<dyn Engine>> {
+        match self.roles {
+            Roles::Hidpp { .. } => Some(Box::new(self.hidpp(group, catalog)?)),
+            Roles::Rapoo { receive } => {
+                if group.id != self.group {
+                    return None;
+                }
+                let entry = catalog.devices().get(self.direct?)?;
+                let rx = group.collections.iter().find(|c| c.id == receive)?;
+                Some(Box::new(RapooEngine::from_selection(group.id, rx, entry)?))
+            }
+        }
     }
 
     pub(crate) fn hidpp(&self, group: &HidGroup, catalog: &Catalog) -> Option<HidppEngine> {
         if !self.ready(group) {
             return None;
         }
-        let out = group.collections.iter().find(|c| c.id == self.command)?;
+        let Roles::Hidpp {
+            receive,
+            command,
+            report_id,
+        } = &self.roles
+        else {
+            return None;
+        };
+        let out = group.collections.iter().find(|c| c.id == *command)?;
         let quirks = self
             .direct
             .and_then(|index| catalog.devices().get(index))
             .map(|d| &d.quirks);
         Some(HidppEngine::from_selection(
             group,
-            (self.report_id, out),
-            &self.receive,
+            (*report_id, out),
+            receive,
             quirks,
         ))
     }
@@ -105,17 +150,13 @@ pub(crate) fn select_with(
     catalog: &Catalog,
     mut product: impl FnMut(usize, &CollectionSelector) -> Option<bool>,
 ) -> Option<Selection> {
-    let first = group.collections.first()?;
-    let (vid, pid) = (first.vid, first.pid);
-    if group.collections.iter().any(|c| (c.vid, c.pid) != (vid, pid)) {
-        return None;
-    }
+    let (vid, pid) = usb_ids(group)?;
 
     let mut direct = catalog.direct_entries(vid, pid).peekable();
     if direct.peek().is_some() {
         let mut selected = None;
         for (index, entry) in direct {
-            match match_roles(group, entry.engine, Some((index, entry)), &mut product) {
+            match match_roles(group, Some((index, entry)), &mut product) {
                 Match::Absent => {}
                 Match::Denied => return None,
                 Match::Unique(candidate) => {
@@ -130,40 +171,62 @@ pub(crate) fn select_with(
         return selected;
     }
 
-    let family = catalog.family(vid, EngineKind::Hidpp)?;
-    match match_roles(group, family.engine, None, &mut product) {
+    catalog.family(vid, EngineKind::Hidpp)?;
+    match match_roles(group, None, &mut product) {
         Match::Unique(selection) => Some(selection),
         Match::Absent | Match::Denied => None,
     }
 }
 
-enum Match {
+fn usb_ids(group: &HidGroup) -> Option<(u16, u16)> {
+    let first = group.collections.first()?;
+    let ids = (first.vid, first.pid);
+    group
+        .collections
+        .iter()
+        .all(|c| (c.vid, c.pid) == ids)
+        .then_some(ids)
+}
+
+enum Match<T> {
     Absent,
     /// A plausible entry whose identity or explicit collection role is not unique.
     Denied,
-    Unique(Selection),
+    Unique(T),
 }
 
 fn match_roles(
     group: &HidGroup,
-    kind: EngineKind,
     direct: Option<(usize, &DeviceEntry)>,
     product: &mut impl FnMut(usize, &CollectionSelector) -> Option<bool>,
-) -> Match {
+) -> Match<Selection> {
+    if let Some((index, entry)) = direct
+        && entry.engine == EngineKind::Rapoo
+    {
+        return match RapooEngine::match_receive(group, entry, product) {
+            Match::Unique(rx) => Match::Unique(Selection {
+                group: group.id,
+                direct: Some(index),
+                roles: Roles::Rapoo { receive: rx.id },
+            }),
+            Match::Absent => Match::Absent,
+            Match::Denied => Match::Denied,
+        };
+    }
+
     let receive = direct.and_then(|(_, entry)| entry.receive.as_ref());
     let send = direct.and_then(|(_, entry)| entry.send.as_ref());
     let eligible = |c: &Collection, selector: Option<&CollectionSelector>| {
         selector.is_none_or(|selector| selector.matches_descriptor(c))
     };
-    let report = |c: &Collection| match kind {
-        EngineKind::Hidpp => HidppEngine::command_report(c),
-    };
+    let report = HidppEngine::command_report;
     let rx = |c: &Collection| {
         // Explicit receive roles may be on an input-only interface. The ungated Logitech
         // family keeps its original collection recognition for both widths.
-        let compatible = match kind {
-            EngineKind::Hidpp if receive.is_some() => HidppEngine::receives(c),
-            EngineKind::Hidpp => report(c).is_some(),
+        let compatible = if receive.is_some() {
+            HidppEngine::receives(c)
+        } else {
+            report(c).is_some()
         };
         compatible && eligible(c, receive)
     };
@@ -217,18 +280,19 @@ fn match_roles(
     }
     Match::Unique(Selection {
         group: group.id,
-        kind,
         direct: direct.map(|(index, _)| index),
-        receive: receiving,
-        command,
-        report_id,
+        roles: Roles::Hidpp {
+            receive: receiving,
+            command,
+            report_id,
+        },
     })
 }
 
 /// Whether two devices present at once can be registered under the same `key`: a key an
 /// engine builds without a serial or unit id. The hub tells such devices apart.
 pub fn shared_key(key: &DeviceKey) -> bool {
-    HidppEngine::is_fallback_key(key)
+    HidppEngine::is_fallback_key(key) || RapooEngine::is_fallback_key(key)
 }
 
 #[cfg(test)]

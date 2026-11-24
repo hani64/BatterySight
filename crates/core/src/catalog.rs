@@ -11,6 +11,24 @@ use crate::model::{DeviceKind, Verification};
 #[serde(rename_all = "lowercase")]
 pub enum EngineKind {
     Hidpp,
+    Rapoo,
+}
+
+/// The input status format and any known wired PID for a Rapoo VT model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RapooConfig {
+    pub report: RapooReport,
+    pub wired_pid: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RapooReport {
+    Nordic,
+    Ch584,
+    Legacy,
+    LegacyWithUnknownLevel,
 }
 
 /// Per-device deviations from engine defaults.
@@ -90,6 +108,7 @@ pub struct DeviceEntry {
     pub source: String,
     pub receive: Option<CollectionSelector>,
     pub send: Option<CollectionSelector>,
+    pub rapoo: Option<RapooConfig>,
     pub quirks: Quirks,
 }
 
@@ -157,6 +176,7 @@ struct RawDevice {
     source: String,
     receive: Option<CollectionSelector>,
     send: Option<CollectionSelector>,
+    rapoo: Option<RapooConfig>,
     #[serde(default)]
     quirks: Quirks,
 }
@@ -172,7 +192,10 @@ fn parse_status(s: String) -> Result<Verification, CatalogError> {
 }
 
 /// Every built-in catalog file; adding a vendor file is one line here.
-const BUILTIN_FILES: &[&str] = &[include_str!("../catalog/logitech.toml")];
+const BUILTIN_FILES: &[&str] = &[
+    include_str!("../catalog/logitech.toml"),
+    include_str!("../catalog/rapoo.toml"),
+];
 
 impl Catalog {
     pub fn parse(toml: &str) -> Result<Catalog, CatalogError> {
@@ -221,6 +244,7 @@ impl Catalog {
                     source: d.source,
                     receive: d.receive,
                     send: d.send,
+                    rapoo: d.rapoo,
                     quirks: d.quirks,
                 })
             })

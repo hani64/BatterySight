@@ -313,11 +313,10 @@ impl Hub {
                     };
                     selection
                 };
-                let engine = match selection.kind() {
-                    EngineKind::Hidpp => selection.hidpp(group, &self.catalog),
+                let Some(engine) = selection.engine(group, &self.catalog) else {
+                    return;
                 };
-                let Some(engine) = engine else { return };
-                (Box::new(engine), Some(selection))
+                (engine, Some(selection))
             };
         let key = engine.group_key();
         let mut collections = Vec::new();
@@ -880,8 +879,8 @@ impl Hub {
         }
     }
 
-    /// A receiver's devices use the reported wireless PID, independently of the entry
-    /// that admitted the physical group. Other devices use that exact direct entry.
+    /// HID++ receiver slots use their wireless PID. Dedicated devices, including a
+    /// Rapoo dongle that reports its own mouse, use the exact direct entry.
     /// Both fall back to the selected engine's family status, if present.
     fn identity(
         &self,
@@ -892,7 +891,7 @@ impl Hub {
         let Some(vid) = slot.vid else {
             return (Verification::Generic, None);
         };
-        let entry = if behind_receiver {
+        let entry = if behind_receiver && slot.kind == EngineKind::Hidpp {
             wpid.and_then(|wpid| self.catalog.device_by_wpid(vid, wpid))
         } else {
             slot.direct.and_then(|index| self.catalog.devices().get(index))

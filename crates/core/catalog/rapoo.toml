@@ -1,0 +1,91 @@
+# Rapoo VT interrupt input only. No vendor family fallback or command selectors.
+
+[[device]]
+name = "Rapoo VT7"
+vid = 0x24AE
+pids = [0x1413, 0x4613]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "pspfreak/rapoo-mouse-battery README.md (Protocol notes) and MouseMonitor.cs: FF00:0002, 19-byte status 07 on receiver and cable"
+receive = { usage_page = 0xFF00, usage = 0x0002, input_len = 19 }
+rapoo = { report = "nordic", wired_pid = 0x4613 }
+
+[[device]]
+name = "Rapoo VT2 Pro Max"
+vid = 0x24AE
+pids = [0x1423]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "renanleonel/windows-taskbar-battery src/rapoo.rs: VT2 Pro Max receiver capture, FF00:0002, 13-byte status 07"
+receive = { usage_page = 0xFF00, usage = 0x0002, input_len = 13 }
+rapoo = { report = "nordic" }
+
+[[device]]
+name = "Rapoo VT9 Pro V2"
+vid = 0x24AE
+pids = [0x14A9, 0x46A9]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "k997/rapoo readme.md (Protocol): FF00:0002, report 07 with 18 payload bytes; receiver and cable PIDs"
+receive = { usage_page = 0xFF00, usage = 0x0002, input_len = 19 }
+rapoo = { report = "nordic", wired_pid = 0x46A9 }
+
+# A HUB identifies the CH584 input handler and collection, but gives no fixed
+# descriptor input width. The status body has eight required payload bytes.
+[[device]]
+name = "Rapoo VT1 SE"
+vid = 0x24AE
+pids = [0x1A11, 0x4A11]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "Rapoo A HUB index-ucvYttFJ.js: VT1 SE manifest default FF00:000F and VT_CH584 (EB.handleReport) input 08"
+receive = { usage_page = 0xFF00, usage = 0x000F }
+rapoo = { report = "ch584", wired_pid = 0x4A11 }
+
+[[device]]
+name = "Rapoo VT7 SE"
+vid = 0x24AE
+pids = [0x1A00, 0x4A00]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "Rapoo A HUB index-ucvYttFJ.js: VT7 SE manifest default FF00:000F and VT_CH584 (EB.handleReport) input 08"
+receive = { usage_page = 0xFF00, usage = 0x000F }
+rapoo = { report = "ch584", wired_pid = 0x4A00 }
+
+[[device]]
+name = "Rapoo VT9 Pro (1st gen)"
+vid = 0x24AE
+pids = [0x1205]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "OpenMouse mouse-protocol docs/rapoo-vt9-pro-testing.md and captures/rapoo-vt9-pro/sweep-2026-09-29.txt: receiver BB B0 on 7-byte FF00:0002"
+receive = { usage_page = 0xFF00, usage = 0x0002, input_len = 7 }
+rapoo = { report = "legacy" }
+
+[[device]]
+name = "Rapoo VT9 Pro"
+vid = 0x24AE
+pids = [0x185A]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "wuxx7/rapoo-vt9pro-battery rapoo_proto.py: BB B0 on receiver's 7-byte FF00:0002 without features"
+receive = { usage_page = 0xFF00, usage = 0x0002, input_len = 7, output_len = 7, feature_len = 0 }
+rapoo = { report = "legacy" }
+
+[[device]]
+name = "Rapoo VT3 Pro"
+vid = 0x24AE
+pids = [0x1215, 0x4415]
+kind = "mouse"
+engine = "rapoo"
+status = "source-verified"
+source = "PyFlat/Device-Battery-Info RapooProtocol.cs: BB B0 on 7-byte FF00:0002 for receiver and cable; state 02 / 7F is unavailable level"
+receive = { usage_page = 0xFF00, usage = 0x0002, input_len = 7 }
+rapoo = { report = "legacy-with-unknown-level", wired_pid = 0x4415 }

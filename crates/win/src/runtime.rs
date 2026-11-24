@@ -190,7 +190,7 @@ type PathSet = BTreeSet<String>;
 struct SelectionSignature {
     kind: EngineKind,
     direct: Option<usize>,
-    report_id: u8,
+    report_id: Option<u8>,
     /// I/O widths by selected role, in the same sorted path order as the group's `PathSet`.
     roles: Vec<PathWidths>,
 }
@@ -951,7 +951,7 @@ mod tests {
 
     use batterysight_core::engine::{Action, Engine};
     use batterysight_core::hid::Collection;
-    use batterysight_core::model::{DeviceUpdate, Presence, Source};
+    use batterysight_core::model::{DeviceUpdate, Level, Presence, Source};
     use batterysight_core::scheduler::{Capabilities, DEFAULT_INTERVAL_MS, Grant, Trigger};
     use windows::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, PIPE_ACCESS_OUTBOUND};
 
@@ -1413,7 +1413,7 @@ mod tests {
             signature: SelectionSignature {
                 kind: EngineKind::Hidpp,
                 direct: None,
-                report_id: 0x10,
+                report_id: Some(0x10),
                 roles: Vec::new(),
             },
             collections: Vec::new(),
@@ -1566,6 +1566,41 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
                 .all(|event| event != &OsEvent::WriteFailed { collection: id }),
             "discovery tried to use a read-only handle"
         );
+    }
+
+    #[test]
+    fn rapoo_opens_only_its_read_only_status_collection() {
+        let (rx_server, rx) = Server::new(PIPE_ACCESS_OUTBOUND);
+        let (_sibling_server, sibling) = Server::new(PIPE_ACCESS_DUPLEX);
+        let mut rx = dongle_member(rx, 0xFF00, 2, 7);
+        let mut sibling = dongle_member(sibling, 0xFF00, 2, 10);
+        for member in [&mut rx, &mut sibling] {
+            (member.collection.vid, member.collection.pid) = (0x24AE, 0x1205);
+            member.container = Some([1; 16]);
+        }
+        let id = rx.collection.id;
+        let mut device = device();
+        device.apply_scan(Some(vec![sibling, rx]), now_ms());
+        assert_eq!(device.groups.len(), 1, "the RX path permits only a read open");
+        assert_eq!(device.groups[0].collections, [id]);
+
+        // OpenMouse VT9 Pro 1st-gen 7-byte heartbeat, over a local pipe, not HID.
+        let status = [0xBB, 0xB0, 0x51, 0x20, 3, 1, 98];
+        rx_server.send(&status);
+        let now = now_ms();
+        let events = device.reactor.wait(Some(now + 1_000), now);
+        assert_eq!(
+            events,
+            [OsEvent::Report {
+                collection: id,
+                bytes: status.to_vec(),
+            }]
+        );
+        for event in events {
+            assert!(!device.on_event(event));
+        }
+        assert_eq!(device.hub.snapshot()[0].level, Some(Level::Percent(98)));
+        assert!(!device.reactor.write(id, &status));
     }
 
     #[test]
