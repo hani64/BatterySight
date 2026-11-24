@@ -37,6 +37,7 @@ pub struct Capabilities {
     pub query_wakes: bool,
     /// Minimum time since the last granted request (any trigger) or noted read
     /// ([`Scheduler::note_read`]) before an `Activity` grant; the other triggers ignore it.
+    /// Zero means no `Activity` grant at all.
     pub min_query_gap_ms: Ms,
 }
 
@@ -224,21 +225,23 @@ impl Scheduler {
 
     /// When `key` may next get an [`Trigger::Activity`] grant: `min_query_gap_ms` after its
     /// last grant or read (at once without one). `None` while no activity can justify a
-    /// query: the device is unknown, pushes its battery or is asleep.
+    /// query: the device is unknown, pushes its battery, is asleep, or declares no gap (the
+    /// gap is the only limit on activity reads, so a device without one gets none).
     pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
         let slot = self.devices.get(key)?;
-        if slot.caps.pushes_battery || slot.asleep {
+        let gap = slot.caps.min_query_gap_ms;
+        if slot.caps.pushes_battery || slot.asleep || gap == 0 {
             return None;
         }
-        let gap = slot.caps.min_query_gap_ms;
         Some(
             slot.last_grant_ms
                 .map_or(0, |last| last.saturating_add(gap)),
         )
     }
 
-    /// `key` was read without a grant of its own (its discovery's first battery read): the
-    /// activity gap counts from `now`, unless a later grant already restarted it.
+    /// `key` was read without a grant of its own (its discovery's first battery read, or a
+    /// reading it pushed): the activity gap counts from `now`, unless a later grant already
+    /// restarted it.
     pub fn note_read(&mut self, key: &DeviceKey, now: Ms) {
         if let Some(slot) = self.devices.get_mut(key) {
             slot.last_grant_ms = Some(slot.last_grant_ms.map_or(now, |last| last.max(now)));
@@ -367,7 +370,7 @@ mod tests {
     #[test]
     fn activity_grant_does_not_clear_asleep_state() {
         for asleep in [false, true] {
-            let mut s = scheduler_with(caps(false, false, 0));
+            let mut s = scheduler_with(caps(false, false, 1));
             if asleep {
                 s.mark_asleep(&key());
             }
@@ -407,6 +410,18 @@ mod tests {
     }
 
     #[test]
+    fn device_without_a_gap_gets_no_activity_grant() {
+        // The gap is the only limit on audio-driven reads: an engine that declares a
+        // non-pushing device without one gets none.
+        let mut s = scheduler_with(caps(false, false, 0));
+        assert_eq!(s.activity_ready_at(&key()), None);
+        for t in [0, 1, 300_000] {
+            assert_eq!(s.request(&key(), Trigger::Activity, t), None, "t = {t}");
+        }
+        assert!(s.request(&key(), Trigger::RefreshNow, 0).is_some());
+    }
+
+    #[test]
     fn mark_awake_lifts_asleep() {
         let mut s = scheduler_with(caps(false, false, 0));
         s.mark_asleep(&key());
@@ -427,10 +442,10 @@ mod tests {
                 read_ms: 3_000,
             }
         );
-        let mut s = scheduler_with(caps(false, false, 0));
-        let now = 1_000;
+        // A 1 ms gap lets the activity request one millisecond after the others.
+        let mut s = scheduler_with(caps(false, false, 1));
         let mut ids = Vec::new();
-        for trigger in ALL_TRIGGERS {
+        for (now, trigger) in (1_000..).zip(ALL_TRIGGERS) {
             let grant = s.request(&key(), trigger, now).unwrap();
             let (budget, duration) = match trigger {
                 Trigger::Arrival | Trigger::Connected => (96, 10_000),

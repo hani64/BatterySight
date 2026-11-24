@@ -21,7 +21,7 @@ It sends a battery query only when:
 - a device reconnects (for example a mouse waking up and linking to its receiver again),
 - the PC resumes from sleep,
 - you click "Refresh now",
-- audio is playing to a headset that does not report its battery while in use (the PRO X Wireless): at most every 5 minutes while audio plays, only while sound is actually playing, and never while the headset is known to be off or asleep.
+- audio is playing to a headset that does not report its battery while in use (the PRO X Wireless): at most once every 5 minutes, only while sound is actually playing, and never while the headset is known to be off or asleep.
 
 Otherwise it only listens. Opening the menu never queries; it shows the last known values. A device known to be asleep is not asked until it reports again. Audio is matched to a device through the container id Windows gives both a headset's audio endpoint and its HID interfaces; BatterySight only watches which audio sessions are active and reads the endpoint's peak meter, it never records or plays audio.
 
