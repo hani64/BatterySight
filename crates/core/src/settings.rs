@@ -204,7 +204,8 @@ impl Settings {
             .unwrap_or(DEFAULT_THRESHOLD)
     }
 
-    /// The device's poll interval in minutes, `None` when it has none (the engine's own gap).
+    /// The device's poll interval in minutes; `None` when it has none, so the default applies
+    /// (10 minutes, or the device's minimum if that is longer).
     pub fn interval(&self, key: &DeviceKey) -> Option<u16> {
         self.intervals.get(key).copied()
     }

@@ -165,7 +165,8 @@ impl Scheduler {
     }
 
     /// Replaces every user gap between `Activity` grants (key → ms). A gap below the
-    /// device's `min_query_gap_ms` counts as the minimum; a key without one uses the minimum.
+    /// device's `min_query_gap_ms` counts as the minimum; a key without one uses
+    /// [`DEFAULT_INTERVAL_MS`], or the minimum if that is longer.
     pub fn set_user_gaps(&mut self, gaps: HashMap<DeviceKey, Ms>) {
         self.user_gaps = gaps;
     }
@@ -692,8 +693,8 @@ mod tests {
         let mut s = polled_after_wake_grant();
         s.set_user_gaps(gaps(Some(1_800_000)));
         assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
-        s.set_user_gaps(gaps(Some(600_000)));
-        assert_eq!(s.activity_ready_at(&key()), Some(900_000));
+        s.set_user_gaps(gaps(Some(1_200_000)));
+        assert_eq!(s.activity_ready_at(&key()), Some(1_500_000));
         // None stored: the default.
         s.set_user_gaps(gaps(None));
         assert_eq!(s.activity_ready_at(&key()), Some(900_000));
