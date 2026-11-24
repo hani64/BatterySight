@@ -137,7 +137,7 @@ struct Registrant {
 }
 
 fn apply_polling_caps(state: &mut DeviceState, caps: Capabilities) -> bool {
-    let min = (caps.audio && !caps.pushes_battery && caps.min_query_gap_ms > 0)
+    let min = ((caps.audio || caps.awake_signal) && !caps.pushes_battery && caps.min_query_gap_ms > 0)
         .then_some(caps.min_query_gap_ms);
     let changed = state.poll_min_ms != min || state.reports_changes != caps.pushes_battery;
     state.poll_min_ms = min;
@@ -2375,7 +2375,7 @@ quirks = { query_wakes = true }
         hub.handle(logi(1), 0);
         hub.handle(intervals(&key, 10_000), 0);
         let device = state(&hub, &key).unwrap();
-        assert_eq!(device.poll_min_ms, None);
+        assert_eq!(device.poll_min_ms, Some(100_000));
         assert!(!device.reports_changes);
         assert_eq!(hub.audio_ready_at(&key), None);
 

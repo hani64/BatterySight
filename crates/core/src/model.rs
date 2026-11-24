@@ -87,8 +87,8 @@ pub struct DeviceState {
     pub updated_ms: Ms,
     pub source: Source,
     pub verification: Verification,
-    /// The engine's minimum for battery checks driven by audio, when an interval
-    /// setting is available for this device.
+    /// The engine's minimum for battery checks driven by audio or a device's awake
+    /// signal, when an interval setting is available.
     pub poll_min_ms: Option<Ms>,
     /// Whether the device reports battery changes on its own.
     pub reports_changes: bool,
