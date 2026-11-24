@@ -1,0 +1,58 @@
+# LIGHTSPEED receiver 046D:C547 ("USB Receiver"), single-device receiver, with
+# a linked but idle PRO X Superlight on slot 1 that answers its ping slowly.
+#
+# Shape from owner trace 2026-11-23: the receiver answers its register 0x00
+# read; slots 2..6 answer the ping with HID++ 1.0 error 0x08 at once; the slot-1
+# ping `10 01 00 1B 00 00 5A` was answered after 443, 937 and 1 288 ms in three
+# starts (this transcript uses 1 288 ms, beyond the old 1 s timeout). The trace
+# came from the slot ping sweep, which is now only the fallback: here the
+# register 0x02 write (Solaar receiver.py notify_devices) goes unanswered
+# (synthetic) so the sweep runs. The mouse's feature indexes, name and unit id
+# are the synthetic ones of receiver_mouse_discovery.txt.
+#
+# Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
+# reads, `@t+<ms>` lets time pass and ticks the hub; frames shorter than their
+# role (7 / 20 bytes) are zero-padded. The `out` lines after an input are the
+# writes that input causes. Each `in` advances the clock by 1 ms.
+
+# t = 0: group arrival, read the receiver's notification flags (1 s timeout).
+out short 10 FF 81 00 00 00 00
+# t = 1: wireless notifications already on.
+in  short 10 FF 81 00 00 01 00
+# Ask the receiver to report every paired slot.
+out short 10 FF 80 02 02 00 00
+# t = 1001: no answer within 1 s: fall back to pinging every slot (4 s timeout).
+@t+1000
+out short 10 01 00 1B 00 00 5A
+out short 10 02 00 1B 00 00 5A
+out short 10 03 00 1B 00 00 5A
+out short 10 04 00 1B 00 00 5A
+out short 10 05 00 1B 00 00 5A
+out short 10 06 00 1B 00 00 5A
+# Slots 2..6 are empty: error 0x08.
+in  short 10 02 8F 00 1B 08 00
+in  short 10 03 8F 00 1B 08 00
+in  short 10 04 8F 00 1B 08 00
+in  short 10 05 8F 00 1B 08 00
+in  short 10 06 8F 00 1B 08 00
+# t = 2289, 1 288 ms after the ping: still within the device timeout, no write.
+@t+1283
+# Slot 1 finally answers (protocol 4.2): discovery goes on.
+in  long  11 01 00 1B 04 02 5A
+out short 10 01 00 0B 00 05 00
+in  long  11 01 00 0B 03
+out short 10 01 00 0B 00 03 00
+in  long  11 01 00 0B 02
+out short 10 01 00 0B 10 04 00
+in  long  11 01 00 0B 06
+out short 10 01 03 0B 00 00 00
+in  long  11 01 03 0B 10
+out short 10 01 03 1B 00 00 00
+in  long  11 01 03 1B 50 52 4F 20 58 20 53 75 70 65 72 6C 69 67 68 74
+out short 10 01 03 2B 00 00 00
+in  long  11 01 03 2B 03
+out short 10 01 02 0B 00 00 00
+in  long  11 01 02 0B 00 1A 2B 3C 4D
+out short 10 01 06 1B 00 00 00
+# 0x1004 fn 1: 80 %, discharging -> registered.
+in  long  11 01 06 1B 50 04 00 00

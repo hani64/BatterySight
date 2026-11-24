@@ -17,6 +17,10 @@ const SET_REGISTER: u8 = 0x80;
 const REG_NOTIFICATIONS: u8 = 0x00;
 pub(super) const REG_BATTERY_STATUS: u8 = 0x07;
 pub(super) const REG_BATTERY_CHARGE: u8 = 0x0D;
+/// `Registers.RECEIVER_CONNECTION`; writing 0x02 makes the receiver send one 0x41
+/// notification per paired slot. Source: Solaar `receiver.py` `notify_devices`.
+const REG_RECEIVER_CONNECTION: u8 = 0x02;
+const NOTIFY_DEVICES: u8 = 0x02;
 /// `NotificationFlag.WIRELESS` 0x000100: byte 1, bit 0.
 const WIRELESS_NOTIFICATIONS: u8 = 0x01;
 /// `NotificationFlag.BATTERY_STATUS` 0x100000: byte 0, bit 4.
@@ -156,6 +160,8 @@ pub(super) enum Step {
     /// Receiver register 0x00 read, then written with the wireless flag added.
     GetNotifications,
     SetNotifications([u8; 3]),
+    /// Receiver register 0x02 written with 0x02: report every paired slot with a 0x41.
+    NotifyDevices,
     Ping,
     /// Root getFeature for [`FEATURES`]`[i]`.
     Feature(usize),
@@ -237,6 +243,7 @@ pub(super) fn request(step: Step, f: &Found) -> Option<Request> {
     Some(match step {
         Step::GetNotifications | Step::GetReg00 => Request::get(REG_NOTIFICATIONS),
         Step::SetNotifications(p) | Step::SetReg00(p) => Request::set(REG_NOTIFICATIONS, p),
+        Step::NotifyDevices => Request::set(REG_RECEIVER_CONNECTION, [NOTIFY_DEVICES, 0, 0]),
         Step::Ping => Request::feature(0, 1, [0, 0, PING_MARK]),
         Step::Feature(i) => {
             let [hi, lo] = FEATURES[i].to_be_bytes();
@@ -272,7 +279,7 @@ pub(super) fn advance<'a>(step: Step, f: &mut Found, reply: Reply<'a>) -> Next<'
             // Already on, or refused.
             _ => Next::Done,
         },
-        Step::SetNotifications(_) | Step::Read => Next::Done,
+        Step::SetNotifications(_) | Step::NotifyDevices | Step::Read => Next::Done,
         Step::Ping => match reply {
             Reply::Ok(&[major, ..]) if major >= 2 => Next::Ask(Step::Feature(NAME_FEATURE)),
             // Source: Solaar `base.py` `ping()`: invalid sub id means HID++ 1.0.

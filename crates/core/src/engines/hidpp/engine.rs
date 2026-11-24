@@ -2,15 +2,18 @@
 //! receivers and directly attached devices.
 //!
 //! One engine serves one HID group. On the group's arrival grant it enables
-//! the receiver's connection notifications, pings every device index and
-//! discovers each answering device once (protocol, battery feature, name,
-//! kind, unit id, first battery reading). Afterwards it lives on pushed
-//! reports: battery broadcasts and register notifications become `Update`s,
-//! receiver link notifications become `Asleep` or `Connected`. A device is
-//! only asked again under a grant the hub hands out for it.
+//! the receiver's connection notifications and asks the receiver to report
+//! every paired slot with a 0x41 link notification (falling back to pinging
+//! every slot when it will not), or pings a direct device. Each linked device
+//! is discovered once (protocol, battery feature, name, kind, unit id, first
+//! battery reading). Afterwards the engine lives on pushed reports: battery
+//! broadcasts and register notifications become `Update`s, receiver link
+//! notifications become `Asleep` or `Connected`. A device is only asked again
+//! under a grant the hub hands out for it.
 //!
 //! Every device index has at most one request in flight; a request
-//! unanswered after one second counts as no answer.
+//! unanswered within its timeout (1 s for the receiver itself, 4 s for a
+//! device) counts as no answer.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
@@ -28,10 +31,17 @@ use super::discovery::{
     self, Decoder, ERR_CONNECT_FAIL, ERR_RESOURCE_ERROR, ERR_UNKNOWN_DEVICE, Found, Next,
     REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
 };
-use super::frame::{LONG, Reply, SHORT};
+use super::frame::{LONG, Reply, SHORT, SW_ID};
 
-/// Per-request timeout.
-const TIMEOUT_MS: u32 = 1_000;
+/// Timeout of a request to the receiver itself.
+/// Source: Solaar `base.py` `_RECEIVER_REQUEST_TIMEOUT` (0.9 s).
+const RECEIVER_TIMEOUT_MS: u32 = 1_000;
+/// Timeout of a request to a device (receiver slot or direct): an idle device
+/// may take over a second to wake (owner trace 2026-11-23: 443 to 1 288 ms).
+/// Source: Solaar `base.py` `_DEVICE_REQUEST_TIMEOUT` / `_PING_TIMEOUT` (4 s).
+const DEVICE_TIMEOUT_MS: u32 = 4_000;
+/// HID++ 1.0 sub ids from 0x80 up are register access and errors, never a feature reply.
+const FIRST_REGISTER_SUB_ID: u8 = 0x80;
 
 const LOGITECH: u16 = 0x046D;
 
@@ -217,10 +227,20 @@ impl HidppEngine {
     }
 
     fn device_key(&self, index: u8, unit: u32) -> DeviceKey {
-        if unit != 0 {
+        // 0xFFFFFFFF is a placeholder (the PRO X Wireless dongle reports it), not an identity.
+        if unit != 0 && unit != u32::MAX {
             DeviceKey(format!("logi:unit:{unit:08X}"))
         } else {
             DeviceKey(format!("logi:{:04X}:{index}", self.pid))
+        }
+    }
+
+    /// How long a request to `index` may stay unanswered.
+    fn timeout(&self, index: u8) -> u32 {
+        if self.receiver && index == DIRECT {
+            RECEIVER_TIMEOUT_MS
+        } else {
+            DEVICE_TIMEOUT_MS
         }
     }
 
@@ -252,18 +272,19 @@ impl HidppEngine {
         if !self.spend(c.grant, now) {
             return;
         }
+        let timeout_ms = self.timeout(index);
         actions.push(Action::Send {
             grant: c.grant,
             collection: self.out,
             bytes: request.bytes(self.report_id, index),
-            timeout_ms: TIMEOUT_MS,
+            timeout_ms,
         });
         self.in_flight.insert(
             index,
             InFlight {
                 conversation: c,
                 request,
-                deadline: now.saturating_add(Ms::from(TIMEOUT_MS)),
+                deadline: now.saturating_add(Ms::from(timeout_ms)),
             },
         );
     }
@@ -327,8 +348,15 @@ impl HidppEngine {
                 self.issue(index, c, now, actions);
             }
             Next::Discovered(p) => self.discovered(index, c.found, Some(p), actions),
-            // Receiver notifications set up (or refused): discover its devices.
+            // Receiver notifications set up (or refused): ask it to report its slots.
             Next::Done if matches!(c.step, Step::GetNotifications | Step::SetNotifications(_)) => {
+                c.step = Step::NotifyDevices;
+                self.issue(index, c, now, actions);
+            }
+            // The receiver now sends a 0x41 per paired slot.
+            Next::Done if c.step == Step::NotifyDevices && matches!(reply, Reply::Ok(_)) => {}
+            // It refused: find the devices by pinging every slot.
+            Next::Done if c.step == Step::NotifyDevices => {
                 self.discover(RECEIVER_SLOTS, c.grant, now, actions);
             }
             // A known device answered with an error: same meaning as on a read.
@@ -458,6 +486,14 @@ impl HidppEngine {
             self.forget(index, actions);
             return;
         }
+        // A feature reply carrying our software id from a slot with nothing in flight.
+        if self.receiver
+            && RECEIVER_SLOTS.contains(&index)
+            && sub < FIRST_REGISTER_SUB_ID
+            && address & 0x0F == SW_ID
+        {
+            self.late_reply(index, actions);
+        }
         // A direct device may report as index 0x00 instead of 0xFF.
         let index = if !self.receiver && index == 0 {
             DIRECT
@@ -511,6 +547,20 @@ impl HidppEngine {
             self.pending.insert(index);
             actions.push(Action::Connected(self.group_key.clone()));
         }
+    }
+
+    /// An answer to one of our requests from slot `index` that came after its
+    /// timeout: the device is there and awake. If the slot is still unknown,
+    /// discover it as on a link-up (an already linked device sends no 0x41).
+    fn late_reply(&mut self, index: u8, actions: &mut Vec<Action>) {
+        if self.devices.contains_key(&index)
+            || self.pending.contains(&index)
+            || self.in_flight.contains_key(&index)
+        {
+            return;
+        }
+        self.pending.insert(index);
+        actions.push(Action::Connected(self.group_key.clone()));
     }
 }
 
@@ -595,8 +645,16 @@ impl Engine for HidppEngine {
                 continue;
             };
             match f.conversation.step {
-                // The receiver did not answer: discover its devices anyway.
+                // The receiver did not answer: still ask it to report its slots.
                 Step::GetNotifications | Step::SetNotifications(_) => {
+                    let c = Conversation {
+                        step: Step::NotifyDevices,
+                        ..f.conversation
+                    };
+                    self.issue(index, c, now, &mut actions);
+                }
+                // No slot report either: find the devices by pinging every slot.
+                Step::NotifyDevices => {
                     self.discover(RECEIVER_SLOTS, f.conversation.grant, now, &mut actions);
                 }
                 Step::Read => {
@@ -663,11 +721,13 @@ source = "test"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 "#;
 
-    const FIXTURES: [&str; 4] = [
+    const FIXTURES: [&str; 6] = [
         include_str!("../../../tests/fixtures/hidpp/receiver_mouse_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/headset_long_only_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/receiver_hidpp10_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/0aba-headset-off-at-start.txt"),
+        include_str!("../../../tests/fixtures/hidpp/c547-slow-ping.txt"),
+        include_str!("../../../tests/fixtures/hidpp/c547-late-ping-reply.txt"),
     ];
 
     fn catalog() -> Catalog {
@@ -791,17 +851,39 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         }
     }
 
-    /// Receiver after arrival with wireless notifications already on: pings 1..=6 outstanding.
+    /// The receiver's "report every paired slot" write (register 0x02 = 0x02).
+    fn notify_devices() -> Vec<u8> {
+        s(&[0x10, 0xFF, 0x80, 0x02, 0x02, 0x00, 0x00])
+    }
+
+    /// Receiver after arrival with wireless notifications already on and the
+    /// register 0x02 write refused, so the slot ping sweep runs: pings 1..=6
+    /// outstanding, sent at t = 1.
     fn receiver_pinging() -> HidppEngine {
         let mut e = HidppEngine::new(&receiver_group(), &catalog());
         let gk = e.group_key();
         let a = e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
         assert_eq!(sent(&a), vec![s(&[0x10, 0xFF, 0x81, 0x00])]);
         let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        assert_eq!(sent(&a), vec![notify_devices()]);
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x8F, 0x80, 0x02, 0x02]), 1);
         let pings: Vec<Vec<u8>> = (1..=6)
             .map(|i| s(&[0x10, i, 0x00, 0x1B, 0x00, 0x00, 0x5A]))
             .collect();
         assert_eq!(sent(&a), pings);
+        e
+    }
+
+    /// Receiver after arrival whose register 0x02 write was acknowledged: waiting for 0x41s.
+    fn receiver_notified() -> HidppEngine {
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        assert_eq!(sent(&a), vec![notify_devices()]);
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x02]), 2);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
         e
     }
 
@@ -965,9 +1047,6 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 &s(&[&[0x10, 0xFF, 0x81, 0x00][..], &flags].concat()),
                 1,
             );
-            let pings: Vec<Vec<u8>> = (1..=6)
-                .map(|i| s(&[0x10, i, 0x00, 0x1B, 0x00, 0x00, 0x5A]))
-                .collect();
             match write {
                 Some(params) => {
                     assert_eq!(
@@ -975,9 +1054,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                         vec![s(&[&[0x10, 0xFF, 0x80, 0x00][..], &params].concat())]
                     );
                     let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
-                    assert_eq!(sent(&a), pings, "{flags:?}");
+                    assert_eq!(sent(&a), vec![notify_devices()], "{flags:?}");
                 }
-                None => assert_eq!(sent(&a), pings, "{flags:?}"),
+                None => assert_eq!(sent(&a), vec![notify_devices()], "{flags:?}"),
             }
         }
     }
@@ -1005,8 +1084,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 },
             }]
         );
-        // Pings 2..=6 went out at t = 1 and are still unanswered.
-        assert_eq!(e.next_deadline(), Some(1_001));
+        // Pings 2..=6 went out at t = 1 and are still unanswered (device timeout 4 s).
+        assert_eq!(e.next_deadline(), Some(4_001));
     }
 
     #[test]
@@ -1049,7 +1128,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             grant: GrantId(5),
             collection: LONG_C,
             bytes,
-            timeout_ms: 1_000,
+            timeout_ms: 4_000,
         };
         let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
         assert_eq!(
@@ -1121,7 +1200,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert!(a.is_empty(), "{a:?}");
 
         // The other pings time out: skipped during discovery, nothing retried.
-        let a = e.on_tick(1 + 1_000);
+        let a = e.on_tick(1 + 4_000);
         assert!(a.is_empty(), "{a:?}");
         assert_eq!(e.next_deadline(), None);
     }
@@ -1304,7 +1383,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     /// The headset registered asleep, then switched on.
     fn check_off_headset_registered_then_updated(e: &mut HidppEngine, registered: &[Action]) {
-        let key = DeviceKey("logi:unit:FFFFFFFF".into());
+        // Unit id FFFFFFFF is a placeholder: the key falls back to pid and index.
+        let key = headset_key();
         assert_eq!(
             registered,
             [Action::Register {
@@ -1349,8 +1429,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     #[test]
     fn direct_device_first_read_timeout_registers_asleep() {
         let mut e = headset_off_until_read();
-        assert!(e.on_tick(1_000).is_empty());
-        let a = e.on_tick(1_001);
+        assert!(e.on_tick(4_000).is_empty());
+        let a = e.on_tick(4_001);
         check_off_headset_registered_then_updated(&mut e, &a);
     }
 
@@ -1383,7 +1463,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             run(&mut e, &mouse_script(), 3);
             let a = match reply {
                 Some(r) => e.on_report(LONG_C, &r, 4),
-                None => e.on_tick(3 + 1_000),
+                None => e.on_tick(3 + 4_000),
             };
             assert!(a.is_empty(), "tick {tick}: {a:?}");
             assert_eq!(e.next_deadline(), None);
@@ -1420,7 +1500,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 grant: GrantId(9),
                 collection: SHORT_C,
                 bytes: s(&[0x10, 2, 0x00, 0x1B, 0x00, 0x00, 0x5A]),
-                timeout_ms: 1_000,
+                timeout_ms: 4_000,
             }]
         );
     }
@@ -1469,7 +1549,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
         let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x1D, 0x04, 0x02, 0x5A]), 10);
         assert!(a.is_empty(), "{a:?}");
-        assert_eq!(e.next_deadline(), Some(1_000));
+        assert_eq!(e.next_deadline(), Some(4_000));
 
         let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 20);
         assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x00, 0x0B, 0x00, 0x05])]);
@@ -1481,10 +1561,10 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = headset_engine();
         let a = e.on_grant(&grant(2, &headset_key(), Trigger::RefreshNow), 100);
         assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x08, 0x0B])]);
-        assert_eq!(e.next_deadline(), Some(1_100));
+        assert_eq!(e.next_deadline(), Some(4_100));
 
-        assert!(e.on_tick(1_099).is_empty());
-        assert_eq!(e.on_tick(1_100), vec![Action::Asleep(headset_key())]);
+        assert!(e.on_tick(4_099).is_empty());
+        assert_eq!(e.on_tick(4_100), vec![Action::Asleep(headset_key())]);
         assert_eq!(e.next_deadline(), None);
     }
 
@@ -1496,19 +1576,19 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert_eq!(sent(&a), vec![read.clone()]);
 
         // A receiver reports a sleeping device with an error: silence is a lost reply.
-        let a = e.on_tick(1_100);
+        let a = e.on_tick(4_100);
         assert_eq!(
             a,
             vec![Action::Send {
                 grant: GrantId(2),
                 collection: SHORT_C,
                 bytes: read,
-                timeout_ms: 1_000,
+                timeout_ms: 4_000,
             }]
         );
-        assert_eq!(e.next_deadline(), Some(2_100));
+        assert_eq!(e.next_deadline(), Some(8_100));
 
-        let a = e.on_tick(2_100);
+        let a = e.on_tick(8_100);
         assert!(a.is_empty(), "no second retry, no Asleep: {a:?}");
         assert_eq!(e.next_deadline(), None);
     }
@@ -1522,8 +1602,211 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         };
         e.on_grant(&one, 100);
 
-        assert!(e.on_tick(1_100).is_empty());
+        assert!(e.on_tick(4_100).is_empty());
         assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn slow_receiver_slot_ping_continues_discovery() {
+        // Owner trace 2026-11-23: an idle, linked Superlight answered the slot-1 ping
+        // after 443, 937 and 1 288 ms.
+        let mut e = receiver_pinging();
+        for i in 2..=6 {
+            e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+        }
+        let late = 1 + 1_288;
+        assert!(e.on_tick(late).is_empty());
+        assert_eq!(e.next_deadline(), Some(4_001));
+
+        run(&mut e, &mouse_script(), late);
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), late + 1);
+
+        assert!(
+            matches!(a.as_slice(), [Action::Register { key, .. }] if *key == mouse_key()),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn silent_receiver_slot_ping_is_dropped_after_4_s() {
+        let mut e = receiver_pinging();
+        for i in 2..=6 {
+            e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+        }
+        assert!(e.on_tick(4_000).is_empty());
+        assert_eq!(e.next_deadline(), Some(4_001));
+
+        assert!(e.on_tick(4_001).is_empty());
+        assert_eq!(e.next_deadline(), None);
+        // A reply after the timeout is a sign of life: rediscover through a Connected grant.
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 4_002);
+        assert_eq!(a, vec![Action::Connected(e.group_key())]);
+    }
+
+    #[test]
+    fn receiver_own_request_times_out_after_1_s() {
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+        assert!(
+            matches!(
+                a.as_slice(),
+                [Action::Send {
+                    timeout_ms: 1_000,
+                    ..
+                }]
+            ),
+            "{a:?}"
+        );
+        assert_eq!(e.next_deadline(), Some(1_000));
+
+        // No answer from the receiver: still ask it to report its slots.
+        let a = e.on_tick(1_000);
+        assert_eq!(sent(&a), vec![notify_devices()]);
+        assert!(matches!(
+            a.as_slice(),
+            [Action::Send {
+                timeout_ms: 1_000,
+                ..
+            }]
+        ));
+        assert_eq!(e.next_deadline(), Some(2_000));
+
+        // No answer again: fall back to pinging every slot, at the device timeout.
+        let a = e.on_tick(2_000);
+        assert_eq!(a.len(), 6, "{a:?}");
+        assert!(
+            a.iter().all(|a| matches!(
+                a,
+                Action::Send {
+                    timeout_ms: 4_000,
+                    ..
+                }
+            )),
+            "{a:?}"
+        );
+        assert_eq!(e.next_deadline(), Some(6_000));
+    }
+
+    #[test]
+    fn receiver_start_asks_for_link_notifications_instead_of_pinging() {
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+
+        assert_eq!(
+            a,
+            vec![Action::Send {
+                grant: GrantId(1),
+                collection: SHORT_C,
+                bytes: notify_devices(),
+                timeout_ms: 1_000,
+            }]
+        );
+        // The acknowledgement asks nothing more: the receiver now reports its slots.
+        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x02]), 2);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn slot_link_notifications_drive_discovery_of_linked_slots_only() {
+        let mut e = receiver_notified();
+        let gk = e.group_key();
+
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 3);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+        // Paired, link not established: nothing to do until it links.
+        let a = e.on_report(SHORT_C, &[0x10, 0x02, 0x41, 0x04, 0x40, 0x8A, 0x40], 4);
+        assert!(a.is_empty(), "{a:?}");
+
+        let a = e.on_grant(&grant(2, &gk, Trigger::Connected), 5);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
+        run(&mut e, &mouse_script(), 6);
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 7);
+        assert!(
+            matches!(a.as_slice(), [Action::Register { key, .. }] if *key == mouse_key()),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn notify_devices_failure_falls_back_to_ping_sweep() {
+        let pings: Vec<Vec<u8>> = (1..=6)
+            .map(|i| s(&[0x10, i, 0x00, 0x1B, 0x00, 0x00, 0x5A]))
+            .collect();
+        for code in [0x02, 0x09] {
+            let mut e = HidppEngine::new(&receiver_group(), &catalog());
+            let gk = e.group_key();
+            e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+            e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+            let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x8F, 0x80, 0x02, code]), 2);
+            assert_eq!(sent(&a), pings, "{code:#04x}");
+        }
+        // Timeout: same fallback.
+        let mut e = HidppEngine::new(&receiver_group(), &catalog());
+        let gk = e.group_key();
+        e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
+        e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        assert!(e.on_tick(1_000).is_empty());
+        assert_eq!(sent(&e.on_tick(1_001)), pings);
+    }
+
+    #[test]
+    fn late_slot_reply_counts_as_link_up() {
+        let mut e = receiver_notified();
+        let gk = e.group_key();
+        e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 3);
+        let a = e.on_grant(&grant(2, &gk, Trigger::Connected), 10);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
+        assert!(e.on_tick(10 + 4_000).is_empty(), "ping dropped quietly");
+
+        // The mouse answers 4.5 s after the ping.
+        let late = l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]);
+        let a = e.on_report(LONG_C, &late, 10 + 4_500);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+        // Already pending: a second late frame asks nothing more.
+        assert!(e.on_report(LONG_C, &late, 10 + 4_501).is_empty());
+
+        let a = e.on_grant(&grant(3, &gk, Trigger::Connected), 10 + 4_502);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
+        run(&mut e, &mouse_script(), 10 + 4_503);
+        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 10 + 4_504);
+        assert!(
+            matches!(a.as_slice(), [Action::Register { key, .. }] if *key == mouse_key()),
+            "{a:?}"
+        );
+
+        // Registered: further late frames from the slot are ignored.
+        assert!(e.on_report(LONG_C, &late, 10 + 4_505).is_empty());
+    }
+
+    #[test]
+    fn late_frames_without_our_software_id_are_not_link_ups() {
+        let mut e = receiver_notified();
+        // Battery broadcast (software id 0) and a reply to another program (0x0D).
+        for frame in [
+            l(&[0x11, 1, 6, 0x00, 40, 4, 0, 0]),
+            l(&[0x11, 1, 0x00, 0x1D, 0x04, 0x02, 0x5A]),
+        ] {
+            let a = e.on_report(LONG_C, &frame, 3);
+            assert!(a.is_empty(), "{frame:02X?}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn placeholder_unit_id_falls_back_to_pid_and_index() {
+        let mut e = headset_off_until_read();
+
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x06, 0x0B, 0x0E, 0xF4, 0x01]), 2);
+
+        let [Action::Register { key, initial, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(*key, DeviceKey("logi:0ABA:255".into()));
+        assert_eq!(initial.level, Some(Level::Percent(68)));
     }
 
     #[test]
@@ -1684,7 +1967,10 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
         let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
 
-        assert!(a.is_empty(), "no budget left for pings: {a:?}");
+        assert!(
+            a.is_empty(),
+            "no budget left for the register 0x02 write: {a:?}"
+        );
         assert_eq!(e.next_deadline(), None);
     }
 
