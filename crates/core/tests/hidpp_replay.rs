@@ -2,10 +2,10 @@
 //! engines and checks every write against the transcript.
 //!
 //! Fixture lines are `out <short|long> <hex>` (a frame we write),
-//! `in <short|long> <hex>` (a frame we read) or `@t+<ms>` (time passes, then the
-//! hub gets a `Tick`); `#` starts a comment. Each `in` advances the clock by
-//! 1 ms. The `out` lines between two inputs are exactly the writes the first
-//! one causes.
+//! `in <short|long> <hex>` (a frame we read), `@t+<ms>` (time passes, then the
+//! hub gets a `Tick`) or `resume` (the system resumed from sleep); `#` starts a
+//! comment. Each `in` and `resume` advances the clock by 1 ms. The `out` lines
+//! between two inputs are exactly the writes the first one causes.
 
 use batterysight_core::catalog::Catalog;
 use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup};
@@ -40,6 +40,8 @@ enum Entry {
     Out(CollectionId, Vec<u8>),
     /// Milliseconds that pass before the next `Tick`.
     Wait(u64),
+    /// System resume.
+    Resume,
 }
 
 fn parse(name: &str, text: &str) -> Vec<(usize, Entry)> {
@@ -54,6 +56,10 @@ fn parse(name: &str, text: &str) -> Vec<(usize, Entry)> {
                 .parse()
                 .unwrap_or_else(|_| panic!("{name}:{}: bad wait {ms:?}", n + 1));
             entries.push((n + 1, Entry::Wait(ms)));
+            continue;
+        }
+        if line == "resume" {
+            entries.push((n + 1, Entry::Resume));
             continue;
         }
         let mut words = line.split_whitespace();
@@ -154,6 +160,10 @@ fn replay(name: &str, text: &str, group: HidGroup) -> Hub {
             Entry::Wait(ms) => {
                 now += ms;
                 HubInput::Tick
+            }
+            Entry::Resume => {
+                now += 1;
+                HubInput::Resume
             }
         };
         assert_eq!(sent, expected, "{name}: writes before line {line}");
@@ -313,4 +323,77 @@ fn c547_late_ping_reply() {
         receiver(),
     );
     check(&hub, name, &c547_mouse());
+}
+
+/// The Superlight of the owner captures: it calls itself "PRO X Wireless"
+/// behind the C547 receiver; its unit id is replaced by a synthetic one.
+fn superlight(level: u8) -> Expect {
+    Expect {
+        key: "logi:unit:1A2B3C4D",
+        name: "PRO X Wireless",
+        kind: DeviceKind::Mouse,
+        via: Via::Receiver,
+        level: Level::Percent(level),
+        millivolts: None,
+        charge: Charge::Discharging,
+    }
+}
+
+/// The PRO X Wireless headset of the owner captures at `millivolts`, discharging.
+fn pro_x_headset(level: u8, millivolts: u16) -> Expect {
+    Expect {
+        key: "logi:0ABA:255",
+        name: "PRO X Wireless Gaming Headset",
+        kind: DeviceKind::Headset,
+        via: Via::Usb,
+        level: Level::Percent(level),
+        millivolts: Some(millivolts),
+        charge: Charge::Discharging,
+    }
+}
+
+#[test]
+fn c547_superlight_arrival() {
+    let name = "c547-superlight-arrival.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/c547-superlight-arrival.txt"),
+        receiver(),
+    );
+    check(&hub, name, &superlight(80));
+}
+
+#[test]
+fn c547_superlight_resume() {
+    let name = "c547-superlight-resume.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/c547-superlight-resume.txt"),
+        receiver(),
+    );
+    check(&hub, name, &superlight(79));
+}
+
+#[test]
+fn headset_arrival() {
+    let name = "0aba-headset-arrival.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/0aba-headset-arrival.txt"),
+        headset(),
+    );
+    // 0x0F81 = 3969 mV on the PRO X curve: 85 + 5 * (3969 - 3950) / (3993 - 3950), truncated.
+    check(&hub, name, &pro_x_headset(87, 3969));
+}
+
+#[test]
+fn headset_resume() {
+    let name = "0aba-headset-resume.txt";
+    let hub = replay(
+        name,
+        include_str!("fixtures/hidpp/0aba-headset-resume.txt"),
+        headset(),
+    );
+    // 0x0F62 = 3938 mV: 80 + 5 * (3938 - 3915) / (3950 - 3915), truncated.
+    check(&hub, name, &pro_x_headset(83, 3938));
 }

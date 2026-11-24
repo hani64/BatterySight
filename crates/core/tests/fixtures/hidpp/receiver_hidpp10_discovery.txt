@@ -4,8 +4,8 @@
 # drivers/hid/hid-logitech-hidpp.c (short 0x10 reports, 0x8F HID++ 1.0 error,
 # battery registers 0x07 / 0x0D) and Solaar lib/logitech_receiver
 # (base.py ping, hidpp10_constants.py NotificationFlag.BATTERY_STATUS and
-# Registers.BATTERY_STATUS / BATTERY_CHARGE). Replace with a real capture in
-# Task 14.
+# Registers.BATTERY_STATUS / BATTERY_CHARGE). No HID++ 1.0 device has been
+# captured yet.
 #
 # Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
 # reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The

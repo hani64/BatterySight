@@ -6,7 +6,7 @@
 # HID++ 1.0 error) and Solaar lib/logitech_receiver (base.py ping,
 # hidpp10_constants.py NotificationFlag.WIRELESS, hidpp20.py feature calls,
 # notifications.py 0x41 link notification, receiver.py notify_devices).
-# Replace with a real capture in Task 14.
+# The real capture of this receiver is c547-superlight-arrival.txt.
 #
 # Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
 # reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The

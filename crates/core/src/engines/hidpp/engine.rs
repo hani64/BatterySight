@@ -743,13 +743,17 @@ source = "test"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 "#;
 
-    const FIXTURES: [&str; 6] = [
+    const FIXTURES: [&str; 10] = [
         include_str!("../../../tests/fixtures/hidpp/receiver_mouse_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/headset_long_only_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/receiver_hidpp10_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/0aba-headset-off-at-start.txt"),
         include_str!("../../../tests/fixtures/hidpp/c547-slow-ping.txt"),
         include_str!("../../../tests/fixtures/hidpp/c547-late-ping-reply.txt"),
+        include_str!("../../../tests/fixtures/hidpp/c547-superlight-arrival.txt"),
+        include_str!("../../../tests/fixtures/hidpp/0aba-headset-arrival.txt"),
+        include_str!("../../../tests/fixtures/hidpp/c547-superlight-resume.txt"),
+        include_str!("../../../tests/fixtures/hidpp/0aba-headset-resume.txt"),
     ];
 
     fn catalog() -> Catalog {
