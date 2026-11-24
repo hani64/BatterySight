@@ -1,6 +1,7 @@
-//! The hover card: a device's name, level, status and time left, shown above the taskbar
-//! once the cursor has rested on the device on a widget for [`HOVER_MS`](super::HOVER_MS).
-//! The tray icons' tooltips carry the same text ([`card_text`]).
+//! The hover card: two compact lines with a device's name and level, its status and time
+//! left, shown just above the taskbar once the cursor has rested on the device on a widget
+//! for the tooltip delay (`hover_delay`). The tray icons' tooltips carry the same text
+//! ([`card_text`]).
 //!
 //! The card is a layered top-level popup of the UI thread (`WS_POPUP`; a tool window,
 //! topmost, never activated and click-through), never a child of a taskbar: creating,
@@ -10,7 +11,6 @@
 
 use std::time::Duration;
 
-use batterysight_core::history;
 use batterysight_core::model::{Charge, DeviceKey, DeviceState, Presence};
 use batterysight_core::time::Ms;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -64,7 +64,8 @@ impl Card {
             return;
         };
         let size = painter.size();
-        let gap = 8 * hover.dpi as i32 / 96;
+        // Close to the taskbar, like a tooltip.
+        let gap = 4 * hover.dpi as i32 / 96;
         let at = place(size, hover.device, hover.bar, monitor, work, gap);
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
@@ -176,28 +177,34 @@ pub unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
     }
 }
 
-/// The card's lines: the device's name; its level; charging, or how long ago it was last
-/// read (asleep or not); and, unless it is on power, the time left
-/// ([`history::time_left_text`]). `now`: the monotonic time of the readings.
+/// The card's two lines: "name · level" (a coarse level as its word, an unknown one as
+/// "?"), then the status: "Charging" or "Full" on power; else how long ago the device was
+/// last read ("just now", "N min ago"…), after "Asleep · " or "Disconnected · " when it is,
+/// and then " · about N h left" when there is an estimate. `now`: the monotonic time of
+/// the readings.
 pub fn card_text(state: &DeviceState, time_left: Option<Duration>, now: Ms) -> Vec<String> {
-    let level = state.level.map_or_else(|| "unknown".to_owned(), level_text);
+    let level = state.level.map_or_else(|| "?".to_owned(), level_text);
     let age = age_text(now.saturating_sub(state.updated_ms));
-    let status = match (state.presence, state.charge) {
+    let mut status = match (state.presence, state.charge) {
         (Presence::Online, Charge::Charging) => "Charging".to_owned(),
-        (Presence::Online, _) => format!("Updated {age}"),
-        (Presence::Asleep, _) => format!("Asleep, updated {age}"),
-        (Presence::Offline, _) => format!("Disconnected, updated {age}"),
+        (Presence::Online, Charge::Full) => "Full".to_owned(),
+        (Presence::Online, _) => age,
+        (Presence::Asleep, _) => format!("Asleep · {age}"),
+        (Presence::Offline, _) => format!("Disconnected · {age}"),
     };
-    let mut lines = vec![state.name.clone(), format!("Battery: {level}"), status];
     let on_power = state.presence == Presence::Online
         && matches!(
             state.charge,
             Charge::Charging | Charge::Full | Charge::NotCharging
         );
-    if !on_power {
-        lines.push(history::time_left_text(time_left));
+    if let Some(left) = time_left.filter(|_| !on_power) {
+        // To the nearest hour, as `history::time_left_text`.
+        match (left.as_secs() + 1800) / 3600 {
+            0 => status.push_str(" · less than 1 h left"),
+            hours => status.push_str(&format!(" · about {hours} h left")),
+        }
     }
-    lines
+    vec![format!("{} · {level}", state.name), status]
 }
 
 /// "just now", "N min ago", "N h ago" (from 1 h), "N days ago" (from 48 h).
@@ -258,7 +265,7 @@ fn monitor_of(rect: &RECT) -> Option<(RECT, RECT)> {
 mod tests {
     use super::*;
     use batterysight_core::model::{
-        Charge, DeviceKey, DeviceKind, Level, Presence, Source, Verification, Via,
+        Charge, CoarseLevel, DeviceKey, DeviceKind, Level, Presence, Source, Verification, Via,
     };
 
     const MIN: u64 = 60_000;
@@ -282,22 +289,21 @@ mod tests {
     }
 
     #[test]
-    fn card_text_online_discharging() {
+    fn card_text_awake_shows_age_and_time_left() {
         let s = state(Presence::Online, Charge::Discharging, NOW - 3 * MIN);
         let left = Some(Duration::from_secs(20 * 3600));
         assert_eq!(
             card_text(&s, left, NOW),
-            [
-                "G305",
-                "Battery: 80%",
-                "Updated 3 min ago",
-                "Time left: about 20 h"
-            ]
+            ["G305 · 80%", "3 min ago · about 20 h left"]
         );
-        // Under a minute.
+        let at = |ago, left| card_text(&s, left, s.updated_ms + ago)[1].clone();
+        assert_eq!(at(59_000, left), "just now · about 20 h left");
+        assert_eq!(at(125 * MIN, left), "2 h ago · about 20 h left");
+        // No estimate: no text for it.
+        assert_eq!(at(3 * MIN, None), "3 min ago");
         assert_eq!(
-            card_text(&s, left, s.updated_ms + 59_000)[2],
-            "Updated just now"
+            at(3 * MIN, Some(Duration::from_secs(20 * 60))),
+            "3 min ago · less than 1 h left"
         );
     }
 
@@ -306,29 +312,42 @@ mod tests {
         let s = state(Presence::Asleep, Charge::Discharging, NOW - 12 * MIN);
         assert_eq!(
             card_text(&s, None, NOW),
-            [
-                "G305",
-                "Battery: 80%",
-                "Asleep, updated 12 min ago",
-                "Time left: not enough data"
-            ]
+            ["G305 · 80%", "Asleep · 12 min ago"]
         );
-        let at = |ago| card_text(&s, None, s.updated_ms + ago)[2].clone();
-        assert_eq!(at(125 * MIN), "Asleep, updated 2 h ago");
-        assert_eq!(at(3 * 24 * 60 * MIN), "Asleep, updated 3 days ago");
+        let nine = Some(Duration::from_secs(9 * 3600));
+        assert_eq!(
+            card_text(&s, nine, NOW)[1],
+            "Asleep · 12 min ago · about 9 h left"
+        );
+        let at = |ago| card_text(&s, None, s.updated_ms + ago)[1].clone();
+        assert_eq!(at(3 * 24 * 60 * MIN), "Asleep · 3 days ago");
     }
 
     #[test]
-    fn card_text_charging_has_no_time_left() {
-        let mut s = state(Presence::Online, Charge::Charging, NOW);
+    fn card_text_on_power_has_no_time_left() {
+        let left = Some(Duration::from_secs(9 * 3600));
+        let line = |charge| {
+            card_text(&state(Presence::Online, charge, NOW - 3 * MIN), left, NOW)[1].clone()
+        };
+        assert_eq!(line(Charge::Charging), "Charging");
+        assert_eq!(line(Charge::Full), "Full");
+        // Plugged in but not charging: its age, still no estimate.
+        assert_eq!(line(Charge::NotCharging), "3 min ago");
+    }
+
+    #[test]
+    fn card_text_disconnected_shows_age() {
+        let s = state(Presence::Offline, Charge::Discharging, NOW - 7 * MIN);
+        assert_eq!(card_text(&s, None, NOW)[1], "Disconnected · 7 min ago");
+    }
+
+    #[test]
+    fn card_text_levels() {
+        let mut s = state(Presence::Online, Charge::Discharging, NOW);
+        s.level = Some(Level::Coarse(CoarseLevel::Good));
+        assert_eq!(card_text(&s, None, NOW)[0], "G305 · Good");
         s.level = None;
-        assert_eq!(
-            card_text(&s, None, NOW),
-            ["G305", "Battery: unknown", "Charging"]
-        );
-        // On power, nothing to estimate either.
-        s.charge = Charge::Full;
-        assert_eq!(card_text(&s, None, NOW).len(), 3);
+        assert_eq!(card_text(&s, None, NOW)[0], "G305 · ?");
     }
 
     #[test]

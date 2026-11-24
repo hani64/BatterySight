@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateBitmap,
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, FW_NORMAL, FW_SEMIBOLD, FillRect, GdiFlush,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, FW_BOLD, FW_NORMAL, FW_SEMIBOLD, FillRect, GdiFlush,
     GetTextExtentPoint32W, GetTextFaceW, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
     SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
@@ -343,7 +343,8 @@ struct CardColors {
     background: [u8; 3],
     border: [u8; 3],
     title: [u8; 3],
-    text: [u8; 3],
+    /// The second line's.
+    muted: [u8; 3],
 }
 
 impl CardColors {
@@ -353,47 +354,48 @@ impl CardColors {
                 background: [255, 255, 255],
                 border: [200, 200, 200],
                 title: [0, 0, 0],
-                text: [64, 64, 64],
+                muted: [96, 96, 96],
             }
         } else {
             CardColors {
                 background: [32, 32, 32],
                 border: [80, 80, 80],
                 title: [255, 255, 255],
-                text: [220, 220, 220],
+                muted: [170, 170, 170],
             }
         }
     }
 }
 
-/// The hover card: `lines` (the first, the device's name, emphasised), opaque, in the
-/// taskbar's theme; `dpi` scales it.
+/// The hover card, as compact as a tooltip: `lines` (the first in bold at a tooltip's
+/// size, the rest smaller and muted), opaque, in the taskbar's theme; `dpi` scales it.
 pub fn card(lines: &[String], dpi: u32, light: bool) -> Option<Painter> {
     let px = |v: i32| v * dpi as i32 / 96;
     let colors = CardColors::new(light);
     let mut p = Painter::new()?;
-    let title_font = p.font(&[TEXT_FACE], -px(14), FW_SEMIBOLD.0 as i32)?;
-    let text_font = p.font(&[TEXT_FACE], -px(12), FW_NORMAL.0 as i32)?;
-    let pad = px(12);
+    // 9 pt, a tooltip's size; then 8 pt.
+    let title_font = p.font(&[TEXT_FACE], -px(12), FW_BOLD.0 as i32)?;
+    let text_font = p.font(&[TEXT_FACE], -px(11), FW_NORMAL.0 as i32)?;
+    let (pad_x, pad_y) = (px(8), px(5));
     // (font, text, y, colour)
     let mut rows = Vec::with_capacity(lines.len());
-    let mut y = pad;
-    let mut bottom = pad;
-    let mut width = px(180);
+    let mut y = pad_y;
+    let mut bottom = pad_y;
+    let mut width = 0;
     for (i, line) in lines.iter().enumerate() {
-        let (font, rgb, gap) = if i == 0 {
-            (title_font, colors.title, px(4))
+        let (font, rgb) = if i == 0 {
+            (title_font, colors.title)
         } else {
-            (text_font, colors.text, px(2))
+            (text_font, colors.muted)
         };
         let wide: Vec<u16> = line.encode_utf16().collect();
         let size = p.measure(font, &wide);
-        width = width.max(size.cx + 2 * pad);
+        width = width.max(size.cx + 2 * pad_x);
         rows.push((font, wide, y, rgb));
         bottom = y + size.cy;
-        y = bottom + gap;
+        y = bottom + px(1);
     }
-    let height = bottom + pad;
+    let height = bottom + pad_y;
     if !p.begin(width, height) {
         return None;
     }
@@ -414,7 +416,7 @@ pub fn card(lines: &[String], dpi: u32, light: bool) -> Option<Painter> {
     for (font, wide, y, rgb) in &rows {
         // SAFETY: the painter's DC is alive.
         unsafe { SetTextColor(p.dc, colorref(*rgb)) };
-        p.draw(*font, pad, *y, wide);
+        p.draw(*font, pad_x, *y, wide);
     }
     p.opaque();
     Some(p)

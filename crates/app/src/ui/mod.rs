@@ -70,6 +70,7 @@ use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -365,7 +366,8 @@ const WM_APP_RESUMED: u32 = WM_APP + 13;
 const WM_APP_SUSPENDING: u32 = WM_APP + 14;
 /// The cursor moved on a widget (queued once however many moves, [`schedule_hover`]).
 const WM_APP_HOVER: u32 = WM_APP + 15;
-/// The cursor rested [`HOVER_MS`] on a device: show its card (posted by [`HOVER_TIMER`]).
+/// The cursor rested on a device for the tooltip delay: show its card (posted by
+/// [`HOVER_TIMER`]).
 const WM_APP_HOVER_DUE: u32 = WM_APP + 16;
 /// The cursor left a widget (`WM_MOUSELEAVE`): hide the card.
 const WM_APP_HOVER_END: u32 = WM_APP + 17;
@@ -386,10 +388,24 @@ const SELF_RETRY_TIMER: usize = 3;
 /// One-shot: removes the notification's temporary icon ([`notify::TEMP_ICON_MS`] after the
 /// last notification), through [`WM_APP_NOTIFY_DONE`].
 const NOTIFY_TIMER: usize = 4;
-/// One-shot: [`HOVER_MS`] after the cursor came to a device on a widget, shows its card,
-/// through [`WM_APP_HOVER_DUE`].
+/// One-shot: the tooltip delay ([`hover_delay`]) after the cursor came to a device on a
+/// widget, shows its card, through [`WM_APP_HOVER_DUE`].
 const HOVER_TIMER: usize = 5;
-const HOVER_MS: u32 = 400;
+
+/// How long the cursor rests on a device before its card shows: Windows' tooltip delay,
+/// read each time a hover starts, so a changed setting applies at once.
+fn hover_delay() -> u32 {
+    // SAFETY: no arguments.
+    tooltip_initial_delay(unsafe { GetDoubleClickTime() })
+}
+
+/// A tooltip's initial delay (`TTDT_INITIAL`) by default: the double-click time
+/// `double_click_ms` ("The default delay times are based on the double-click time … initial
+/// = GetDoubleClickTime()", 500 ms by default:
+/// <https://learn.microsoft.com/windows/win32/controls/ttm-setdelaytime>).
+fn tooltip_initial_delay(double_click_ms: u32) -> u32 {
+    double_click_ms
+}
 
 /// Sleep of the widget thread after the first click with `--debug-stall-widget`.
 const DEBUG_STALL: Duration = Duration::from_secs(10);
@@ -756,8 +772,8 @@ impl Ui {
     }
 
     /// The cursor moved on a widget. On a device other than the one hovered so far, the
-    /// card switches to it at once if one shows, else shows [`HOVER_MS`] later. On the
-    /// same device, a shown card follows a widget that moved.
+    /// card switches to it at once if one shows, else shows after the tooltip delay
+    /// ([`hover_delay`]). On the same device, a shown card follows a widget that moved.
     fn hover(&mut self) {
         let Some(hover) = self.hit() else {
             self.end_hover();
@@ -775,7 +791,7 @@ impl Ui {
             self.show_card(&read_snapshot(&self.runtime));
         } else {
             // SAFETY: our own window; setting an existing timer id restarts it.
-            unsafe { SetTimer(Some(self.host), HOVER_TIMER, HOVER_MS, None) };
+            unsafe { SetTimer(Some(self.host), HOVER_TIMER, hover_delay(), None) };
         }
     }
 
@@ -1728,12 +1744,17 @@ mod tests {
         let one = std::slice::from_ref(&s);
         let v = views(one, &Settings::default(), Some(&tips));
         // 10 % in 2 h: 80 % lasts 16 h.
-        assert_eq!(
-            v[0].tooltip,
-            "M\nBattery: 80%\nUpdated 5 min ago\nTime left: about 16 h"
-        );
+        assert_eq!(v[0].tooltip, "M · 80%\n5 min ago · about 16 h left");
         // The widget shows no tooltips: none is made for it.
         assert_eq!(views(one, &Settings::default(), None)[0].tooltip, "");
+    }
+
+    #[test]
+    fn hover_delay_is_the_tooltip_initial_delay() {
+        // The double-click time, as the user set it: 500 ms by default.
+        assert_eq!(tooltip_initial_delay(500), 500);
+        assert_eq!(tooltip_initial_delay(900), 900);
+        assert_eq!(tooltip_initial_delay(200), 200);
     }
 
     #[test]
