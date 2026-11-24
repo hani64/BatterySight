@@ -39,6 +39,7 @@
 
 mod card;
 mod chart;
+mod dwrite;
 pub mod fallback;
 mod history_window;
 mod menu;
@@ -460,6 +461,8 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
             return 1;
         }
     };
+    // DirectWrite too, as loading it may read from disk.
+    dwrite::init();
     let light = light_theme();
     let states = read_snapshot(&runtime);
     let unix_now = unix_now_ms();
@@ -531,6 +534,7 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         let _ = KillTimer(Some(host), HOVER_TIMER);
         let _ = DestroyWindow(host);
     }
+    dwrite::shutdown();
     0
 }
 
