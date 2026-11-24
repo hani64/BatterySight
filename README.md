@@ -1,16 +1,44 @@
 # BatterySight
 
-BatterySight is a free, open-source (GPLv3) Windows app that shows the battery level of wireless mice, keyboards, headsets and controllers on the taskbar. It replaces BatteryHub, which went offline on 2026-11-22. Unlike BatteryHub, it never keeps a device awake: it listens for what devices push and asks only when a device is provably awake because you are using it. Every supported device entry carries a verification status and a source.
+BatterySight is a free, open-source (GPLv3) Windows app that shows the battery level of wireless devices on the taskbar. It replaces BatteryHub, which went offline on 2026-11-22. Unlike BatteryHub, it never keeps a device awake: it listens for the battery reports devices send on their own and asks a device only on a few one-off events (see below). Every supported device entry carries a verification status and a source.
+
+## Status
+
+Milestone 1: Logitech devices that speak HID++ only. The goal is to cover wireless mice, keyboards, headsets and controllers of other vendors too; none is supported yet.
+
+Tested on real hardware, on Windows 11 build 26300 only:
+
+- Logitech PRO X Wireless Gaming Headset (USB dongle 046D:0ABA)
+- Logitech PRO X Superlight on its LIGHTSPEED receiver (046D:C547); the mouse names itself "PRO X Wireless"
+
+Other Logitech HID++ devices are expected to work from the protocol sources but are untested.
+
+### When BatterySight asks a device
+
+It sends a battery query only when:
+
+- the app starts or a device is plugged in,
+- a device reconnects (for example a mouse waking up and linking to its receiver again),
+- the PC resumes from sleep,
+- you click "Refresh now".
+
+Otherwise it only listens. Opening the menu never queries; it shows the last known values. A device known to be asleep is not asked until it reports again.
+
+### Known limitations
+
+- The PRO X Wireless headset does not report its battery while it is in use. Its level updates when the headset is switched on, when the PC resumes and on "Refresh now", so it can lag behind during a long session until audio-gated updates land.
 
 ## Privacy
 
 BatterySight collects no telemetry. Its only network call is the update check (arriving in milestone 4).
 
+For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it write every HID++ frame it sends and receives to `%LOCALAPPDATA%\BatterySight\sends.log`. Tracing is off by default.
+
 ## Usage
 
 Start `batterysight.exe`. It shows each device's battery level on the taskbar, next to the notification area (and next to the clock on other monitors' taskbars). Click it for the device list, "Refresh now" and "Exit". Only one instance runs per session; starting another does nothing.
 
-- `batterysight --tray-only` shows one notification-area icon per device instead. Use it if the widget does not appear on your Windows build. The app also switches to tray icons by itself when Windows refuses the widget window, and restarts itself with `--tray-only` when the widget stops responding for 1.5 s (a stalled widget would freeze the taskbar's mouse input).
+- `batterysight --tray-only` shows one notification-area icon per device instead. Use it if the widget does not appear on your Windows build. The app also switches to tray icons by itself when Windows refuses the widget window or the widget cannot find its place on the taskbar. If the widget stops responding (a stalled widget would freeze the taskbar's mouse input), it restarts itself with `--tray-only`: after about 1.5 s while Explorer is responsive, after at most 5 s otherwise.
 - `batterysight --list` prints the devices it finds, one per line, and exits.
 
 ## Building
