@@ -26,6 +26,7 @@
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
 //!   tracked with the state released.
 
+pub mod fallback;
 pub mod render;
 mod tray;
 pub mod watchdog;
@@ -54,6 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use fallback::{TrayReason, should_retry_widget};
 use tray::Tray;
 use widget::Widgets;
 
@@ -133,7 +135,8 @@ const WM_APP_TASKBAR_CREATED: u32 = WM_APP + 4;
 const WM_APP_ENVIRONMENT: u32 = WM_APP + 5;
 /// "Refresh now" was chosen.
 const WM_APP_REFRESH: u32 = WM_APP + 6;
-/// Fall back to tray icons if no widget is shown (posted by [`WIDGET_CHECK_TIMER`]).
+/// Fall back to tray icons if no widget is shown, or in tray mode try the widget again
+/// (posted by [`WIDGET_CHECK_TIMER`]).
 const WM_APP_CHECK_WIDGET: u32 = WM_APP + 7;
 /// "Exit" was chosen, or the host was asked to close.
 const WM_APP_EXIT: u32 = WM_APP + 8;
@@ -144,7 +147,9 @@ const WM_APP_TRAY: u32 = WM_APP + 10;
 
 /// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
-/// One-shot: [`WIDGET_CHECK_MS`] after start or `TaskbarCreated`, checks that a widget is shown.
+/// One-shot: [`WIDGET_CHECK_MS`] after the widgets start or `TaskbarCreated`, checks that a
+/// widget is shown; in tray mode, after a retry on a taskbar or display change failed, tries
+/// the widget once more ([`Ui::retry_widget`]).
 const WIDGET_CHECK_TIMER: usize = 2;
 const WIDGET_CHECK_MS: u32 = 5_000;
 const MENU_REFRESH: usize = 1;
@@ -159,6 +164,8 @@ static HOST: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// Whether the next left click on the widget stalls its thread (`--debug-stall-widget`).
 static DEBUG_STALL_ARMED: AtomicBool = AtomicBool::new(false);
+/// Whether the next widget check reports no anchor (`--debug-force-no-anchor`).
+static DEBUG_NO_ANCHOR_ARMED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// The UI state; lives on the UI thread only. See the module doc for how it is borrowed.
@@ -168,15 +175,18 @@ thread_local! {
 }
 
 pub struct Options {
-    /// Tray icons instead of the widget for this session.
-    pub tray_only: bool,
+    /// Tray icons instead of the widget for this session, and why; `None` starts the widget.
+    pub tray: Option<TrayReason>,
     /// Debug builds only: stall the widget thread for 10 s after the first click.
     pub debug_stall: bool,
+    /// Debug builds only: the first widget check reports no anchor, as if no widget showed.
+    pub debug_no_anchor: bool,
 }
 
 /// Runs the UI on this thread until "Exit". Returns the process exit code.
 pub fn run(options: &Options) -> i32 {
     DEBUG_STALL_ARMED.store(options.debug_stall, Ordering::Relaxed);
+    DEBUG_NO_ANCHOR_ARMED.store(options.debug_no_anchor, Ordering::Relaxed);
     let Some(host) = create_host() else {
         return 1;
     };
@@ -192,23 +202,22 @@ pub fn run(options: &Options) -> i32 {
     };
     let light = light_theme();
     let views = views(&read_snapshot(&runtime));
-    let surface = if options.tray_only {
-        None
-    } else {
-        Widgets::new(&views, light).ok().map(Surface::Widgets)
+    let widgets = match options.tray {
+        Some(reason) => Err(reason),
+        None => Widgets::new(&views, light).map_err(|_| TrayReason::CreateFailed),
     };
-    let surface = surface.unwrap_or_else(|| {
-        let mut tray = Tray::new(host);
-        tray.show(&views, light);
-        Surface::Tray(tray)
-    });
-    if matches!(surface, Surface::Widgets(_)) {
-        watchdog::arm(true);
-        watchdog::spawn();
-        // SAFETY: our own window.
-        unsafe { SetTimer(Some(host), HEARTBEAT_TIMER, watchdog::INTERVAL_MS, None) };
-        check_widget_later(host);
-    }
+    let (surface, tray_reason) = match widgets {
+        Ok(widgets) => {
+            start_widget_checks(host);
+            (Surface::Widgets(widgets), None)
+        }
+        Err(reason) => {
+            fallback::trace(reason);
+            let mut tray = Tray::new(host);
+            tray.show(&views, light);
+            (Surface::Tray(tray), Some(reason))
+        }
+    };
     UI.with(|ui| {
         *ui.borrow_mut() = Some(Ui {
             host,
@@ -216,6 +225,7 @@ pub fn run(options: &Options) -> i32 {
             views,
             light,
             surface,
+            tray_reason,
         });
     });
     let mut msg = MSG::default();
@@ -251,6 +261,8 @@ struct Ui {
     /// Whether the taskbar uses the light theme.
     light: bool,
     surface: Surface,
+    /// Why tray icons show the devices; `None` while the widgets do.
+    tray_reason: Option<TrayReason>,
 }
 
 impl Ui {
@@ -274,6 +286,9 @@ impl Ui {
                 self.show();
             }
             WM_APP_TASKBAR_CREATED => {
+                if self.retry_widget(true) {
+                    return;
+                }
                 let result = match &mut self.surface {
                     Surface::Widgets(w) => w.taskbar_created(&self.views, self.light),
                     Surface::Tray(t) => {
@@ -282,13 +297,16 @@ impl Ui {
                     }
                 };
                 if result.is_err() {
-                    self.fall_back_to_tray();
+                    self.fall_back_to_tray(TrayReason::CreateFailed);
                 } else if matches!(self.surface, Surface::Widgets(_)) {
                     check_widget_later(self.host);
                 }
             }
             WM_APP_ENVIRONMENT => {
                 self.light = light_theme();
+                if self.retry_widget(true) {
+                    return;
+                }
                 let result = match &mut self.surface {
                     Surface::Widgets(w) => w.environment_changed(&self.views, self.light),
                     Surface::Tray(t) => {
@@ -297,15 +315,17 @@ impl Ui {
                     }
                 };
                 if result.is_err() {
-                    self.fall_back_to_tray();
+                    self.fall_back_to_tray(TrayReason::CreateFailed);
                 }
             }
             WM_APP_REFRESH => self.runtime.refresh_now(),
             WM_APP_CHECK_WIDGET => {
-                if let Surface::Widgets(w) = &self.surface
-                    && w.missing()
-                {
-                    self.fall_back_to_tray();
+                if let Surface::Widgets(w) = &self.surface {
+                    if take_debug_no_anchor() || w.missing() {
+                        self.fall_back_to_tray(TrayReason::NoAnchor);
+                    }
+                } else {
+                    self.retry_widget(false);
                 }
             }
             _ => {}
@@ -322,13 +342,15 @@ impl Ui {
             }
         };
         if result.is_err() {
-            self.fall_back_to_tray();
+            self.fall_back_to_tray(TrayReason::CreateFailed);
         }
     }
 
-    /// Windows refused a widget window, or none is shown: tray icons for the rest of the
-    /// session.
-    fn fall_back_to_tray(&mut self) {
+    /// Windows refused a widget window, or none is shown: tray icons, until a taskbar or
+    /// display change brings the widget back ([`Ui::retry_widget`]).
+    fn fall_back_to_tray(&mut self, reason: TrayReason) {
+        fallback::trace(reason);
+        self.tray_reason = Some(reason);
         watchdog::arm(false);
         // SAFETY: our own window and timers; nothing reads the heartbeat in tray mode.
         unsafe {
@@ -339,6 +361,33 @@ impl Ui {
         tray.show(&self.views, self.light);
         // Dropping the widgets destroys their windows and hooks.
         self.surface = Surface::Tray(tray);
+    }
+
+    /// In tray mode after a failure that may pass ([`should_retry_widget`]), tries the
+    /// widget again and switches to it once one shows; the tray icons stay until then. A
+    /// failed try keeps tray mode and its reason. With `again_later` (a taskbar or display
+    /// change: Explorer may lay its taskbars out only after it), a failed try is repeated
+    /// once, [`WIDGET_CHECK_MS`] later; then the next change tries again. Returns whether it
+    /// switched.
+    fn retry_widget(&mut self, again_later: bool) -> bool {
+        if !self.tray_reason.is_some_and(should_retry_widget) {
+            return false;
+        }
+        // Dropping widgets that do not show destroys their windows and hooks.
+        let Some(widgets) = Widgets::new(&self.views, self.light)
+            .ok()
+            .filter(Widgets::shown)
+        else {
+            if again_later {
+                check_widget_later(self.host);
+            }
+            return false;
+        };
+        start_widget_checks(self.host);
+        self.tray_reason = None;
+        // Dropping the tray removes its icons.
+        self.surface = Surface::Widgets(widgets);
+        true
     }
 
     /// Removes the widgets or tray icons, then stops the runtime (bounded by its 2 s limit)
@@ -400,9 +449,24 @@ fn check_widget_later(host: HWND) {
     unsafe { SetTimer(Some(host), WIDGET_CHECK_TIMER, WIDGET_CHECK_MS, None) };
 }
 
+/// Widgets now show the devices: arms the watchdog and its heartbeat, and checks later
+/// that a widget is shown.
+fn start_widget_checks(host: HWND) {
+    watchdog::arm(true);
+    watchdog::spawn();
+    // SAFETY: our own window; setting an existing timer id restarts it.
+    unsafe { SetTimer(Some(host), HEARTBEAT_TIMER, watchdog::INTERVAL_MS, None) };
+    check_widget_later(host);
+}
+
 /// Whether this click should stall the widget thread (`--debug-stall-widget`, once).
 fn take_debug_stall() -> bool {
     DEBUG_STALL_ARMED.swap(false, Ordering::Relaxed)
+}
+
+/// Whether this widget check reports no anchor (`--debug-force-no-anchor`, once).
+fn take_debug_no_anchor() -> bool {
+    DEBUG_NO_ANCHOR_ARMED.swap(false, Ordering::Relaxed)
 }
 
 fn hinstance() -> HINSTANCE {

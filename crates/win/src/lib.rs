@@ -6,4 +6,4 @@ pub mod notify;
 pub mod power;
 pub mod reactor;
 pub mod runtime;
-mod trace;
+pub mod trace;

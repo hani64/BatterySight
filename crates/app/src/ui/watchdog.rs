@@ -126,8 +126,13 @@ pub fn arm(armed: bool) {
     ARMED.store(armed, Ordering::Relaxed);
 }
 
-/// Starts the watchdog thread. It owns no windows and runs until the process ends.
+/// Starts the watchdog thread, once per process (later calls do nothing). It owns no
+/// windows and runs until the process ends.
 pub fn spawn() {
+    static SPAWNED: AtomicBool = AtomicBool::new(false);
+    if SPAWNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let _ = thread::Builder::new()
         .name("batterysight-watchdog".into())
         .spawn(watch);

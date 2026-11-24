@@ -203,8 +203,12 @@ impl Widgets {
 
     /// Whether no widget is shown although a taskbar exists; see [`needs_tray`].
     pub fn missing(&self) -> bool {
-        let shown = self.widgets.iter().any(|w| w.pos.is_some());
-        needs_tray(!taskbars().is_empty(), shown)
+        needs_tray(!taskbars().is_empty(), self.shown())
+    }
+
+    /// Whether a widget is shown on some taskbar.
+    pub fn shown(&self) -> bool {
+        self.widgets.iter().any(|w| w.pos.is_some())
     }
 
     /// Destroys the windows and removes the hooks. The UIA thread ends when `self` drops.
@@ -352,7 +356,8 @@ fn class_name(hwnd: HWND) -> String {
 
 /// Whether the session must switch to tray icons: a taskbar exists but no widget is shown on
 /// any (for example, a Windows build without a visible `TrayNotifyWnd`), so nothing would
-/// show the devices or offer "Exit". Without any taskbar, tray icons cannot show either.
+/// show the devices or offer "Exit". Without any taskbar, tray icons cannot show either. A
+/// later taskbar or display change tries the widget again.
 fn needs_tray(taskbar: bool, shown: bool) -> bool {
     taskbar && !shown
 }

@@ -27,12 +27,14 @@ fn main() {
     }
     // `--takeover` (hidden): started by the widget watchdog just before it ends this
     // instance, so wait for the instance to go instead of leaving.
-    let Some(instance) = SingleInstance::acquire(has("--takeover")) else {
+    let takeover = has("--takeover");
+    let Some(instance) = SingleInstance::acquire(takeover) else {
         return;
     };
     let options = ui::Options {
-        tray_only: has("--tray-only"),
+        tray: ui::fallback::start_reason(has("--tray-only"), takeover),
         debug_stall: cfg!(debug_assertions) && has("--debug-stall-widget"),
+        debug_no_anchor: cfg!(debug_assertions) && has("--debug-force-no-anchor"),
     };
     let code = ui::run(&options);
     drop(instance);
