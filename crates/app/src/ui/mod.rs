@@ -287,7 +287,6 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         notifier: Notifier::new(host),
         history,
         recorder: Recorder::default(),
-        suspended: false,
     };
     // Nothing was observed while the app was not running.
     ui.session_break();
@@ -304,6 +303,9 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
             DispatchMessageW(&msg);
         }
     }
+    // Already done by "Exit"; this covers a message loop that ended otherwise. The store
+    // first: a window that does not close in time must not hold up the writes.
+    stop_store();
     history_window::close();
     // SAFETY: our own window and timers (killing one that is not set fails harmlessly).
     unsafe {
@@ -313,8 +315,6 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         let _ = KillTimer(Some(host), NOTIFY_TIMER);
         let _ = DestroyWindow(host);
     }
-    // Already done by "Exit"; this covers a message loop that ended otherwise.
-    stop_store();
     0
 }
 
@@ -350,8 +350,6 @@ struct Ui {
     /// those recorded since.
     history: HashMap<DeviceKey, Vec<Sample>>,
     recorder: Recorder,
-    /// A session break was recorded as the PC went to sleep, and it has not resumed since.
-    suspended: bool,
 }
 
 /// When the widget fell back, and how many self-retries have run since.
@@ -435,14 +433,11 @@ impl Ui {
                 }
             }
             WM_APP_NOTIFY_DONE => self.notifier.remove(),
-            // Nothing is observed while the PC sleeps. Recorded here, the break is queued
-            // ahead of whatever the resume brings (the device thread posts its readings
-            // only once the PC is awake again).
-            WM_APP_SUSPENDING => {
-                self.session_break();
-                self.suspended = true;
-            }
-            WM_APP_RESUMED => self.resumed(),
+            // Nothing is observed while the PC sleeps. Recorded as it goes, the break is
+            // queued ahead of whatever the resume brings; recorded again on resume, it also
+            // covers a reading taken between the suspend notice and the sleep (a no-op for
+            // devices not read since the first).
+            WM_APP_SUSPENDING | WM_APP_RESUMED => self.session_break(),
             _ => {}
         }
     }
@@ -479,15 +474,6 @@ impl Ui {
         let now = unix_now_ms();
         let samples = self.recorder.session_break(&self.history, now);
         self.keep(samples, &read_snapshot(&self.runtime), now);
-    }
-
-    /// The PC resumed: the fallback break, when none was recorded as it went to sleep (the
-    /// suspend notice was missed). One recorded now could follow a resume reading posted
-    /// before this message.
-    fn resumed(&mut self) {
-        if !std::mem::take(&mut self.suspended) {
-            self.session_break();
-        }
     }
 
     /// Appends `samples` to `history.tsv` (by the store's writer), keeps them in
