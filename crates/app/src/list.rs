@@ -6,13 +6,16 @@ use std::sync::PoisonError;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use batterysight_core::engines::hidpp::engine::DEVICE_TIMEOUT_MS;
 use batterysight_core::model::{
     Charge, CoarseLevel, DeviceState, Level, Presence, Verification, Via,
 };
 use batterysight_win::runtime;
 
-/// The list is printed once no change arrived for this long...
-const QUIET: Duration = Duration::from_secs(3);
+/// The list is printed once no change arrived for this long... Longer than the
+/// HID++ device timeout, so a device whose first answer comes late, or a direct
+/// device registered asleep only when its first read times out, still shows.
+const QUIET: Duration = Duration::from_millis(DEVICE_TIMEOUT_MS as u64 + 1_000);
 /// ...or once this much time has passed since the runtime started.
 const MAX_WAIT: Duration = Duration::from_secs(10);
 

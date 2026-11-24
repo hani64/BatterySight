@@ -39,7 +39,7 @@ const RECEIVER_TIMEOUT_MS: u32 = 1_000;
 /// Timeout of a request to a device (receiver slot or direct): an idle device
 /// may take over a second to wake (owner trace 2026-11-23: 443 to 1 288 ms).
 /// Source: Solaar `base.py` `_DEVICE_REQUEST_TIMEOUT` / `_PING_TIMEOUT` (4 s).
-const DEVICE_TIMEOUT_MS: u32 = 4_000;
+pub const DEVICE_TIMEOUT_MS: u32 = 4_000;
 /// HID++ 1.0 sub ids from 0x80 up are register access and errors, never a feature reply.
 const FIRST_REGISTER_SUB_ID: u8 = 0x80;
 
@@ -139,6 +139,9 @@ pub struct HidppEngine {
     in_flight: BTreeMap<u8, InFlight>,
     /// Indices whose link came up while unknown: discovered on the next group grant.
     pending: BTreeSet<u8>,
+    /// Slots whose one late-reply rediscovery is used up; re-armed by a 0x41 for
+    /// the slot, by `forget` or by a successful discovery.
+    late_used: BTreeSet<u8>,
     budgets: HashMap<GrantId, Budget>,
 }
 
@@ -222,6 +225,7 @@ impl HidppEngine {
             devices: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             pending: BTreeSet::new(),
+            late_used: BTreeSet::new(),
             budgets: HashMap::new(),
         }
     }
@@ -414,6 +418,7 @@ impl HidppEngine {
 
         // The same device may have moved to another index (re-pairing).
         self.devices.retain(|_, d| d.key != key);
+        self.late_used.remove(&index);
         self.devices.insert(
             index,
             Device {
@@ -465,6 +470,7 @@ impl HidppEngine {
     /// The device on `index` is gone (unpaired): drop it so the next link-up rediscovers the index.
     fn forget(&mut self, index: u8, actions: &mut Vec<Action>) {
         self.in_flight.remove(&index);
+        self.late_used.remove(&index);
         if let Some(d) = self.devices.remove(&index) {
             actions.push(Action::Unregister(d.key));
         }
@@ -536,6 +542,8 @@ impl HidppEngine {
             return;
         };
         let lost = flags & LINK_LOST != 0;
+        // The receiver vouches for the slot again: a late reply may rediscover it once more.
+        self.late_used.remove(&index);
         if let Some(d) = self.devices.get(&index) {
             actions.push(if lost {
                 Action::Asleep(d.key.clone())
@@ -551,11 +559,13 @@ impl HidppEngine {
 
     /// An answer to one of our requests from slot `index` that came after its
     /// timeout: the device is there and awake. If the slot is still unknown,
-    /// discover it as on a link-up (an already linked device sends no 0x41).
+    /// discover it as on a link-up (an already linked device sends no 0x41) —
+    /// once: a device that keeps answering too late is not pinged forever.
     fn late_reply(&mut self, index: u8, actions: &mut Vec<Action>) {
         if self.devices.contains_key(&index)
             || self.pending.contains(&index)
             || self.in_flight.contains_key(&index)
+            || !self.late_used.insert(index)
         {
             return;
         }
@@ -667,6 +677,9 @@ impl Engine for HidppEngine {
                     } else if !f.conversation.retried {
                         // A receiver reports a sleeping device with an error, so
                         // silence is a lost reply: ask once more within the grant.
+                        // Only a grant that outlives the timeout allows it: a Connected
+                        // grant (10 s) does, a Resume/RefreshNow grant (3 s) has expired,
+                        // so `issue` sends nothing and presence stays as it is.
                         let again = Conversation {
                             retried: true,
                             ..f.conversation
@@ -1570,9 +1583,10 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     #[test]
     fn receiver_read_timeout_retries_once_and_keeps_presence() {
+        // A Connected grant (discovery budget, 10 s) outlives a 4 s timeout: the retry is real.
         let mut e = mouse_engine();
         let read = s(&[0x10, 1, 6, 0x1B]);
-        let a = e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
+        let a = e.on_grant(&grant(2, &mouse_key(), Trigger::Connected), 100);
         assert_eq!(sent(&a), vec![read.clone()]);
 
         // A receiver reports a sleeping device with an error: silence is a lost reply.
@@ -1590,6 +1604,24 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
         let a = e.on_tick(8_100);
         assert!(a.is_empty(), "no second retry, no Asleep: {a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn receiver_read_timeout_under_short_read_grant_is_not_retried() {
+        // Resume/RefreshNow grants last Policy::read_ms (3 s): expired when a 4 s read times out.
+        let mut e = mouse_engine();
+        let refresh = Grant {
+            expires_ms: 100 + 3_000,
+            max_requests: 4,
+            ..grant(2, &mouse_key(), Trigger::RefreshNow)
+        };
+        let a = e.on_grant(&refresh, 100);
+        assert_eq!(sent(&a), vec![s(&[0x10, 1, 6, 0x1B])]);
+
+        let a = e.on_tick(4_100);
+
+        assert!(a.is_empty(), "no retry, no Asleep: {a:?}");
         assert_eq!(e.next_deadline(), None);
     }
 
@@ -1781,6 +1813,44 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
         // Registered: further late frames from the slot are ignored.
         assert!(e.on_report(LONG_C, &late, 10 + 4_505).is_empty());
+    }
+
+    #[test]
+    fn late_reply_rediscovers_a_slot_once_until_rearmed() {
+        let ping = s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A]);
+        let late = l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]);
+        let mut e = receiver_notified();
+        let gk = e.group_key();
+        e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 3);
+        assert_eq!(
+            sent(&e.on_grant(&grant(2, &gk, Trigger::Connected), 10)),
+            vec![ping.clone()]
+        );
+        e.on_tick(10 + 4_000);
+
+        // First late reply: one rediscovery.
+        let a = e.on_report(LONG_C, &late, 4_100);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+        assert_eq!(
+            sent(&e.on_grant(&grant(3, &gk, Trigger::Connected), 4_101)),
+            vec![ping.clone()]
+        );
+        e.on_tick(4_101 + 4_000);
+
+        // Its ping timed out too: a second late reply asks nothing more.
+        let a = e.on_report(LONG_C, &late, 8_200);
+        assert!(a.is_empty(), "{a:?}");
+
+        // A real 0x41 for the slot re-arms it.
+        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 8_201);
+        assert_eq!(a, vec![Action::Connected(gk.clone())]);
+        assert_eq!(
+            sent(&e.on_grant(&grant(4, &gk, Trigger::Connected), 8_202)),
+            vec![ping]
+        );
+        e.on_tick(8_202 + 4_000);
+        let a = e.on_report(LONG_C, &late, 12_300);
+        assert_eq!(a, vec![Action::Connected(gk)]);
     }
 
     #[test]
