@@ -46,8 +46,9 @@ const RECEIVER_TIMEOUT_MS: u32 = 1_000;
 /// Source: Solaar `base.py` `_DEVICE_REQUEST_TIMEOUT` / `_PING_TIMEOUT` (4 s).
 pub const DEVICE_TIMEOUT_MS: u32 = 4_000;
 /// Least time between two activity reads of a device whose catalog entry has
-/// `no_in_use_push`: a headset's level moves about a point in 8 minutes of use (owner
-/// observation: ~5 points in 43 min), so 5 minutes keeps it current with few requests.
+/// `no_in_use_push`, its floor in the scheduler (the default and user intervals never go
+/// below it): a headset's level moves about a point in 8 minutes of use (owner observation:
+/// ~5 points in 43 min), so 5 minutes keeps it current with few requests.
 pub const ACTIVITY_GAP_MS: Ms = 300_000;
 /// How long a direct group whose discovery registered nothing waits before it is discovered
 /// again, after its first, second and third failure; after the fourth it waits for the next

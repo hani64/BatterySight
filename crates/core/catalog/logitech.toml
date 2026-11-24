@@ -7,7 +7,8 @@
 # least one id. The entry's `name` replaces the name the device reports.
 #
 # `no_in_use_push = true` marks a device that reports its battery only when it powers on or
-# off: it is read while audio plays to it, at most every 5 minutes.
+# off: it is read while audio plays to it, every 10 minutes by default and never more often
+# than every 5 minutes.
 
 [[family]]
 engine = "hidpp"

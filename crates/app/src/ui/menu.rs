@@ -3,6 +3,7 @@
 //! made from it ([`track`]).
 
 use batterysight_core::model::{DeviceKey, DeviceState};
+use batterysight_core::scheduler::DEFAULT_INTERVAL_MS;
 use batterysight_core::settings::{
     DisplayMode, INTERVAL_MAX_MIN, MonitorChoice, Settings, Threshold,
 };
@@ -287,12 +288,18 @@ impl Builder {
 
     /// "Check battery while in use": the presets at or above the device's minimum
     /// (`min_ms`, rounded up to whole minutes) and `chosen` when it is none of them. The
-    /// checked entry is the interval in effect: `chosen`, but never below the minimum.
+    /// checked entry is the interval in effect: `chosen`, or the default without one, but
+    /// never below the minimum.
     fn intervals(&mut self, key: &DeviceKey, chosen: Option<u16>, min_ms: Ms) -> Vec<Item> {
-        let min = u16::try_from(min_ms.div_ceil(60_000))
-            .unwrap_or(u16::MAX)
-            .clamp(1, INTERVAL_MAX_MIN);
-        let current = chosen.unwrap_or(min).max(min);
+        let minutes_of = |ms: Ms| {
+            u16::try_from(ms.div_ceil(60_000))
+                .unwrap_or(u16::MAX)
+                .clamp(1, INTERVAL_MAX_MIN)
+        };
+        let min = minutes_of(min_ms);
+        let current = chosen
+            .unwrap_or_else(|| minutes_of(DEFAULT_INTERVAL_MS))
+            .max(min);
         let mut minutes: Vec<u16> = INTERVALS.into_iter().filter(|&m| m >= min).collect();
         if !minutes.contains(&current) {
             minutes.push(current);
@@ -972,26 +979,31 @@ mod tests {
                 "Every 60 min"
             ]
         );
+        // The 5-minute headset: 5 offered, the 10-minute default checked.
         assert_eq!(
             intervals(&polled_headset(300_000), &settings),
             [
-                "Every 5 min ✓",
-                "Every 10 min",
+                "Every 5 min",
+                "Every 10 min ✓",
                 "Every 15 min",
                 "Every 30 min",
                 "Every 60 min"
             ]
         );
-        // A minimum between presets, rounded up to whole minutes, is listed as the default.
+        // A minimum between presets is rounded up to whole minutes: only presets above it.
         assert_eq!(
             intervals(&polled_headset(400_000), &settings),
             [
-                "Every 7 min ✓",
-                "Every 10 min",
+                "Every 10 min ✓",
                 "Every 15 min",
                 "Every 30 min",
                 "Every 60 min"
             ]
+        );
+        // A minimum above the default is the default.
+        assert_eq!(
+            intervals(&polled_headset(900_000), &settings),
+            ["Every 15 min ✓", "Every 30 min", "Every 60 min"]
         );
     }
 

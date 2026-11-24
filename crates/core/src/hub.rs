@@ -1531,9 +1531,10 @@ quirks = { query_wakes = true }
         hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
         hub.handle(logi(2), 2_000);
 
-        hub.handle(HubInput::Activity(a.clone()), 101_999);
+        // The refresh ended the registration's wake: the default gap, from the new read.
+        hub.handle(HubInput::Activity(a.clone()), 601_999);
         assert_eq!(grants(&second), vec![(group_key(2), Trigger::Arrival)]);
-        hub.handle(HubInput::Activity(a.clone()), 102_000);
+        hub.handle(HubInput::Activity(a.clone()), 602_000);
         assert_eq!(grants(&second).last(), Some(&(a, Trigger::Activity)));
     }
 
