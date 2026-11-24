@@ -2,7 +2,7 @@
 //! settings only, so opening it sends no device traffic and reads no file) and the popup
 //! made from it ([`track`]).
 
-use batterysight_core::model::{DeviceKey, DeviceState, Presence};
+use batterysight_core::model::{DeviceKey, DeviceState};
 use batterysight_core::settings::{DisplayMode, MonitorChoice, Settings, Threshold};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -108,11 +108,8 @@ impl Model {
     ) -> Model {
         let mut b = Builder::default();
         let mut items = Vec::new();
-        let listed: Vec<&DeviceState> = settings
-            .ordered(states)
-            .into_iter()
-            .filter(|s| s.presence != Presence::Offline)
-            .collect();
+        // Disconnected devices too: the widget shows them through the hub's removal grace.
+        let listed: Vec<&DeviceState> = settings.ordered(states);
         let shown: Vec<&DeviceKey> = listed
             .iter()
             .map(|s| &s.key)
@@ -697,11 +694,22 @@ mod tests {
     }
 
     #[test]
-    fn offline_devices_are_not_listed() {
+    fn disconnected_devices_are_listed_with_their_submenu() {
+        // The widget shows a disconnected device (through the hub's removal grace), so the
+        // menu lists it, and counts it among the shown devices for moves.
         let mut states = two_devices();
         states[0].presence = Presence::Offline;
         let model = Model::new(&states, &Settings::default(), &two_monitors(), None, true);
-        assert!(!lines(&model.items).iter().any(|l| l.contains("Superlight")));
+        assert_eq!(
+            lines(&model.items)[..5],
+            [
+                "PRO X Superlight — disconnected ▸",
+                "  Show on taskbar ✓",
+                "  Move left (disabled)",
+                "  Move right",
+                "  Low-battery alert ▸",
+            ]
+        );
     }
 
     #[test]

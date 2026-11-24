@@ -214,7 +214,9 @@ fn layout(
         let caption = caption.map(|c| part(Face::Caption, c, palette.text, opacity));
         let start = x;
         match caption {
-            // Under the glyph, the two centred as one, when they fit the taskbar.
+            // Under the glyph, the two centred as one, when they fit the taskbar. They share
+            // columns, and `colorize` colours a column by the first span covering it: the
+            // two must keep one colour and opacity (both the text colour at the device's).
             Some(mut caption) if glyph.size.cy + caption.size.cy <= height => {
                 let column = glyph.size.cx.max(caption.size.cx);
                 let top = (height - glyph.size.cy - caption.size.cy) / 2;
