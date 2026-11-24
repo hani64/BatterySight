@@ -5,16 +5,18 @@
 //!
 //! The UI thread (the main thread) owns a hidden host window, the widget windows (children
 //! of Explorer's taskbars, so Explorer's taskbar thread shares this thread's input queue),
-//! the tray icons in tray mode, a low-battery notification's temporary icon and the history
-//! window (a normal top-level window). It only paints, positions, shows notifications and
-//! handles menu and mouse input; its calls to Explorer are the ones `widget` and `tray`
-//! list. The device runtime's `on_change` runs on the device thread and only posts
-//! [`WM_APP_CHANGED`] here; the menu reads the snapshot, the in-memory settings and the
-//! monitor list, and sends no device traffic. Settings and the last 30 days of battery
-//! history are loaded before the UI starts; changes are saved, history samples (recorded
-//! from snapshot changes, never from device traffic of their own) appended, and the Run
-//! value written, by the store's writer thread ([`Store`]). UI Automation runs on its own
-//! windowless thread (`widget`), and the [`watchdog`] on another.
+//! the tray icons in tray mode and a low-battery notification's temporary icon. It only
+//! paints, positions, shows notifications and handles menu and mouse input; its calls to
+//! Explorer are the ones `widget` and `tray` list. The device runtime's `on_change` runs on
+//! the device thread and only posts [`WM_APP_CHANGED`] here; the menu reads the snapshot,
+//! the in-memory settings and the monitor list, and sends no device traffic. Settings and
+//! the last 30 days of battery history are loaded before the UI starts; changes are saved,
+//! history samples (recorded from snapshot changes, never from device traffic of their
+//! own, and a session break at start and on resume) appended, and the Run value written,
+//! by the store's writer thread ([`Store`]). The history window (a normal top-level window)
+//! runs on its own thread, which this thread only sends data to (`history_window`). UI
+//! Automation runs on its own windowless thread (`widget`), and the [`watchdog`] on
+//! another.
 //!
 //! # Re-entrancy
 //!
@@ -24,17 +26,15 @@
 //! re-entered while the UI state is borrowed. One rule covers it:
 //!
 //! - Messages from outside (`TaskbarCreated`, `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`,
-//!   `WM_CLOSE`, WinEvent callbacks, `WM_DPICHANGED_AFTERPARENT`, clicks and tray callbacks)
-//!   never touch the state where they arrive: they post one of our `WM_APP_*` messages.
+//!   `WM_POWERBROADCAST`, `WM_CLOSE`, WinEvent callbacks, `WM_DPICHANGED_AFTERPARENT`,
+//!   clicks and tray callbacks) never touch the state where they arrive: they post one of
+//!   our `WM_APP_*` messages.
 //!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`],
 //!   [`WM_APP_SELF_RETRY`] or [`WM_APP_NOTIFY_DONE`].
 //! - Only `WM_APP_*` handlers borrow the state. One that arrives while the state is borrowed
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
 //!   tracked with the state released; the chosen command borrows it again afterwards.
-//! - The history window keeps its own copy of the samples, handed over by `WM_APP_*`
-//!   handlers; its procedure works on that copy only and never borrows the UI state
-//!   (see `history_window`).
 
 mod chart;
 pub mod fallback;
@@ -68,10 +68,10 @@ use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegG
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC, PostMessageW,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP,
+    WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -179,6 +179,8 @@ const WM_APP_TRAY: u32 = WM_APP + 10;
 const WM_APP_SELF_RETRY: u32 = WM_APP + 11;
 /// Remove the notification's temporary icon (posted by [`NOTIFY_TIMER`]).
 const WM_APP_NOTIFY_DONE: u32 = WM_APP + 12;
+/// The PC resumed from sleep (`WM_POWERBROADCAST`, `PBT_APMRESUMEAUTOMATIC`).
+const WM_APP_RESUMED: u32 = WM_APP + 13;
 
 /// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
@@ -284,6 +286,8 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
         history,
         recorder: Recorder::default(),
     };
+    // Nothing was observed while the app was not running.
+    ui.session_break();
     ui.record(&states);
     ui.schedule_self_retry();
     UI.with(|cell| *cell.borrow_mut() = Some(ui));
@@ -291,10 +295,6 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
     // SAFETY: `msg` outlives each call. GetMessageW returns -1 on error, 0 on WM_QUIT.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
         watchdog::beat();
-        // The history window's keyboard input (Tab, arrows, Esc) is dispatched by it.
-        if history_window::dialog_message(&msg) {
-            continue;
-        }
         // SAFETY: `msg` came from GetMessageW.
         unsafe {
             let _ = TranslateMessage(&msg);
@@ -430,6 +430,8 @@ impl Ui {
                 }
             }
             WM_APP_NOTIFY_DONE => self.notifier.remove(),
+            // Nothing was observed while the PC slept.
+            WM_APP_RESUMED => self.session_break(),
             _ => {}
         }
     }
@@ -453,11 +455,25 @@ impl Ui {
         self.notifier.show(&alerts, on, view, self.light);
     }
 
-    /// Records the samples `states` give (hidden devices too): appended to `history.tsv` by
-    /// the store's writer, kept in [`Ui::history`] and handed to an open history window.
+    /// Records the samples `states` give (hidden devices too).
     fn record(&mut self, states: &[DeviceState]) {
         let now = unix_now_ms();
         let samples = self.recorder.observe(states, now);
+        self.keep(samples, states, now);
+    }
+
+    /// Records a session break for every known device ([`Recorder::session_break`]): the
+    /// time since each one's last sample was not observed.
+    fn session_break(&mut self) {
+        let now = unix_now_ms();
+        let samples = self.recorder.session_break(&self.history, now);
+        self.keep(samples, &read_snapshot(&self.runtime), now);
+    }
+
+    /// Appends `samples` to `history.tsv` (by the store's writer), keeps them in
+    /// [`Ui::history`] and hands them, with the devices of `states`, to an open history
+    /// window.
+    fn keep(&mut self, samples: Vec<Sample>, states: &[DeviceState], now: u64) {
         if !samples.is_empty() {
             with_store(|store| {
                 for s in &samples {
@@ -938,6 +954,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         // Never handled where they arrive (see the module doc); WM_SETTINGCHANGE's string
         // is not needed, every change is re-read.
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => post(WM_APP_ENVIRONMENT),
+        WM_POWERBROADCAST => {
+            if wp.0 == PBT_APMRESUMEAUTOMATIC as usize {
+                post(WM_APP_RESUMED);
+            }
+            return LRESULT(1);
+        }
         _ if msg == taskbar_created && msg != 0 => post(WM_APP_TASKBAR_CREATED),
         WM_CLOSE => post(WM_APP_EXIT),
         WM_ENDSESSION if wp.0 != 0 => exit(),
@@ -949,7 +971,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 post(WM_APP_MENU);
             }
         }
-        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET | WM_APP_SELF_RETRY | WM_APP_NOTIFY_DONE => {
+        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET
+        | WM_APP_SELF_RETRY
+        | WM_APP_NOTIFY_DONE
+        | WM_APP_RESUMED => {
             if ui_busy() {
                 // SAFETY: no pointers involved.
                 let _ = unsafe { PostMessageW(Some(hwnd), msg, wp, lp) };

@@ -26,20 +26,27 @@ struct Plot {
     lines: Vec<Vec<(u64, u8)>>,
     /// `(from, to)` while charging.
     charging: Vec<(u64, u64)>,
+    /// Whether a reading was taken in the window (the sample carried in from before it
+    /// and session breaks are none).
+    readings: bool,
 }
 
 /// The plot of `samples` (in time order) from `from` to `now`. It starts with the last
 /// sample before `from`, so a line enters from the left edge. A line runs from a sample on
-/// only while the device is awake and has a level; a sample asleep or offline ends the
-/// line at its level, and draws nothing until the device is awake again. A charging
-/// sample shades the time until the next sample (or now).
+/// only while the device is awake and has a level; a sample asleep or offline (a session
+/// break too) ends the line at its level, and draws nothing until the device is awake
+/// again. An awake charging sample shades the time until the next sample (or now, for the
+/// latest).
 fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     let end = samples.partition_point(|s| s.at_unix_ms <= now);
     let start = samples[..end]
         .partition_point(|s| s.at_unix_ms < from)
         .saturating_sub(1);
     let shown = &samples[start..end];
-    let mut plot = Plot::default();
+    let mut plot = Plot {
+        readings: shown.iter().any(|s| s.at_unix_ms >= from && !s.is_break()),
+        ..Plot::default()
+    };
     let mut line = Vec::new();
     for (i, s) in shown.iter().enumerate() {
         let awake = s.presence == Presence::Online;
@@ -50,7 +57,7 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
         if (!awake || s.level.is_none()) && !line.is_empty() {
             plot.lines.push(std::mem::take(&mut line));
         }
-        if s.charge == Charge::Charging {
+        if awake && s.charge == Charge::Charging {
             let to = shown.get(i + 1).map_or(now, |next| next.at_unix_ms);
             match plot.charging.last_mut() {
                 Some(last) if last.1 == s.at_unix_ms => last.1 = to,
@@ -184,7 +191,7 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration, light: b
         let below = area.bottom + text_h / 8;
         text(dc, area.left, below, &start_label(span));
         text(dc, area.right - text_width(dc, "now"), below, "now");
-        if plot.lines.is_empty() {
+        if !plot.readings {
             let w = text_width(dc, NO_DATA);
             text(
                 dc,
@@ -375,5 +382,56 @@ mod tests {
             .map(|p| p.1)
             .collect();
         assert_eq!(heights, [100, 60, 20, 5]);
+    }
+
+    #[test]
+    fn session_break_leaves_a_gap() {
+        let samples = [
+            on(0, 82),
+            on(60, 80),
+            // The PC was off: started again at 08:00.
+            Sample::session_break(DeviceKey("logi:4082:1".into()), at(600)),
+            on(600, 80),
+            on(660, 78),
+        ];
+        assert_eq!(
+            plot(&samples, at(0), at(700)).lines,
+            [
+                vec![(at(0), 82), (at(60), 80)],
+                vec![(at(600), 80), (at(660), 78)]
+            ]
+        );
+    }
+
+    #[test]
+    fn only_samples_in_the_window_are_readings() {
+        // Only the carry-in before the window: nothing read in it.
+        let samples = [on(0, 90)];
+        assert!(!plot(&samples, at(10), at(20)).readings);
+        // Nor is a session break.
+        let samples = [
+            on(0, 90),
+            Sample::session_break(DeviceKey("logi:4082:1".into()), at(15)),
+        ];
+        assert!(!plot(&samples, at(10), at(20)).readings);
+        assert!(plot(&[on(0, 90), on(15, 89)], at(10), at(20)).readings);
+        assert!(!plot(&[], at(10), at(20)).readings);
+    }
+
+    #[test]
+    fn charging_is_shaded_only_while_online() {
+        let charging = |m, presence| s(m, Some(Level::Percent(50)), presence, Charge::Charging);
+        // Offline or asleep with a charging state kept: no shade.
+        let samples = [
+            charging(0, Presence::Offline),
+            charging(10, Presence::Asleep),
+        ];
+        assert!(plot(&samples, at(0), at(50)).charging.is_empty());
+        // Online and charging: shaded until the next sample, here the device leaving.
+        let samples = [
+            charging(10, Presence::Online),
+            charging(30, Presence::Offline),
+        ];
+        assert_eq!(plot(&samples, at(0), at(50)).charging, [(at(10), at(30))]);
     }
 }
