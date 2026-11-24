@@ -4,15 +4,17 @@
 //!
 //! The factories, the system font collection and a software render target are made once
 //! per thread ([`init`]: on the UI thread at start, before any widget shares Explorer's
-//! input queue, as loading them may read from disk) and released by [`shutdown`]. A paint
-//! makes only its text formats, layouts and brush, and binds the target to the painter's
-//! DC: all in-process, nothing waits on another thread. Should any of it fail, DirectWrite
-//! is off for the rest of the session (traced once) and `render` draws with GDI.
+//! input queue, with a little text drawn so fonts and rasteriser load then, as loading them
+//! may read from disk) and released by [`shutdown`]. A paint makes only its text formats,
+//! layouts and brush, and binds the target to the painter's DC: all in-process, nothing
+//! waits on another thread. Should a paint fail, GDI draws it; a lost render target is
+//! made again for the next paint, any other failure turns DirectWrite off for the rest of
+//! the session (traced once).
 
 use std::cell::RefCell;
 
 use batterysight_win::trace::ui_line;
-use windows::Win32::Foundation::{RECT, SIZE};
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -79,11 +81,13 @@ pub struct Fill {
     pub inside: [u8; 3],
 }
 
-/// Makes this thread's engine, if not tried yet.
+/// Makes this thread's engine, if not tried yet, and draws a little with it, so its fonts
+/// and rasteriser load now (before any widget exists, on the UI thread) rather than in the
+/// first paint.
 pub fn init() {
     let untried = ENGINE.with_borrow(|s| matches!(s, State::Untried));
     if untried {
-        let state = match Engine::new() {
+        let state = match Engine::new().and_then(|e| super::render::warm_up(&e).map(|()| e)) {
             Ok(engine) => State::Ready(engine),
             Err(e) => {
                 off(&e);
@@ -100,7 +104,7 @@ pub fn shutdown() {
 }
 
 /// Runs `f` with this thread's engine (made first if need be). `None` while DirectWrite is
-/// off or when `f` gives up; an error from `f` turns DirectWrite off.
+/// off or when `f` gives up or fails ([`failed`]).
 pub fn with<R>(f: impl FnOnce(&Engine) -> Result<Option<R>>) -> Option<R> {
     init();
     let result = ENGINE.with_borrow(|s| match s {
@@ -108,10 +112,20 @@ pub fn with<R>(f: impl FnOnce(&Engine) -> Result<Option<R>>) -> Option<R> {
         _ => None,
     })?;
     result.unwrap_or_else(|e| {
-        off(&e);
-        shutdown();
+        failed(&e);
         None
     })
+}
+
+/// A paint failed with `e` (GDI draws it): a lost render target is rebuilt for the next
+/// paint; any other error turns DirectWrite off for the session.
+fn failed(e: &windows::core::Error) {
+    if e.code() == D2DERR_RECREATE_TARGET {
+        ENGINE.set(State::Untried);
+    } else {
+        off(e);
+        shutdown();
+    }
 }
 
 fn off(e: &windows::core::Error) {
@@ -272,5 +286,34 @@ fn color([r, g, b]: [u8; 3], a: u8) -> D2D1_COLOR_F {
         g: f32::from(g) / 255.0,
         b: f32::from(b) / 255.0,
         a: f32::from(a) / 255.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, E_FAIL};
+
+    fn state() -> &'static str {
+        ENGINE.with_borrow(|s| match s {
+            State::Untried => "untried",
+            State::Ready(_) => "ready",
+            State::Off => "off",
+        })
+    }
+
+    #[test]
+    fn a_lost_target_is_rebuilt_other_errors_switch_off() {
+        // This test's thread only.
+        init();
+        assert_eq!(state(), "ready");
+        failed(&windows::core::Error::from_hresult(D2DERR_RECREATE_TARGET));
+        assert_eq!(state(), "untried");
+        // The next paint rebuilds it.
+        assert!(with(|_| Ok(Some(()))).is_some());
+        assert_eq!(state(), "ready");
+        failed(&windows::core::Error::from_hresult(E_FAIL));
+        assert_eq!(state(), "off");
+        assert!(with(|_| Ok(Some(()))).is_none());
     }
 }

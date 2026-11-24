@@ -683,6 +683,39 @@ fn card_gdi(lines: &[String], dpi: u32, light: bool) -> Option<Painter> {
     Some(p)
 }
 
+/// Measures and draws a little text with `e` into a 1×1 DIB, in the strip's text and icon
+/// fonts and the card's bold one, so DirectWrite loads those fonts and its rasteriser now
+/// ([`dwrite::init`]) rather than in the first paint.
+pub(super) fn warm_up(e: &Engine) -> windows::core::Result<()> {
+    let [text, icon, ..] = strip_fonts(96);
+    let [title, _] = card_fonts(96);
+    let fonts = e.fonts(&[text, icon, title])?;
+    let texts: [Vec<u16>; 3] = [
+        "0%".encode_utf16().collect(),
+        NO_DEVICE.to_string().encode_utf16().collect(),
+        "0%".encode_utf16().collect(),
+    ];
+    let mut runs = Vec::with_capacity(texts.len());
+    for (font, text) in texts.iter().enumerate() {
+        runs.push(Run {
+            font,
+            text,
+            x: 0,
+            y: 0,
+            size: e.measure(&fonts, font, text)?,
+            rgb: [255; 3],
+            opacity: 255,
+        });
+    }
+    let Some(mut p) = Painter::new() else {
+        return Ok(());
+    };
+    if !p.begin(1, 1) {
+        return Ok(());
+    }
+    e.draw(p.dc, SIZE { cx: 1, cy: 1 }, &fonts, None, &runs)
+}
+
 /// Raises every pixel's alpha to at least `floor` (premultiplied: the colour is 0 there).
 fn floor_alpha(pixels: &mut [u8], floor: u8) {
     for px in pixels.as_chunks_mut::<4>().0 {
@@ -1139,6 +1172,8 @@ mod tests {
                 .collect();
             assert!(partial.len() > 8, "{} partial alphas", partial.len());
         }
+        // Drawn by DirectWrite, not by a silent GDI fallback.
+        assert!(directwrite_on());
     }
 
     #[test]
@@ -1162,6 +1197,7 @@ mod tests {
             // SAFETY: the icon was made here and is not used elsewhere.
             let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyIcon(icon) };
         }
+        assert!(directwrite_on(), "no silent GDI fallback");
     }
 
     #[test]
