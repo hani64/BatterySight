@@ -379,7 +379,9 @@ pub(super) mod tests {
             text: text.into(),
             dimmed: false,
             charging: false,
+            full: false,
             low: false,
+            caption: None,
             tooltip: format!("{key} — {text}"),
         }
     }

@@ -27,6 +27,8 @@ const ICON_FACES: [PCWSTR; 2] = [w!("Segoe Fluent Icons"), w!("Segoe MDL2 Assets
 const TEXT_FACE: PCWSTR = w!("Segoe UI");
 /// Shown after the level of a charging device.
 const BOLT: char = '\u{E945}';
+/// Shown after the level of a device charged full on power (instead of the bolt).
+const CHECK: char = '\u{E73E}';
 /// Shown when there is no device, so the widget stays clickable.
 const NO_DEVICE: char = '\u{E83F}';
 /// Opacity of an asleep device (its last known level).
@@ -94,6 +96,40 @@ impl Palette {
     }
 }
 
+/// What a part of the widget's strip is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Face {
+    /// The level.
+    Text,
+    /// The device's glyph.
+    Icon,
+    /// The bolt or the check after the level.
+    Mark,
+    /// The caption telling apart devices of a kind.
+    Caption,
+}
+
+/// One text of the strip: drawn at (`x`, `y`), `size` as measured.
+#[derive(Debug)]
+struct Part {
+    face: Face,
+    text: Vec<u16>,
+    x: i32,
+    y: i32,
+    size: SIZE,
+    rgb: [u8; 3],
+    opacity: u8,
+}
+
+/// Where the strip's parts go.
+#[derive(Debug)]
+struct Layout {
+    parts: Vec<Part>,
+    /// Each view's drawn extent (`x0`, `x1`), in view order.
+    drawn: Vec<(i32, i32)>,
+    width: i32,
+}
+
 /// The widget's strip for `views`: `dpi` scales it, `height` is the taskbar's client
 /// height. Every pixel gets at least alpha 1, so the whole strip takes clicks. Also returns
 /// each view's columns of the strip ([`device_columns`]), in view order.
@@ -104,67 +140,134 @@ pub fn widget_strip(
     light: bool,
 ) -> Option<(Painter, Vec<(i32, i32)>)> {
     let px = |v: i32| v * dpi as i32 / 96;
-    let palette = Palette::new(light);
     let mut p = Painter::new()?;
     let text_font = p.font(&[TEXT_FACE], -px(12), FW_NORMAL.0 as i32)?;
     let icon_font = p.font(&ICON_FACES, -px(15), FW_NORMAL.0 as i32)?;
-    let bolt_font = p.font(&ICON_FACES, -px(11), FW_NORMAL.0 as i32)?;
+    let mark_font = p.font(&ICON_FACES, -px(11), FW_NORMAL.0 as i32)?;
+    let caption_font = p.font(&[TEXT_FACE], -px(9), FW_SEMIBOLD.0 as i32)?;
+    let font = |face| match face {
+        Face::Text => text_font,
+        Face::Icon => icon_font,
+        Face::Mark => mark_font,
+        Face::Caption => caption_font,
+    };
+    let height = height.max(1);
+    let layout = layout(views, dpi, height, light, |face, text| {
+        p.measure(font(face), text)
+    });
+    if !p.begin(layout.width, height) {
+        return None;
+    }
+    let mut spans = Vec::with_capacity(layout.parts.len());
+    for part in &layout.parts {
+        p.draw(font(part.face), part.x, part.y, &part.text);
+        spans.push(Span {
+            x0: part.x,
+            x1: part.x + part.size.cx,
+            rgb: part.rgb,
+            opacity: part.opacity,
+        });
+    }
+    p.finish(&spans, 1, true);
+    Some((p, device_columns(&layout.drawn, layout.width)))
+}
 
-    // (font, text, x, colour, opacity)
+/// Lays the strip for `views` out on a `height` px taskbar (`dpi` scales it), with
+/// `measure` giving a text's size in a face.
+fn layout(
+    views: &[DeviceView],
+    dpi: u32,
+    height: i32,
+    light: bool,
+    mut measure: impl FnMut(Face, &[u16]) -> SIZE,
+) -> Layout {
+    let px = |v: i32| v * dpi as i32 / 96;
+    let palette = Palette::new(light);
+    // A part measured and centred vertically, its `x` still to be set.
+    let mut part = |face, text: &str, rgb, opacity| {
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let size = measure(face, &text);
+        Part {
+            face,
+            text,
+            x: 0,
+            y: (height - size.cy) / 2,
+            size,
+            rgb,
+            opacity,
+        }
+    };
     let mut parts = Vec::new();
     let mut x = px(4);
-    // Returns the part's extent.
-    let mut place = |p: &mut Painter, font, text: String, rgb, opacity, gap_after| {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let size = p.measure(font, &wide);
-        parts.push((font, wide, x, size, rgb, opacity));
-        let extent = (x, x + size.cx);
-        x += size.cx + gap_after;
-        extent
-    };
     if views.is_empty() {
-        place(&mut p, icon_font, NO_DEVICE.into(), palette.text, 255, 0);
+        let none = part(Face::Icon, &NO_DEVICE.to_string(), palette.text, 255);
+        next(&mut parts, &mut x, none, 0);
     }
-    // Each view's drawn extent.
     let mut drawn = Vec::with_capacity(views.len());
     for (i, v) in views.iter().enumerate() {
         let opacity = if v.dimmed { DIMMED } else { 255 };
         let level = if v.low { palette.low } else { palette.text };
         let last = i + 1 == views.len();
         let gap = if last { 0 } else { px(10) };
-        let (start, _) = place(
-            &mut p,
-            icon_font,
-            v.glyph.into(),
-            palette.text,
-            opacity,
-            px(4),
-        );
-        let (_, end) = if v.charging {
-            place(&mut p, text_font, v.text.clone(), level, opacity, px(2));
-            place(&mut p, bolt_font, BOLT.into(), palette.text, opacity, gap)
+        let glyph = part(Face::Icon, &v.glyph.to_string(), palette.text, opacity);
+        let caption = v.caption.as_deref();
+        let caption = caption.map(|c| part(Face::Caption, c, palette.text, opacity));
+        let start = x;
+        match caption {
+            // Under the glyph, the two centred as one, when they fit the taskbar.
+            Some(mut caption) if glyph.size.cy + caption.size.cy <= height => {
+                let column = glyph.size.cx.max(caption.size.cx);
+                let top = (height - glyph.size.cy - caption.size.cy) / 2;
+                let glyph = Part {
+                    x: x + (column - glyph.size.cx) / 2,
+                    y: top,
+                    ..glyph
+                };
+                caption.x = x + (column - caption.size.cx) / 2;
+                caption.y = top + glyph.size.cy;
+                parts.extend([glyph, caption]);
+                x += column + px(4);
+            }
+            Some(caption) => {
+                next(&mut parts, &mut x, glyph, px(2));
+                next(&mut parts, &mut x, caption, px(4));
+            }
+            None => {
+                next(&mut parts, &mut x, glyph, px(4));
+            }
+        }
+        let text = part(Face::Text, &v.text, level, opacity);
+        let mark = if v.full {
+            Some(CHECK)
+        } else if v.charging {
+            Some(BOLT)
         } else {
-            place(&mut p, text_font, v.text.clone(), level, opacity, gap)
+            None
+        };
+        let (_, end) = match mark {
+            Some(mark) => {
+                next(&mut parts, &mut x, text, px(2));
+                let mark = part(Face::Mark, &mark.to_string(), palette.text, opacity);
+                next(&mut parts, &mut x, mark, gap)
+            }
+            None => next(&mut parts, &mut x, text, gap),
         };
         drawn.push((start, end));
     }
-    let width = x + px(4);
-    let height = height.max(1);
-    if !p.begin(width, height) {
-        return None;
+    Layout {
+        parts,
+        drawn,
+        width: x + px(4),
     }
-    let mut spans = Vec::new();
-    for (font, wide, x, size, rgb, opacity) in &parts {
-        p.draw(*font, *x, (height - size.cy) / 2, wide);
-        spans.push(Span {
-            x0: *x,
-            x1: x + size.cx,
-            rgb: *rgb,
-            opacity: *opacity,
-        });
-    }
-    p.finish(&spans, 1, true);
-    Some((p, device_columns(&drawn, width)))
+}
+
+/// Puts `part` at `x`, then moves `x` past it and `gap_after`. Returns its extent.
+fn next(parts: &mut Vec<Part>, x: &mut i32, mut part: Part, gap_after: i32) -> (i32, i32) {
+    part.x = *x;
+    let extent = (*x, *x + part.size.cx);
+    *x += part.size.cx + gap_after;
+    parts.push(part);
+    extent
 }
 
 /// Each device's columns of the strip, from its drawn extent (`x0`, `x1`) per device: the
@@ -572,6 +675,7 @@ impl Drop for Painter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::tray::tests::keyed;
 
     const RED: [u8; 3] = [255, 0, 0];
 
@@ -639,5 +743,75 @@ mod tests {
         );
         assert_eq!(device_columns(&[(4, 50)], 54), [(0, 54)]);
         assert!(device_columns(&[], 20).is_empty());
+    }
+
+    /// The layout with stand-in sizes: 10 px a character; 20 px tall icons, 16 px text,
+    /// 12 px for the rest.
+    fn laid(views: &[DeviceView], height: i32) -> Layout {
+        layout(views, 96, height, false, |face, text| SIZE {
+            cx: 10 * text.len() as i32,
+            cy: match face {
+                Face::Icon => 20,
+                Face::Text => 16,
+                _ => 12,
+            },
+        })
+    }
+
+    fn part<'a>(layout: &'a Layout, text: &str) -> Option<&'a Part> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        layout.parts.iter().find(|p| p.text == wide)
+    }
+
+    #[test]
+    fn full_on_power_shows_check() {
+        let full = DeviceView {
+            full: true,
+            ..keyed("M", "100%")
+        };
+        let l = laid(&[full], 40);
+        let check = part(&l, &CHECK.to_string()).expect("a check");
+        let level = part(&l, "100%").unwrap();
+        assert!(check.x > level.x, "after the level, where the bolt goes");
+        assert!(part(&l, &BOLT.to_string()).is_none());
+        // Charging keeps its bolt.
+        let charging = DeviceView {
+            charging: true,
+            ..keyed("M", "80%")
+        };
+        let l = laid(&[charging], 40);
+        assert!(part(&l, &BOLT.to_string()).is_some());
+        assert!(part(&l, &CHECK.to_string()).is_none());
+    }
+
+    #[test]
+    fn caption_under_the_glyph_when_it_fits() {
+        let v = DeviceView {
+            caption: Some("SUP".into()),
+            ..keyed("M", "50%")
+        };
+        let l = laid(std::slice::from_ref(&v), 40);
+        let glyph = part(&l, &v.glyph.to_string()).unwrap();
+        let caption = part(&l, "SUP").expect("a caption");
+        // The glyph (20 px) and the caption (12 px) stacked, centred as one on 40 px.
+        assert_eq!((glyph.y, caption.y), (4, 24));
+        // The caption is wider (30 px): the glyph (10 px) is centred above it.
+        assert_eq!((caption.x, glyph.x), (4, 14));
+        assert_eq!(part(&l, "50%").unwrap().x, 4 + 30 + 4);
+        assert_eq!(l.drawn, [(4, 38 + 30)]);
+    }
+
+    #[test]
+    fn caption_after_the_glyph_on_a_short_taskbar() {
+        let v = DeviceView {
+            caption: Some("SUP".into()),
+            ..keyed("M", "50%")
+        };
+        let l = laid(std::slice::from_ref(&v), 30);
+        let glyph = part(&l, &v.glyph.to_string()).unwrap();
+        let caption = part(&l, "SUP").expect("a caption");
+        assert_eq!((glyph.x, caption.x), (4, 4 + 10 + 2));
+        assert_eq!(caption.y, (30 - 12) / 2);
+        assert_eq!(part(&l, "50%").unwrap().x, 16 + 30 + 4);
     }
 }

@@ -101,7 +101,11 @@ pub struct DeviceView {
     pub text: String,
     pub dimmed: bool,
     pub charging: bool,
+    /// Charged full on power: a check where a charging device has its bolt.
+    pub full: bool,
     pub low: bool,
+    /// Tells the device apart from the other shown devices of its kind ([`caption`]).
+    pub caption: Option<String>,
     /// The hover card's text ([`card::card_text`]), one line each, for tray icons.
     pub tooltip: String,
 }
@@ -115,14 +119,18 @@ impl DeviceView {
             &self.text,
             self.dimmed,
             self.charging,
+            self.full,
             self.low,
+            &self.caption,
         ) == (
             &other.key,
             other.glyph,
             &other.text,
             other.dimmed,
             other.charging,
+            other.full,
             other.low,
+            &other.caption,
         )
     }
 }
@@ -155,22 +163,66 @@ impl<'a> Tips<'a> {
     }
 }
 
-/// The devices to show: in the user's order, hidden and offline devices left out. With
-/// `tips` (tray icons show them) they get their tooltips; without, those stay empty.
+/// The devices to show: in the user's order, hidden devices left out. A disconnected
+/// device (offline: the hub keeps it only through its removal grace) shows `×`. Devices of
+/// a kind shown more than once get captions ([`caption`]). With `tips` (tray icons show
+/// them) they get their tooltips; without, those stay empty.
 fn views(states: &[DeviceState], settings: &Settings, tips: Option<&Tips>) -> Vec<DeviceView> {
-    settings
+    let shown: Vec<&DeviceState> = settings
         .ordered(states)
         .into_iter()
-        .filter(|s| s.presence != Presence::Offline && !settings.hidden.contains(&s.key))
+        .filter(|s| !settings.hidden.contains(&s.key))
+        .collect();
+    shown
+        .iter()
         .map(|s| {
             let tooltip = tips.map(|t| t.text(s)).unwrap_or_default();
-            view(s, settings.threshold(&s.key), tooltip)
+            view(s, settings.threshold(&s.key), caption(s, &shown), tooltip)
         })
         .collect()
 }
 
-/// One device; `threshold`: its low-battery threshold, which also colours it as low.
-fn view(s: &DeviceState, threshold: Threshold, tooltip: String) -> DeviceView {
+/// What tells `s` apart from the other `shown` devices of its kind: the first 3 letters,
+/// in upper case, of the longest word of its name that none of their names has (the
+/// longest of all its words if they all do; the first on a tie). `None` when no other
+/// shown device is of its kind.
+fn caption(s: &DeviceState, shown: &[&DeviceState]) -> Option<String> {
+    fn longest<'a>(words: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+        words.reduce(|best, w| {
+            if w.chars().count() > best.chars().count() {
+                w
+            } else {
+                best
+            }
+        })
+    }
+    let others: Vec<&str> = shown
+        .iter()
+        .filter(|o| o.kind == s.kind && o.key != s.key)
+        .map(|o| o.name.as_str())
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    let shared = |word: &str| {
+        others.iter().any(|name| {
+            name.split_whitespace()
+                .any(|w| w.eq_ignore_ascii_case(word))
+        })
+    };
+    let words = || s.name.split_whitespace();
+    let word = longest(words().filter(|w| !shared(w))).or_else(|| longest(words()))?;
+    Some(word.to_uppercase().chars().take(3).collect())
+}
+
+/// One device; `threshold`: its low-battery threshold, which also colours it as low. A
+/// disconnected device's level and charge are stale: it shows `×`, never low or charging.
+fn view(
+    s: &DeviceState,
+    threshold: Threshold,
+    caption: Option<String>,
+    tooltip: String,
+) -> DeviceView {
     // Segoe Fluent Icons code points (the same in Segoe MDL2 Assets).
     let glyph = match s.kind {
         DeviceKind::Mouse => '\u{E962}',
@@ -179,17 +231,25 @@ fn view(s: &DeviceState, threshold: Threshold, tooltip: String) -> DeviceView {
         DeviceKind::Controller => '\u{E7FC}',
         DeviceKind::Other => '\u{E83F}',
     };
+    let connected = s.presence != Presence::Offline;
     let low = match (s.level, threshold) {
-        (Some(Level::Percent(p)), Threshold::Percent(t)) => p <= t,
+        (Some(Level::Percent(p)), Threshold::Percent(t)) => connected && p <= t,
         _ => false,
+    };
+    let text = if connected {
+        s.level.map_or_else(|| "?".to_owned(), level_text)
+    } else {
+        "×".to_owned()
     };
     DeviceView {
         key: s.key.clone(),
         glyph,
-        text: s.level.map_or_else(|| "?".to_owned(), level_text),
+        text,
         dimmed: s.presence != Presence::Online,
-        charging: s.charge == Charge::Charging,
+        charging: connected && s.charge == Charge::Charging,
+        full: connected && s.charge == Charge::Full,
         low,
+        caption,
         tooltip,
     }
 }
@@ -1416,14 +1476,82 @@ mod tests {
     }
 
     #[test]
-    fn offline_devices_hidden() {
+    fn offline_seen_device_shows_cross() {
+        // The hub keeps a disconnected device (offline) only through its removal grace.
         let off = DeviceState {
             presence: Presence::Offline,
-            ..percent("Off", 50)
+            charge: Charge::Charging,
+            ..percent("Off", 5)
         };
-        let v = all(&[off, percent("On", 60)]);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].text, "60%");
+        let states = [percent("On", 60), off];
+        let mut settings = Settings {
+            order: vec![DeviceKey("Off".into())],
+            ..Settings::default()
+        };
+        let v = shown(&states, &settings);
+        assert_eq!(texts(&v), ["×", "60%"], "kept, in the user's order");
+        assert!(v[0].dimmed);
+        // Its last level and charge are stale: no low colour, no bolt.
+        assert!(!v[0].low && !v[0].charging && !v[0].full);
+        settings.set_hidden(&DeviceKey("Off".into()), true);
+        assert_eq!(texts(&shown(&states, &settings)), ["60%"]);
+    }
+
+    #[test]
+    fn full_when_charged_full_on_power() {
+        let full = DeviceState {
+            charge: Charge::Full,
+            ..percent("M", 100)
+        };
+        let v = &all(&[full])[0];
+        assert!(v.full);
+        assert!(!v.charging);
+        assert_eq!(v.text, "100%");
+        assert!(!all(&[percent("M", 100)])[0].full);
+    }
+
+    fn captions(v: &[DeviceView]) -> Vec<Option<&str>> {
+        v.iter().map(|v| v.caption.as_deref()).collect()
+    }
+
+    #[test]
+    fn captions_only_for_same_kind() {
+        let states = [
+            percent("PRO X Superlight", 50),
+            state("G915", DeviceKind::Keyboard, None),
+            percent("G305", 60),
+        ];
+        let mut settings = Settings::default();
+        assert_eq!(
+            captions(&shown(&states, &settings)),
+            [Some("SUP"), None, Some("G30")]
+        );
+        // Only shown devices count: with one mouse hidden, the other needs no caption.
+        settings.set_hidden(&DeviceKey("G305".into()), true);
+        assert_eq!(captions(&shown(&states, &settings)), [None, None]);
+        // A disconnected device is shown, so it counts.
+        let off = DeviceState {
+            presence: Presence::Offline,
+            ..percent("G305", 60)
+        };
+        let v = all(&[percent("PRO X Superlight", 50), off]);
+        assert_eq!(captions(&v), [Some("SUP"), Some("G30")]);
+    }
+
+    #[test]
+    fn caption_from_distinguishing_word() {
+        let two = |a: &str, b: &str| {
+            let v = all(&[percent(a, 50), percent(b, 50)]);
+            [v[0].caption.clone(), v[1].caption.clone()].map(Option::unwrap)
+        };
+        // The longest word the other name lacks, its first 3 letters in upper case.
+        assert_eq!(two("PRO X Superlight", "G305"), ["SUP", "G30"]);
+        assert_eq!(two("MX Master 3S", "MX Anywhere 3"), ["MAS", "ANY"]);
+        // Shared words do not count, whatever their case; ties go to the first.
+        assert_eq!(two("G502 X PLUS", "g502 lightspeed"), ["PLU", "LIG"]);
+        assert_eq!(two("G502 X PLUS", "G305"), ["G50", "G30"]);
+        // A name whose words are all shared falls back to its longest word.
+        assert_eq!(two("PRO X Superlight", "PRO X Superlight 2"), ["SUP", "2"]);
     }
 
     #[test]
@@ -1520,6 +1648,16 @@ mod tests {
             ..a.clone()
         };
         assert!(!a.looks_like(&c));
+        let full = DeviceView {
+            full: true,
+            ..a.clone()
+        };
+        assert!(!a.looks_like(&full));
+        let captioned = DeviceView {
+            caption: Some("SUP".into()),
+            ..a.clone()
+        };
+        assert!(!a.looks_like(&captioned));
     }
 
     #[test]
