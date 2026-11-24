@@ -1,6 +1,7 @@
 //! Built-in protocol engines.
 
 pub mod hidpp;
+mod hyperx;
 pub mod rapoo;
 mod steelseries;
 
@@ -10,6 +11,7 @@ use crate::hid::{Collection, CollectionId, CollectionRole, GroupId, HidGroup};
 use crate::model::DeviceKey;
 
 use hidpp::HidppEngine;
+use hyperx::HyperxEngine;
 use rapoo::RapooEngine;
 use steelseries::SteelseriesEngine;
 
@@ -37,6 +39,10 @@ enum Roles {
         events: Option<CollectionId>,
         report_id: u8,
     },
+    Hyperx {
+        command: CollectionId,
+        report_id: u8,
+    },
 }
 
 impl Selection {
@@ -47,6 +53,7 @@ impl Selection {
             Roles::Steelseries {
                 command, events, ..
             } => id == *command || Some(id) == *events,
+            Roles::Hyperx { command, .. } => id == *command,
         }
     }
 
@@ -63,6 +70,7 @@ impl Selection {
             Roles::Hidpp { .. } => EngineKind::Hidpp,
             Roles::Rapoo { .. } => EngineKind::Rapoo,
             Roles::Steelseries { .. } => EngineKind::Steelseries,
+            Roles::Hyperx { .. } => EngineKind::Hyperx,
         }
     }
 
@@ -74,9 +82,9 @@ impl Selection {
     /// The report ID used to frame commands, if this selection sends any.
     pub fn command_report_id(&self) -> Option<u8> {
         match self.roles {
-            Roles::Hidpp { report_id, .. } | Roles::Steelseries { report_id, .. } => {
-                Some(report_id)
-            }
+            Roles::Hidpp { report_id, .. }
+            | Roles::Steelseries { report_id, .. }
+            | Roles::Hyperx { report_id, .. } => Some(report_id),
             Roles::Rapoo { .. } => None,
         }
     }
@@ -85,6 +93,7 @@ impl Selection {
         match self.roles {
             Roles::Hidpp { command, .. } if id == command => Some(hidpp::engine::COMMAND_ROLE),
             Roles::Steelseries { command, .. } if id == command => Some(steelseries::COMMAND_ROLE),
+            Roles::Hyperx { command, .. } if id == command => Some(hyperx::COMMAND_ROLE),
             _ => None,
         }
     }
@@ -99,7 +108,7 @@ impl Selection {
                         && group.collections.iter().any(|c| receive.contains(&c.id))
                 }
                 Roles::Rapoo { receive } => group.collections.iter().any(|c| c.id == *receive),
-                Roles::Steelseries { command, .. } => {
+                Roles::Steelseries { command, .. } | Roles::Hyperx { command, .. } => {
                     group.collections.iter().any(|c| c.id == *command)
                 }
             }
@@ -127,6 +136,16 @@ impl Selection {
                 let events = group.collections.iter().find(|c| Some(c.id) == events);
                 Some(Box::new(SteelseriesEngine::from_selection(
                     group.id, command, events, entry,
+                )?))
+            }
+            Roles::Hyperx { command, .. } => {
+                if group.id != self.group {
+                    return None;
+                }
+                let entry = catalog.devices().get(self.direct?)?;
+                let command = group.collections.iter().find(|c| c.id == command)?;
+                Some(Box::new(HyperxEngine::from_selection(
+                    group.id, command, entry,
                 )?))
             }
         }
@@ -263,6 +282,19 @@ fn match_roles(
             Match::Denied => Match::Denied,
         };
     }
+    if let Some((index, entry)) = direct
+        && entry.engine == EngineKind::Hyperx
+    {
+        return match HyperxEngine::match_collection(group, entry, product) {
+            Match::Unique((command, report_id)) => Match::Unique(Selection {
+                group: group.id,
+                direct: Some(index),
+                roles: Roles::Hyperx { command, report_id },
+            }),
+            Match::Absent => Match::Absent,
+            Match::Denied => Match::Denied,
+        };
+    }
 
     let receive = direct.and_then(|(_, entry)| entry.receive.as_ref());
     let send = direct.and_then(|(_, entry)| entry.send.as_ref());
@@ -345,6 +377,7 @@ pub fn shared_key(key: &DeviceKey) -> bool {
     HidppEngine::is_fallback_key(key)
         || RapooEngine::is_fallback_key(key)
         || SteelseriesEngine::is_fallback_key(key)
+        || HyperxEngine::is_fallback_key(key)
 }
 
 #[cfg(test)]
@@ -548,5 +581,58 @@ source = "Linux hid-logitech-hidpp"
             assert_eq!(reads(&g, g.collections.last().unwrap(), &catalog), expected);
         }
         assert!(reads(&g, &g.collections[0], &catalog));
+    }
+
+    #[test]
+    fn hyperx_allowlists_only_variant_reads_on_the_numbered_output_role() {
+        use crate::engine::write_allowed;
+        use crate::hid::ReportKind;
+        use crate::scheduler::GrantId;
+
+        let catalog = Catalog::builtin();
+        for (pid, page, usage, width, prefix, commands) in [
+            (0x05B7, 0xFF13, 1, 62, &[0x66][..], [0x82, 0x89, 0x8A]),
+            (
+                0x098D,
+                0xFF43,
+                0x0202,
+                31,
+                &[0x21, 0xBB][..],
+                [3, 0x0B, 0x0C],
+            ),
+        ] {
+            let mut g = group(0x03F0, page, usage, width);
+            let collection = &mut g.collections[0];
+            collection.pid = pid;
+            collection.interface = Some(3);
+            let id = collection.id;
+            let selection = select(&g, &catalog).expect("documented collection");
+            let engine = selection.engine(&g, &catalog).unwrap();
+            let role = selection.send_role(id).unwrap();
+            let allowed = |role, kind, bytes: &[u8]| {
+                write_allowed(&*engine, role, kind, bytes, GrantId(1)).is_some()
+            };
+            let mut bytes = vec![0; usize::from(width)];
+            bytes[..prefix.len()].copy_from_slice(prefix);
+            for command in u8::MIN..=u8::MAX {
+                bytes[prefix.len()] = command;
+                assert_eq!(
+                    allowed(role, ReportKind::Output, &bytes),
+                    commands.contains(&command),
+                    "{pid:04X}/{command:02X}"
+                );
+            }
+            bytes[prefix.len()] = commands[0];
+            assert!(!allowed(role, ReportKind::GetFeature, &bytes));
+            assert!(!allowed(role, ReportKind::SetFeature, &bytes));
+            assert!(!allowed(CollectionRole(2), ReportKind::Output, &bytes));
+            assert!(!allowed(
+                role,
+                ReportKind::Output,
+                &bytes[..bytes.len() - 1]
+            ));
+            bytes[prefix.len() + 1] = 1;
+            assert!(!allowed(role, ReportKind::Output, &bytes));
+        }
     }
 }

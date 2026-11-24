@@ -13,6 +13,7 @@ pub enum EngineKind {
     Hidpp,
     Rapoo,
     Steelseries,
+    Hyperx,
 }
 
 /// The input status format and any known wired PID for a Rapoo VT model.
@@ -43,6 +44,14 @@ pub enum SteelseriesReport {
     GameBuds,
     Station06Steps,
     Station01Percent,
+}
+
+/// The exact HX66 or Alpha control report format used by a HyperX dongle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HyperxReport {
+    Hx66,
+    Alpha21bb,
 }
 
 /// Per-device deviations from engine defaults.
@@ -124,6 +133,7 @@ pub struct DeviceEntry {
     pub send: Option<CollectionSelector>,
     pub rapoo: Option<RapooConfig>,
     pub steelseries: Option<SteelseriesReport>,
+    pub hyperx: Option<HyperxReport>,
     pub quirks: Quirks,
 }
 
@@ -193,6 +203,7 @@ struct RawDevice {
     send: Option<CollectionSelector>,
     rapoo: Option<RapooConfig>,
     steelseries: Option<SteelseriesReport>,
+    hyperx: Option<HyperxReport>,
     #[serde(default)]
     quirks: Quirks,
 }
@@ -212,6 +223,7 @@ const BUILTIN_FILES: &[&str] = &[
     include_str!("../catalog/logitech.toml"),
     include_str!("../catalog/rapoo.toml"),
     include_str!("../catalog/steelseries.toml"),
+    include_str!("../catalog/hyperx.toml"),
 ];
 
 impl Catalog {
@@ -263,6 +275,7 @@ impl Catalog {
                     send: d.send,
                     rapoo: d.rapoo,
                     steelseries: d.steelseries,
+                    hyperx: d.hyperx,
                     quirks: d.quirks,
                 })
             })
