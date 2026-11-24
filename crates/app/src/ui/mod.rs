@@ -1479,6 +1479,7 @@ mod tests {
             updated_ms: 0,
             source: Source::Query,
             verification: Verification::HardwareTested,
+            poll_min_ms: None,
         }
     }
 

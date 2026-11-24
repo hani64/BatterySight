@@ -1,5 +1,5 @@
-//! The user's options: device order, hidden devices, per-device low-battery thresholds,
-//! monitors, display mode and autostart, and their `settings.toml` form.
+//! The user's options: device order, hidden devices, per-device low-battery thresholds and
+//! poll intervals, monitors, display mode and autostart, and their `settings.toml` form.
 //!
 //! The file is meant to stay hand-editable: keys are device keys, unknown fields are
 //! ignored (a newer version's file still loads), and any field of the wrong shape or out
@@ -11,6 +11,7 @@ use std::fmt::{self, Write as _};
 use toml::Value;
 
 use crate::model::{DeviceKey, DeviceState};
+use crate::time::Ms;
 
 /// Low-battery alert level of a device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +33,9 @@ impl Threshold {
 
 /// Threshold of a device without a settings entry.
 pub const DEFAULT_THRESHOLD: Threshold = Threshold::Percent(15);
+
+/// Largest poll interval a settings file accepts, in minutes (one day); the smallest is 1.
+pub const INTERVAL_MAX_MIN: u16 = 1440;
 
 /// Taskbars that show the widget.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,6 +60,9 @@ pub struct Settings {
     pub order: Vec<DeviceKey>,
     pub hidden: BTreeSet<DeviceKey>,
     pub thresholds: BTreeMap<DeviceKey, Threshold>,
+    /// Minutes between battery checks while the device is in use, 1..=[`INTERVAL_MAX_MIN`];
+    /// the device's own minimum still applies.
+    pub intervals: BTreeMap<DeviceKey, u16>,
     pub monitors: MonitorChoice,
     pub display: DisplayMode,
     pub autostart: bool,
@@ -105,6 +112,16 @@ impl Settings {
                 settings
                     .thresholds
                     .insert(DeviceKey(key.clone()), threshold);
+            }
+        }
+        if let Some(value) = table.get("intervals") {
+            let Value::Table(entries) = value else {
+                return Err(invalid("intervals", "expected a table of device keys"));
+            };
+            for (key, value) in entries {
+                let minutes = interval_of(value)
+                    .ok_or_else(|| invalid(&format!("intervals.{key}"), INTERVAL_FORM))?;
+                settings.intervals.insert(DeviceKey(key.clone()), minutes);
             }
         }
         if let Some(value) = table.get("monitors") {
@@ -168,6 +185,14 @@ impl Settings {
             };
             let _ = writeln!(out, "{} = {value}", quote(&key.0));
         }
+        out.push_str(
+            "\n# intervals: minutes between battery checks while a device is in use; \
+             never below the device's minimum\n[intervals]\n",
+        );
+        for (key, minutes) in &self.intervals {
+            let minutes = (*minutes).clamp(1, INTERVAL_MAX_MIN);
+            let _ = writeln!(out, "{} = {minutes}", quote(&key.0));
+        }
         out
     }
 
@@ -177,6 +202,25 @@ impl Settings {
             .get(key)
             .copied()
             .unwrap_or(DEFAULT_THRESHOLD)
+    }
+
+    /// The device's poll interval in minutes, `None` when it has none (the engine's own gap).
+    pub fn interval(&self, key: &DeviceKey) -> Option<u16> {
+        self.intervals.get(key).copied()
+    }
+
+    /// Sets `key`'s poll interval; minutes outside 1..=[`INTERVAL_MAX_MIN`] are clamped into it.
+    pub fn set_interval(&mut self, key: &DeviceKey, minutes: u16) {
+        self.intervals
+            .insert(key.clone(), minutes.clamp(1, INTERVAL_MAX_MIN));
+    }
+
+    /// Every poll interval in milliseconds, as the scheduler takes them.
+    pub fn interval_gaps(&self) -> HashMap<DeviceKey, Ms> {
+        self.intervals
+            .iter()
+            .map(|(key, &minutes)| (key.clone(), Ms::from(minutes) * 60_000))
+            .collect()
     }
 
     /// `states` in the user's order; devices not in it follow, in `states` order.
@@ -238,6 +282,7 @@ impl Settings {
 }
 
 const THRESHOLD_FORM: &str = "expected 1 to 100 or \"off\"";
+const INTERVAL_FORM: &str = "expected whole minutes 1 to 1440";
 const MONITORS_FORM: &str = "expected \"all\", \"main\" or { named = \"<monitor>\" }";
 
 fn invalid(field: &str, what: &str) -> SettingsError {
@@ -266,6 +311,15 @@ fn threshold_of(value: &Value) -> Option<Threshold> {
             .ok()
             .filter(|p| (1..=100).contains(p))
             .map(Threshold::Percent),
+        _ => None,
+    }
+}
+
+fn interval_of(value: &Value) -> Option<u16> {
+    match value {
+        Value::Integer(n) => u16::try_from(*n)
+            .ok()
+            .filter(|m| (1..=INTERVAL_MAX_MIN).contains(m)),
         _ => None,
     }
 }
@@ -301,6 +355,7 @@ mod tests {
             updated_ms: 0,
             source: Source::Query,
             verification: Verification::Generic,
+            poll_min_ms: None,
         }
     }
 
@@ -324,6 +379,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            intervals: [(key("logi:0ABA:255"), 30)].into_iter().collect(),
             monitors: MonitorChoice::Named(r"\\.\DISPLAY2".into()),
             display: DisplayMode::Tray,
             autostart: true,
@@ -481,5 +537,56 @@ mod tests {
         let loaded = Settings::from_toml(&settings.to_toml()).unwrap();
         assert_eq!(loaded.threshold(&key("direct")), Threshold::Percent(1));
         assert_eq!(loaded.threshold(&key("high")), Threshold::Percent(100));
+    }
+
+    #[test]
+    fn intervals_round_trip() {
+        let settings = Settings {
+            intervals: [(key("logi:0ABA:255"), 10)].into_iter().collect(),
+            ..Settings::default()
+        };
+        let text = settings.to_toml();
+        assert!(text.contains("[intervals]"), "{text}");
+        assert_eq!(Settings::from_toml(&text), Ok(settings), "{text}");
+    }
+
+    #[test]
+    fn hand_written_intervals_parse() {
+        let settings = Settings::from_toml("[intervals]\n\"logi:0ABA:255\" = 30\n").unwrap();
+        assert_eq!(settings.interval(&key("logi:0ABA:255")), Some(30));
+        assert_eq!(settings.interval(&key("other")), None);
+    }
+
+    #[test]
+    fn bad_intervals_are_errors() {
+        for value in ["0", "1441", "\"10\"", "2.5"] {
+            let text = format!("[intervals]\n\"logi:0ABA:255\" = {value}\n");
+            match Settings::from_toml(&text) {
+                Err(SettingsError::Invalid(msg)) => {
+                    assert!(msg.contains("intervals.logi:0ABA:255"), "{value}: {msg}");
+                }
+                other => panic!("{value}: {other:?}"),
+            }
+        }
+        assert!(Settings::from_toml("intervals = 10").is_err());
+    }
+
+    #[test]
+    fn set_interval_clamps() {
+        let mut settings = Settings::default();
+        let k = key("logi:0ABA:255");
+        settings.set_interval(&k, 0);
+        assert_eq!(settings.interval(&k), Some(1));
+        settings.set_interval(&k, 5000);
+        assert_eq!(settings.interval(&k), Some(INTERVAL_MAX_MIN));
+        assert_eq!(INTERVAL_MAX_MIN, 1440);
+    }
+
+    #[test]
+    fn interval_gaps_are_milliseconds() {
+        let mut settings = Settings::default();
+        let k = key("logi:0ABA:255");
+        settings.set_interval(&k, 10);
+        assert_eq!(settings.interval_gaps()[&k], 600_000);
     }
 }

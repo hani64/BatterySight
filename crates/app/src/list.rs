@@ -111,6 +111,7 @@ mod tests {
             updated_ms: 0,
             source: Source::Query,
             verification: Verification::SourceVerified,
+            poll_min_ms: None,
         }
     }
 

@@ -54,6 +54,7 @@ pub struct RuntimeHandle {
 
 enum Command {
     RefreshNow,
+    SetIntervals(HashMap<DeviceKey, Ms>),
     Stop,
 }
 
@@ -61,6 +62,12 @@ impl RuntimeHandle {
     /// Asks for a fresh reading of every device, as far as the scheduler allows.
     pub fn refresh_now(&self) {
         self.command(Command::RefreshNow);
+    }
+
+    /// Sets the user's gaps between battery reads while a device is in use (key → ms),
+    /// replacing earlier ones; the device's own minimum still applies.
+    pub fn set_intervals(&self, gaps: HashMap<DeviceKey, Ms>) {
+        self.command(Command::SetIntervals(gaps));
     }
 
     /// Stops the device thread and waits up to 2 s for it to close the devices.
@@ -284,6 +291,9 @@ impl Device {
                         self.guard.clear();
                         self.rescan();
                         self.feed(HubInput::RefreshNow, now_ms());
+                    }
+                    Ok(Command::SetIntervals(gaps)) => {
+                        self.feed(HubInput::SetIntervals(gaps), now_ms());
                     }
                     Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return,
                     Err(TryRecvError::Empty) => break,
