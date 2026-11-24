@@ -20,7 +20,7 @@
 //! - Messages from outside (`TaskbarCreated`, `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`,
 //!   `WM_CLOSE`, WinEvent callbacks, `WM_DPICHANGED_AFTERPARENT`, clicks and tray callbacks)
 //!   never touch the state where they arrive: they post one of our `WM_APP_*` messages.
-//!   `WM_TIMER` only beats the watchdog.
+//!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`].
 //! - Only `WM_APP_*` handlers borrow the state. One that arrives while the state is borrowed
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
@@ -140,14 +140,20 @@ const WM_APP_TASKBAR_CREATED: u32 = WM_APP + 4;
 const WM_APP_ENVIRONMENT: u32 = WM_APP + 5;
 /// "Refresh now" was chosen.
 const WM_APP_REFRESH: u32 = WM_APP + 6;
+/// Fall back to tray icons if no widget is shown (posted by [`WIDGET_CHECK_TIMER`]).
+const WM_APP_CHECK_WIDGET: u32 = WM_APP + 7;
 /// "Exit" was chosen, or the host was asked to close.
-const WM_APP_EXIT: u32 = WM_APP + 7;
+const WM_APP_EXIT: u32 = WM_APP + 8;
 /// Open the menu (a click on the widget or a tray icon).
-const WM_APP_MENU: u32 = WM_APP + 8;
+const WM_APP_MENU: u32 = WM_APP + 9;
 /// Tray icon callbacks (`NOTIFYICON_VERSION_4`).
-const WM_APP_TRAY: u32 = WM_APP + 9;
+const WM_APP_TRAY: u32 = WM_APP + 10;
 
+/// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
+/// One-shot: [`WIDGET_CHECK_MS`] after start or `TaskbarCreated`, checks that a widget is shown.
+const WIDGET_CHECK_TIMER: usize = 2;
+const WIDGET_CHECK_MS: u32 = 5_000;
 const MENU_REFRESH: usize = 1;
 const MENU_EXIT: usize = 2;
 
@@ -206,6 +212,9 @@ pub fn run(options: &Options) -> i32 {
     if matches!(surface, Surface::Widgets(_)) {
         watchdog::arm(true);
         watchdog::spawn();
+        // SAFETY: our own window.
+        unsafe { SetTimer(Some(host), HEARTBEAT_TIMER, watchdog::INTERVAL_MS, None) };
+        check_widget_later(host);
     }
     UI.with(|ui| {
         *ui.borrow_mut() = Some(Ui {
@@ -216,8 +225,6 @@ pub fn run(options: &Options) -> i32 {
             surface,
         });
     });
-    // SAFETY: our own window; the timer beats the watchdog, also inside the menu's loop.
-    unsafe { SetTimer(Some(host), HEARTBEAT_TIMER, watchdog::INTERVAL_MS, None) };
     let mut msg = MSG::default();
     // SAFETY: `msg` outlives each call. GetMessageW returns -1 on error, 0 on WM_QUIT.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -228,9 +235,10 @@ pub fn run(options: &Options) -> i32 {
             DispatchMessageW(&msg);
         }
     }
-    // SAFETY: our own window and timer.
+    // SAFETY: our own window and timers (killing one that is not set fails harmlessly).
     unsafe {
         let _ = KillTimer(Some(host), HEARTBEAT_TIMER);
+        let _ = KillTimer(Some(host), WIDGET_CHECK_TIMER);
         let _ = DestroyWindow(host);
     }
     0
@@ -282,6 +290,8 @@ impl Ui {
                 };
                 if result.is_err() {
                     self.fall_back_to_tray();
+                } else if matches!(self.surface, Surface::Widgets(_)) {
+                    check_widget_later(self.host);
                 }
             }
             WM_APP_ENVIRONMENT => {
@@ -298,6 +308,13 @@ impl Ui {
                 }
             }
             WM_APP_REFRESH => self.runtime.refresh_now(),
+            WM_APP_CHECK_WIDGET => {
+                if let Surface::Widgets(w) = &self.surface
+                    && w.missing()
+                {
+                    self.fall_back_to_tray();
+                }
+            }
             _ => {}
         }
     }
@@ -316,9 +333,15 @@ impl Ui {
         }
     }
 
-    /// Windows refused a widget window: tray icons for the rest of the session.
+    /// Windows refused a widget window, or none is shown: tray icons for the rest of the
+    /// session.
     fn fall_back_to_tray(&mut self) {
         watchdog::arm(false);
+        // SAFETY: our own window and timers; nothing reads the heartbeat in tray mode.
+        unsafe {
+            let _ = KillTimer(Some(self.host), HEARTBEAT_TIMER);
+            let _ = KillTimer(Some(self.host), WIDGET_CHECK_TIMER);
+        }
         let mut tray = Tray::new(self.host);
         tray.show(&self.views, self.light);
         // Dropping the widgets destroys their windows and hooks.
@@ -376,6 +399,12 @@ fn schedule_layout() {
     if !LAYOUT_PENDING.replace(true) {
         post(WM_APP_LAYOUT);
     }
+}
+
+/// Starts (or restarts) the one-shot check that a widget is shown.
+fn check_widget_later(host: HWND) {
+    // SAFETY: our own window; setting an existing timer id restarts it.
+    unsafe { SetTimer(Some(host), WIDGET_CHECK_TIMER, WIDGET_CHECK_MS, None) };
 }
 
 /// Whether this click should stall the widget thread (`--debug-stall-widget`, once).
@@ -441,6 +470,11 @@ fn create_host() -> Option<HWND> {
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
     match msg {
+        WM_TIMER if wp.0 == WIDGET_CHECK_TIMER => {
+            // SAFETY: our own window and timer; the check runs once.
+            let _ = unsafe { KillTimer(Some(hwnd), WIDGET_CHECK_TIMER) };
+            post(WM_APP_CHECK_WIDGET);
+        }
         WM_TIMER => watchdog::beat(),
         // Never handled where they arrive (see the module doc); WM_SETTINGCHANGE's string
         // is not needed, every change is re-read.
@@ -456,7 +490,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 post(WM_APP_MENU);
             }
         }
-        WM_APP_CHANGED..=WM_APP_REFRESH => {
+        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET => {
             if ui_busy() {
                 // SAFETY: no pointers involved.
                 let _ = unsafe { PostMessageW(Some(hwnd), msg, wp, lp) };
