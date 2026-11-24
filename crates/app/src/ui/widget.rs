@@ -18,6 +18,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
+use batterysight_core::model::DeviceKey;
 use batterysight_core::settings::MonitorChoice;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -32,6 +33,7 @@ use windows::Win32::UI::Accessibility::{
     TreeScope_Descendants, UnhookWinEvent,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_LOCATIONCHANGE,
     EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GA_PARENT, GW_HWNDPREV,
@@ -40,18 +42,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MONITORINFOF_PRIMARY, OBJID_WINDOW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU, WM_DPICHANGED_AFTERPARENT,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WS_CHILD,
-    WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
 use super::menu::{MonitorInfo, display_number};
-use super::{DeviceView, WIDGET_CLASS, WM_APP_CLOCKS, WM_APP_MENU, hinstance, post, render};
+use super::{
+    DeviceView, WIDGET_CLASS, WM_APP_CLOCKS, WM_APP_HOVER_END, WM_APP_MENU, hinstance, post, render,
+};
 
 /// How often UI Automation looks again for a secondary taskbar's clock that is missing
 /// (Explorer starting), and for how many rounds.
 const CLOCK_RETRY: Duration = Duration::from_millis(500);
 const CLOCK_RETRIES: u32 = 20;
+
+/// The cursor left the window (asked for with `TrackMouseEvent`); the `windows` crate
+/// defines it only with its `Win32_UI_Controls` feature.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Windows refused to create a widget window: tray icons, until the widget is tried again.
 #[derive(Debug)]
@@ -80,6 +88,20 @@ struct Widget {
     pos: Option<(i32, i32)>,
     /// Width of the taskbar when its clock was last asked for (secondary taskbars).
     bar_width: i32,
+    /// Each shown device's columns of the painted strip: (key, x0, x1).
+    devices: Vec<(DeviceKey, i32, i32)>,
+}
+
+/// The device under the cursor on a widget ([`Widgets::hit`]), in screen coordinates.
+#[derive(Debug)]
+pub struct Hover {
+    pub key: DeviceKey,
+    /// The device's columns of the widget.
+    pub device: RECT,
+    /// The taskbar the widget is on.
+    pub bar: RECT,
+    /// The DPI the widget is painted for.
+    pub dpi: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -242,6 +264,29 @@ impl Widgets {
         self.widgets.iter().any(|w| w.pos.is_some())
     }
 
+    /// The device under `at` (screen coordinates) on a shown widget. Reads window-manager
+    /// state only.
+    pub fn hit(&self, at: POINT) -> Option<Hover> {
+        self.widgets.iter().find_map(|w| {
+            let p = w.painted.filter(|_| w.pos.is_some())?;
+            let r = window_rect(w.hwnd);
+            if !(r.top..r.bottom).contains(&at.y) || !(r.left..r.right).contains(&at.x) {
+                return None;
+            }
+            let (key, x0, x1) = device_at(&w.devices, at.x - r.left)?;
+            Some(Hover {
+                key: key.clone(),
+                device: RECT {
+                    left: r.left + x0,
+                    right: r.left + x1,
+                    ..r
+                },
+                bar: window_rect(w.bar),
+                dpi: p.dpi,
+            })
+        })
+    }
+
     /// Destroys the windows and removes the hooks. The UIA thread ends when `self` drops.
     pub fn destroy(&mut self) {
         self.destroy_windows();
@@ -393,7 +438,13 @@ fn needs_tray(taskbar: bool, shown: bool) -> bool {
     taskbar && !shown
 }
 
-/// The window procedure of the widget. Clicks open the menu on the host window; nothing
+/// The device at `x` (from the widget's left edge) of `devices` (key, x0, x1).
+fn device_at(devices: &[(DeviceKey, i32, i32)], x: i32) -> Option<&(DeviceKey, i32, i32)> {
+    devices.iter().find(|(_, x0, x1)| (*x0..*x1).contains(&x))
+}
+
+/// The window procedure of the widget. Clicks open the menu and the cursor's moves and
+/// leaving drive the hover card, all through messages posted to the host window; nothing
 /// here touches the UI state.
 pub unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -407,6 +458,23 @@ pub unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 return LRESULT(0);
             }
             post(WM_APP_MENU);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            // Asks for WM_MOUSELEAVE (again: each one ends the tracking).
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // SAFETY: `track` outlives the call; our own window.
+            let _ = unsafe { TrackMouseEvent(&mut track) };
+            super::schedule_hover();
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            post(WM_APP_HOVER_END);
             LRESULT(0)
         }
         WM_DPICHANGED_AFTERPARENT => {
@@ -445,6 +513,7 @@ fn create(bar: HWND, primary: bool) -> Result<Widget, CreateFailed> {
         painted: None,
         pos: None,
         bar_width: 0,
+        devices: Vec::new(),
     })
 }
 
@@ -457,10 +526,11 @@ fn destroy(hwnd: HWND) {
     }
 }
 
-/// Renders the views and hands the bitmap to the window (per-pixel alpha). The position is
-/// set separately; a changed width moves the window at the next [`position`].
+/// Renders the views and hands the bitmap to the window (per-pixel alpha), and keeps each
+/// device's columns for [`Widgets::hit`]. The position is set separately; a changed width
+/// moves the window at the next [`position`].
 fn paint(w: &mut Widget, views: &[DeviceView], dpi: u32, height: i32, light: bool) {
-    let Some(painter) = render::widget_strip(views, dpi, height, light) else {
+    let Some((painter, columns)) = render::widget_strip(views, dpi, height, light) else {
         return;
     };
     let size = painter.size();
@@ -491,6 +561,11 @@ fn paint(w: &mut Widget, views: &[DeviceView], dpi: u32, height: i32, light: boo
             light,
             size,
         });
+        w.devices = views
+            .iter()
+            .zip(columns)
+            .map(|(v, (x0, x1))| (v.key.clone(), x0, x1))
+            .collect();
     }
 }
 
@@ -888,6 +963,20 @@ mod tests {
         // No taskbar at all (Explorer not running): tray icons cannot show either, and
         // `TaskbarCreated` starts the check again.
         assert!(!needs_tray(false, false));
+    }
+
+    #[test]
+    fn hit_maps_x_to_device() {
+        let key = |k: &str| DeviceKey(k.into());
+        let devices = [(key("A"), 0, 57), (key("B"), 57, 120)];
+        let at = |x| device_at(&devices, x).map(|d| d.0.clone());
+        assert_eq!(at(0), Some(key("A")));
+        assert_eq!(at(56), Some(key("A")));
+        assert_eq!(at(57), Some(key("B")));
+        assert_eq!(at(119), Some(key("B")));
+        assert_eq!(at(120), None);
+        assert_eq!(at(-1), None);
+        assert_eq!(device_at(&[], 5), None);
     }
 
     #[test]

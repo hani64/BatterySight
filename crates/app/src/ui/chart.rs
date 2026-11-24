@@ -2,7 +2,8 @@
 //! over a time window ending now, charging spans shaded, gaps where it slept or was off.
 //!
 //! Drawn with plain GDI on the caller's DC in the font selected there (labels are sized
-//! from it); everything the chart selects is restored before it returns.
+//! from it); everything the chart selects is restored before it returns. Drawing is bounded
+//! by the chart's width: at most one point per pixel column ([`columns`]).
 
 use std::time::Duration;
 
@@ -79,6 +80,55 @@ fn height(level: Level) -> u8 {
         Level::Coarse(CoarseLevel::Good) => 60,
         Level::Coarse(CoarseLevel::Full) => 100,
     }
+}
+
+/// The plot in pixel columns (`x` maps a time to its column), at most one point per
+/// column, so drawing is bounded by the chart's width however many samples there are.
+/// Within a line, a later point in the same column replaces the earlier one; a line's
+/// points in columns an earlier line already took are left out (a line left without
+/// points is dropped). Charging spans clamped to `left..right` that touch or overlap are
+/// merged.
+fn columns(plot: &Plot, x: impl Fn(u64) -> i32, left: i32, right: i32) -> Columns {
+    let mut out = Columns::default();
+    // The column of the last point kept, in any line.
+    let mut taken: Option<i32> = None;
+    for line in &plot.lines {
+        let mut points: Vec<(i32, u8)> = Vec::new();
+        for &(t, p) in line {
+            let column = x(t);
+            if taken.is_some_and(|c| column <= c) {
+                if let Some(last) = points.last_mut().filter(|last| last.0 == column) {
+                    last.1 = p;
+                }
+                continue;
+            }
+            points.push((column, p));
+            taken = Some(column);
+        }
+        if !points.is_empty() {
+            out.lines.push(points);
+        }
+    }
+    for &(a, b) in &plot.charging {
+        let (from, to) = (x(a).max(left), x(b).min(right));
+        if to <= from {
+            continue;
+        }
+        match out.charging.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.charging.push((from, to)),
+        }
+    }
+    out
+}
+
+/// A [`Plot`] in pixel columns ([`columns`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Columns {
+    /// (column, percent) per line.
+    lines: Vec<Vec<(i32, u8)>>,
+    /// (first column, end column) while charging.
+    charging: Vec<(i32, i32)>,
 }
 
 /// "24 h ago", "7 days ago": the left end of a `span_ms` window.
@@ -164,17 +214,17 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration, light: b
             area.left + offset.clamp(-1_000_000, 1_000_000) as i32
         };
         let y = |p: u8| area.bottom - i32::from(p) * height / 100;
+        // Bounded by the width, however many samples the window holds.
+        let columns = columns(&plot, x, area.left, area.right);
 
-        for &(a, b) in &plot.charging {
+        for &(left, right) in &columns.charging {
             let band = RECT {
-                left: x(a).max(area.left),
+                left,
                 top: area.top,
-                right: x(b).min(area.right),
+                right,
                 bottom: area.bottom,
             };
-            if band.right > band.left {
-                fill(dc, &band, colors.charging);
-            }
+            fill(dc, &band, colors.charging);
         }
         let grid_pen = CreatePen(PS_SOLID, 1, colors.grid);
         SelectObject(dc, grid_pen.into());
@@ -211,11 +261,8 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration, light: b
         let dot_brush = CreateSolidBrush(colors.line);
         SelectObject(dc, line_pen.into());
         SelectObject(dc, dot_brush.into());
-        for line in &plot.lines {
-            let points: Vec<POINT> = line
-                .iter()
-                .map(|&(t, p)| POINT { x: x(t), y: y(p) })
-                .collect();
+        for line in &columns.lines {
+            let points: Vec<POINT> = line.iter().map(|&(x, p)| POINT { x, y: y(p) }).collect();
             if let [dot] = points[..] {
                 let r = thick + 1;
                 let _ = Ellipse(dc, dot.x - r, dot.y - r, dot.x + r + 1, dot.y + r + 1);
@@ -464,5 +511,28 @@ mod tests {
             charging(30, Presence::Offline),
         ];
         assert_eq!(plot(&samples, at(0), at(50)).charging, [(at(10), at(30))]);
+    }
+
+    #[test]
+    fn columns_keep_one_point_per_column() {
+        let plot = Plot {
+            lines: vec![
+                vec![(0, 90), (1, 89), (4, 88), (10, 80)],
+                // Starts in the column the line before ended in.
+                vec![(11, 79), (20, 70)],
+                // Wholly in a column already taken: dropped.
+                vec![(21, 69)],
+                vec![(40, 60)],
+            ],
+            charging: vec![(0, 3), (5, 12), (14, 16), (30, 200)],
+            drawn: true,
+        };
+        let c = columns(&plot, |t| (t / 5) as i32, 0, 20);
+        assert_eq!(
+            c.lines,
+            [vec![(0, 88), (2, 80)], vec![(4, 70)], vec![(8, 60)]]
+        );
+        // Pixel spans (0,0) empty, (1,2) and (2,3) merge, (6,20) clamped to the right edge.
+        assert_eq!(c.charging, [(1, 3), (6, 20)]);
     }
 }

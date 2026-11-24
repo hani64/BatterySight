@@ -1,22 +1,25 @@
 //! GDI text rendering into 32-bit bitmaps with per-pixel alpha.
 //!
 //! Text is drawn white on black with grayscale antialiasing; [`colorize`] then turns the
-//! coverage into alpha and applies each part's colour.
+//! coverage into alpha and applies each part's colour. The hover card ([`card`]) is drawn
+//! in its colours on an opaque background instead.
 
 use std::ffi::c_void;
+use std::time::Duration;
 
-use windows::Win32::Foundation::{COLORREF, SIZE};
+use batterysight_core::history::Sample;
+use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateBitmap,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, FW_NORMAL, FW_SEMIBOLD, GdiFlush, GetTextExtentPoint32W, GetTextFaceW, HBITMAP,
-    HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-    TextOutW,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, FW_NORMAL, FW_SEMIBOLD, FillRect, GdiFlush,
+    GetTextExtentPoint32W, GetTextFaceW, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 use windows::core::{PCWSTR, w};
 
-use super::DeviceView;
+use super::{DeviceView, chart};
 
 /// Icon fonts, best first: Windows 11 ships Segoe Fluent Icons, Windows 10 Segoe MDL2 Assets
 /// (same code points for the glyphs used here).
@@ -92,8 +95,14 @@ impl Palette {
 }
 
 /// The widget's strip for `views`: `dpi` scales it, `height` is the taskbar's client
-/// height. Every pixel gets at least alpha 1, so the whole strip takes clicks.
-pub fn widget_strip(views: &[DeviceView], dpi: u32, height: i32, light: bool) -> Option<Painter> {
+/// height. Every pixel gets at least alpha 1, so the whole strip takes clicks. Also returns
+/// each view's columns of the strip ([`device_columns`]), in view order.
+pub fn widget_strip(
+    views: &[DeviceView],
+    dpi: u32,
+    height: i32,
+    light: bool,
+) -> Option<(Painter, Vec<(i32, i32)>)> {
     let px = |v: i32| v * dpi as i32 / 96;
     let palette = Palette::new(light);
     let mut p = Painter::new()?;
@@ -104,21 +113,26 @@ pub fn widget_strip(views: &[DeviceView], dpi: u32, height: i32, light: bool) ->
     // (font, text, x, colour, opacity)
     let mut parts = Vec::new();
     let mut x = px(4);
+    // Returns the part's extent.
     let mut place = |p: &mut Painter, font, text: String, rgb, opacity, gap_after| {
         let wide: Vec<u16> = text.encode_utf16().collect();
         let size = p.measure(font, &wide);
         parts.push((font, wide, x, size, rgb, opacity));
+        let extent = (x, x + size.cx);
         x += size.cx + gap_after;
+        extent
     };
     if views.is_empty() {
         place(&mut p, icon_font, NO_DEVICE.into(), palette.text, 255, 0);
     }
+    // Each view's drawn extent.
+    let mut drawn = Vec::with_capacity(views.len());
     for (i, v) in views.iter().enumerate() {
         let opacity = if v.dimmed { DIMMED } else { 255 };
         let level = if v.low { palette.low } else { palette.text };
         let last = i + 1 == views.len();
         let gap = if last { 0 } else { px(10) };
-        place(
+        let (start, _) = place(
             &mut p,
             icon_font,
             v.glyph.into(),
@@ -126,12 +140,13 @@ pub fn widget_strip(views: &[DeviceView], dpi: u32, height: i32, light: bool) ->
             opacity,
             px(4),
         );
-        if v.charging {
+        let (_, end) = if v.charging {
             place(&mut p, text_font, v.text.clone(), level, opacity, px(2));
-            place(&mut p, bolt_font, BOLT.into(), palette.text, opacity, gap);
+            place(&mut p, bolt_font, BOLT.into(), palette.text, opacity, gap)
         } else {
-            place(&mut p, text_font, v.text.clone(), level, opacity, gap);
-        }
+            place(&mut p, text_font, v.text.clone(), level, opacity, gap)
+        };
+        drawn.push((start, end));
     }
     let width = x + px(4);
     let height = height.max(1);
@@ -149,7 +164,23 @@ pub fn widget_strip(views: &[DeviceView], dpi: u32, height: i32, light: bool) ->
         });
     }
     p.finish(&spans, 1, true);
-    Some(p)
+    Some((p, device_columns(&drawn, width)))
+}
+
+/// Each device's columns of the strip, from its drawn extent (`x0`, `x1`) per device: the
+/// gap between two devices is split at its middle, the first starts at 0 and the last ends
+/// at `width`, so every column of the strip belongs to a device.
+fn device_columns(drawn: &[(i32, i32)], width: i32) -> Vec<(i32, i32)> {
+    let mut out = Vec::with_capacity(drawn.len());
+    let mut left = 0;
+    for (i, &(_, end)) in drawn.iter().enumerate() {
+        let right = drawn
+            .get(i + 1)
+            .map_or(width, |&(next, _)| (end + next) / 2);
+        out.push((left, right));
+        left = right;
+    }
+    out
 }
 
 /// A `size`×`size` tray icon: the percentage as a number, else the device's glyph.
@@ -202,6 +233,105 @@ pub fn tray_icon(view: Option<&DeviceView>, size: i32, light: bool) -> Option<HI
     };
     p.finish(&[all], 0, false);
     p.into_icon()
+}
+
+/// Colours of the hover card for the taskbar's theme; its background is the chart's.
+struct CardColors {
+    background: [u8; 3],
+    border: [u8; 3],
+    title: [u8; 3],
+    text: [u8; 3],
+}
+
+impl CardColors {
+    fn new(light: bool) -> CardColors {
+        if light {
+            CardColors {
+                background: [255, 255, 255],
+                border: [200, 200, 200],
+                title: [0, 0, 0],
+                text: [64, 64, 64],
+            }
+        } else {
+            CardColors {
+                background: [32, 32, 32],
+                border: [80, 80, 80],
+                title: [255, 255, 255],
+                text: [220, 220, 220],
+            }
+        }
+    }
+}
+
+/// The hover card: `lines` (the first, the device's name, emphasised) above the chart of
+/// `samples` over `window`, opaque, in the taskbar's theme; `dpi` scales it.
+pub fn card(
+    lines: &[String],
+    samples: &[Sample],
+    window: Duration,
+    dpi: u32,
+    light: bool,
+) -> Option<Painter> {
+    let px = |v: i32| v * dpi as i32 / 96;
+    let colors = CardColors::new(light);
+    let mut p = Painter::new()?;
+    let title_font = p.font(&[TEXT_FACE], -px(14), FW_SEMIBOLD.0 as i32)?;
+    let text_font = p.font(&[TEXT_FACE], -px(12), FW_NORMAL.0 as i32)?;
+    let chart_font = p.font(&[TEXT_FACE], -px(11), FW_NORMAL.0 as i32)?;
+    let pad = px(12);
+    // (font, text, y, colour)
+    let mut rows = Vec::with_capacity(lines.len());
+    let mut y = pad;
+    let mut width = px(300);
+    for (i, line) in lines.iter().enumerate() {
+        let (font, rgb, gap) = if i == 0 {
+            (title_font, colors.title, px(4))
+        } else {
+            (text_font, colors.text, px(2))
+        };
+        let wide: Vec<u16> = line.encode_utf16().collect();
+        let size = p.measure(font, &wide);
+        width = width.max(size.cx + 2 * pad);
+        rows.push((font, wide, y, rgb));
+        y += size.cy + gap;
+    }
+    let chart = RECT {
+        left: pad / 2,
+        top: y + px(6),
+        right: width - pad / 2,
+        bottom: y + px(126),
+    };
+    let height = chart.bottom + pad / 2;
+    if !p.begin(width, height) {
+        return None;
+    }
+    let whole = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let inside = RECT {
+        left: 1,
+        top: 1,
+        right: width - 1,
+        bottom: height - 1,
+    };
+    p.fill(&whole, colors.border);
+    p.fill(&inside, colors.background);
+    for (font, wide, y, rgb) in &rows {
+        // SAFETY: the painter's DC is alive.
+        unsafe { SetTextColor(p.dc, colorref(*rgb)) };
+        p.draw(*font, pad, *y, wide);
+    }
+    p.select(chart_font);
+    chart::paint(p.dc, chart, samples, window, light);
+    p.opaque();
+    Some(p)
+}
+
+fn colorref([r, g, b]: [u8; 3]) -> COLORREF {
+    COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
 }
 
 /// A font owned by a [`Painter`].
@@ -344,16 +474,46 @@ impl Painter {
         let _ = unsafe { TextOutW(self.dc, x, y, text) };
     }
 
-    /// Flushes GDI and colours the pixels (see [`colorize`]).
-    fn finish(&mut self, spans: &[Span], floor: u8, premultiplied: bool) {
-        let Some(s) = &self.surface else { return };
+    /// Fills `rect` with `rgb` (alpha left to [`Painter::opaque`]).
+    fn fill(&mut self, rect: &RECT, rgb: [u8; 3]) {
+        // SAFETY: the DC is alive; the brush is not selected anywhere and is deleted after
+        // use.
+        unsafe {
+            let brush = CreateSolidBrush(colorref(rgb));
+            FillRect(self.dc, rect, brush);
+            let _ = DeleteObject(brush.into());
+        }
+    }
+
+    /// Flushes GDI and returns the DIB's pixels (BGRA rows), if one is selected.
+    fn pixels(&mut self) -> Option<&mut [u8]> {
+        let s = self.surface.as_ref()?;
         // SAFETY: no pointers involved.
         let _ = unsafe { GdiFlush() };
         let len = (s.width * s.height * 4) as usize;
         // SAFETY: the DIB holds `width * height` 4-byte pixels and stays alive and unaliased
-        // while GDI is flushed and nothing else draws.
-        let pixels = unsafe { std::slice::from_raw_parts_mut(s.bits, len) };
-        colorize(pixels, s.width as usize, spans, floor, premultiplied);
+        // while GDI is flushed and nothing else draws (the slice borrows the painter).
+        Some(unsafe { std::slice::from_raw_parts_mut(s.bits, len) })
+    }
+
+    /// Flushes GDI and colours the pixels (see [`colorize`]).
+    fn finish(&mut self, spans: &[Span], floor: u8, premultiplied: bool) {
+        let Some(width) = self.surface.as_ref().map(|s| s.width as usize) else {
+            return;
+        };
+        if let Some(pixels) = self.pixels() {
+            colorize(pixels, width, spans, floor, premultiplied);
+        }
+    }
+
+    /// Flushes GDI and makes every pixel opaque: GDI leaves alpha 0 where it draws, and
+    /// `UpdateLayeredWindow` would show nothing there.
+    fn opaque(&mut self) {
+        if let Some(pixels) = self.pixels() {
+            for px in pixels.as_chunks_mut::<4>().0 {
+                px[3] = 255;
+            }
+        }
     }
 
     pub fn dc(&self) -> HDC {
@@ -469,5 +629,15 @@ mod tests {
                 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 255, 255, 255, 255, 255, 255
             ]
         );
+    }
+
+    #[test]
+    fn device_columns_cover_the_strip() {
+        assert_eq!(
+            device_columns(&[(4, 50), (60, 110), (121, 170)], 174),
+            [(0, 55), (55, 115), (115, 174)]
+        );
+        assert_eq!(device_columns(&[(4, 50)], 54), [(0, 54)]);
+        assert!(device_columns(&[], 20).is_empty());
     }
 }
