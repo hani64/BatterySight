@@ -3,11 +3,13 @@
 //! `settings.toml` and `history.tsv` live in `%LOCALAPPDATA%\BatterySight`. Every write
 //! runs on one writer thread: callers only send ([`Store::save_settings`],
 //! [`Store::append_history`], [`Store::run`]), so the UI thread never waits on the disk.
-//! The one blocking read, [`Store::load_settings`], happens at startup before any window
-//! exists. A failed write is traced (`BATTERYSIGHT_TRACE`) and otherwise ignored: the app
-//! keeps its in-memory settings, and the next save writes the whole file again. An
-//! existing settings file is never replaced unless it was read and parsed: otherwise the
-//! first save sets it aside as `settings.toml.bad`.
+//! The blocking reads, [`Store::load_settings`] and [`Store::load_history`], happen at
+//! startup before any window exists. A failed write is traced (`BATTERYSIGHT_TRACE`) and
+//! otherwise ignored: the app keeps its in-memory settings, and the next save writes the
+//! whole file again. An existing settings file is never replaced unless it was read and
+//! parsed: otherwise the first save sets it aside as `settings.toml.bad`. History lines are
+//! appended without flushing to disk; the history is rewritten only at startup, to drop
+//! what is older than 30 days or cannot be read (such as a line torn by a crash).
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +22,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use batterysight_core::history::{self, KEEP_MS, Sample};
 use batterysight_core::settings::Settings;
 
 use crate::trace;
@@ -30,6 +33,8 @@ const SETTINGS_BAD: &str = "settings.toml.bad";
 /// A save in progress, renamed over [`SETTINGS`] once complete.
 const SETTINGS_TMP: &str = "settings.toml.tmp";
 const HISTORY: &str = "history.tsv";
+/// A rewrite of the history in progress, renamed over [`HISTORY`] once complete.
+const HISTORY_TMP: &str = "history.tsv.tmp";
 
 /// How long [`Store::stop`] waits for queued writes.
 const STOP_WAIT: Duration = Duration::from_secs(1);
@@ -133,6 +138,33 @@ impl Store {
         let _ = self.jobs.send(Job::Append(line));
     }
 
+    /// The samples of `history.tsv` from the 30 days before `now_unix_ms`, in file order;
+    /// lines that do not parse (torn by a crash, for one) are skipped. If the file holds
+    /// anything else, the writer rewrites it without that before any later append. Empty
+    /// when there is no file or it cannot be read (then it is left as it is). Blocks on the
+    /// disk like [`Store::load_settings`]: call it once at startup, before any window exists.
+    pub fn load_history(&self, now_unix_ms: u64) -> Vec<Sample> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        let bytes = match read_retrying(&root.join(HISTORY)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    trace::store_line(&format!("history unreadable: {e}"));
+                }
+                return Vec::new();
+            }
+        };
+        let since = now_unix_ms.saturating_sub(KEEP_MS);
+        let (samples, dirty) = history::read(&String::from_utf8_lossy(&bytes), since);
+        if dirty {
+            let root = root.clone();
+            self.run(Box::new(move || prune_history(&root, since)));
+        }
+        samples
+    }
+
     /// Queues `job` (other blocking work, such as a registry write) on the writer thread.
     /// Everything queued before it, saves and appends included, is done before it runs. A
     /// job that panics is traced and the writer goes on (in a build with `panic = "abort"`
@@ -233,14 +265,23 @@ fn save(root: &Path, settings: &Settings, keep_existing: &AtomicBool) -> io::Res
             _ => keep_existing.store(false, Ordering::Relaxed),
         }
     }
-    let tmp = root.join(SETTINGS_TMP);
-    let written = File::create(&tmp).and_then(|mut file| {
-        file.write_all(settings.to_toml().as_bytes())?;
+    replace(
+        &path,
+        &root.join(SETTINGS_TMP),
+        settings.to_toml().as_bytes(),
+    )
+}
+
+/// Writes `bytes` to `tmp`, flushes it to disk and renames it over `path`, so `path` holds
+/// either its old or its new content.
+fn replace(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+    let written = File::create(tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
         file.sync_all()
     });
-    let result = written.and_then(|()| fs::rename(&tmp, &path));
+    let result = written.and_then(|()| fs::rename(tmp, path));
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp);
     }
     result
 }
@@ -254,6 +295,24 @@ fn append(root: &Path, text: &str) -> io::Result<()> {
         .write_all(text.as_bytes())
 }
 
+/// Rewrites `history.tsv` with only its samples from `since_unix_ms` on (read again here,
+/// on the writer thread), if it holds anything else. A failure is traced; the file is then
+/// left as it is.
+fn prune_history(root: &Path, since_unix_ms: u64) {
+    let path = root.join(HISTORY);
+    let result = fs::read(&path).and_then(|bytes| {
+        let (samples, dirty) = history::read(&String::from_utf8_lossy(&bytes), since_unix_ms);
+        if !dirty {
+            return Ok(());
+        }
+        let text: String = samples.iter().map(|s| s.to_line() + "\n").collect();
+        replace(&path, &root.join(HISTORY_TMP), text.as_bytes())
+    });
+    if let Err(e) = result {
+        trace::store_line(&format!("history not pruned: {e}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -263,7 +322,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use batterysight_core::model::DeviceKey;
+    use batterysight_core::history::{KEEP_MS, Sample};
+    use batterysight_core::model::{Charge, DeviceKey, Level, Presence, Source};
     use batterysight_core::settings::{DisplayMode, Threshold};
     use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
@@ -532,6 +592,103 @@ mod tests {
         assert_eq!(store.load_settings(), Settings::default());
         store.save_settings(Settings::default());
         store.append_history("1".into());
+        store.stop();
+    }
+
+    /// 2026-11-24 00:00 UTC.
+    const NOW: u64 = 1_795_478_400_000;
+
+    fn sample(at: u64, percent: u8) -> Sample {
+        Sample {
+            at_unix_ms: at,
+            key: DeviceKey("logi:4082:1".into()),
+            level: Some(Level::Percent(percent)),
+            charge: Charge::Discharging,
+            presence: Presence::Online,
+            millivolts: None,
+            source: Source::Query,
+        }
+    }
+
+    fn lines(samples: &[&Sample]) -> String {
+        samples.iter().map(|s| s.to_line() + "\n").collect()
+    }
+
+    #[test]
+    fn history_loads_the_last_30_days_and_prunes_the_rest_on_the_writer() {
+        let dir = TempDir::new();
+        let file = dir.path().join("history.tsv");
+        let old = sample(NOW - KEEP_MS - 1, 95);
+        let first = sample(NOW - KEEP_MS, 90);
+        let second = sample(NOW - 1_000, 80);
+        let torn = sample(NOW - 500, 79).to_line();
+        let text = format!(
+            "{}garbage\n{}{}",
+            lines(&[&old, &first]),
+            lines(&[&second]),
+            &torn[..torn.len() / 2]
+        );
+        fs::write(&file, &text).unwrap();
+        let store = open(&dir);
+        // Hold the writer: the file is not rewritten by the load itself.
+        let (release, wait) = mpsc::channel::<()>();
+        store.run(Box::new(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        }));
+
+        assert_eq!(store.load_history(NOW), [first.clone(), second.clone()]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), text);
+        // Appends queued after the load follow the pruned lines.
+        let third = sample(NOW, 78);
+        store.append_history(third.to_line());
+        drop(release);
+        store.stop();
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            lines(&[&first, &second, &third])
+        );
+        assert!(!dir.path().join("history.tsv.tmp").exists());
+    }
+
+    #[test]
+    fn clean_history_is_not_rewritten() {
+        let dir = TempDir::new();
+        let file = dir.path().join("history.tsv");
+        let text = lines(&[&sample(NOW - 2_000, 90), &sample(NOW - 1_000, 89)]);
+        fs::write(&file, &text).unwrap();
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let store = open(&dir);
+        assert_eq!(store.load_history(NOW).len(), 2);
+        store.stop();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn missing_or_unreadable_history_is_empty_and_kept() {
+        let dir = TempDir::new();
+        let store = open(&dir);
+        assert!(store.load_history(NOW).is_empty());
+        store.stop();
+        assert!(!dir.path().join("history.tsv").exists());
+
+        let file = dir.path().join("history.tsv");
+        let text = format!("garbage\n{}", lines(&[&sample(NOW, 90)]));
+        fs::write(&file, &text).unwrap();
+        let store = open(&dir);
+        let held = hold(&file, 0);
+        assert!(store.load_history(NOW).is_empty());
+        drop(held);
+        store.stop();
+        assert_eq!(fs::read_to_string(&file).unwrap(), text);
+    }
+
+    #[test]
+    fn without_a_root_history_is_empty() {
+        let store = Store::start_in(None);
+        assert!(store.load_history(NOW).is_empty());
         store.stop();
     }
 }
