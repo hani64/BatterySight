@@ -132,6 +132,7 @@ fn device_thread(
         groups: Vec::new(),
         products: HashMap::new(),
         guard: ReadFailureGuard::default(),
+        release_at: None,
         trace: Trace::from_env(),
         states,
         on_change,
@@ -167,6 +168,9 @@ struct Device {
     /// Keeps a group closed after back-to-back read failures until the next arrival, resume
     /// or refresh, and holds back one reopened too often in the last minute.
     guard: ReadFailureGuard,
+    /// When the first present group the reopen cap holds back may open; the device thread
+    /// rescans once then.
+    release_at: Option<Ms>,
     trace: Option<Trace>,
     states: Arc<Mutex<Vec<DeviceState>>>,
     on_change: Box<dyn Fn() + Send>,
@@ -184,8 +188,11 @@ impl Device {
             {
                 self.feed(HubInput::Tick, now);
             }
+            if self.release_due(now) {
+                self.rescan();
+            }
             // May return nothing before the deadline; the loop then checks it again.
-            let events = self.reactor.wait(self.hub.next_deadline(), now_ms());
+            let events = self.reactor.wait(self.deadline(), now_ms());
             let mut rescan = false;
             for event in events {
                 rescan |= self.on_event(event);
@@ -243,12 +250,13 @@ impl Device {
                     .iter()
                     .position(|group| group.paths.contains(&path));
                 removed.is_some_and(|index| {
-                    self.remove(index);
+                    let gone = self.remove(index);
+                    self.guard.on_removed(gone.paths, now_ms());
                     true
                 })
             }
             OsEvent::InterfaceArrived => {
-                self.guard.on_arrival();
+                self.guard.on_arrival(now_ms());
                 true
             }
             OsEvent::Resume => {
@@ -265,12 +273,30 @@ impl Device {
     /// Enumerates the HID groups engines want, closes the opened ones no longer present
     /// and opens the new ones the read-failure guard admits.
     fn rescan(&mut self) {
-        self.apply_scan(hid_enum::enumerate());
+        self.apply_scan(hid_enum::enumerate(), now_ms());
     }
 
-    /// [`Device::rescan`] on the interfaces `scanned`. `None` (the enumeration failed) says
-    /// nothing about which devices are present, so every group stays as it is.
-    fn apply_scan(&mut self, scanned: Option<Vec<HidInterface>>) {
+    /// When the device thread must next wake: the hub's deadline or a held-back group's
+    /// release, whichever comes first.
+    fn deadline(&self) -> Option<Ms> {
+        [self.hub.next_deadline(), self.release_at]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Whether a held-back group's release is due at `now`; if so, the release is spent.
+    fn release_due(&mut self, now: Ms) -> bool {
+        let due = self.release_at.is_some_and(|at| now >= at);
+        if due {
+            self.release_at = None;
+        }
+        due
+    }
+
+    /// [`Device::rescan`] on the interfaces `scanned` at `now`. `None` (the enumeration
+    /// failed) says nothing about which devices are present, so every group stays as it is.
+    fn apply_scan(&mut self, scanned: Option<Vec<HidInterface>>, now: Ms) {
         let Some(scanned) = scanned else {
             return;
         };
@@ -287,11 +313,20 @@ impl Device {
         let gone = unmatched(&known, &found);
         let new = unmatched(&found, &known);
         for &index in gone.iter().rev() {
-            self.remove(index);
+            let gone = self.remove(index);
+            self.guard.on_removed(gone.paths, now);
         }
+        self.release_at = None;
         for (index, (group, members, paths)) in scanned.into_iter().enumerate() {
-            if new.contains(&index) && self.guard.admit(&paths, now_ms()) {
-                self.arrive(group, members, paths);
+            if !new.contains(&index) {
+                continue;
+            }
+            match self.guard.admission(&paths, now) {
+                Admission::Open => self.arrive(group, members, paths, now),
+                Admission::Closed => {}
+                Admission::HeldUntil(at) => {
+                    self.release_at = Some(self.release_at.map_or(at, |release| release.min(at)));
+                }
             }
         }
     }
@@ -299,7 +334,7 @@ impl Device {
     /// Fills in the product strings of the collections an engine reads, opens those and
     /// hands them to the hub. The group's other collections (such as a headset's consumer
     /// control) are never opened, so their reports never reach the process.
-    fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet) {
+    fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet, now: Ms) {
         let mut opened = Vec::new();
         for mut member in members
             .into_iter()
@@ -319,6 +354,7 @@ impl Device {
             self.reactor.close_group(group.id);
             return;
         }
+        self.guard.on_open(&paths, now);
         self.groups.push(Opened {
             id: group.id,
             paths,
@@ -397,10 +433,21 @@ fn unmatched(sets: &[&PathSet], others: &[&PathSet]) -> Vec<usize> {
 /// What to do with a group whose read just failed.
 #[derive(Debug, PartialEq, Eq)]
 enum AfterFailure {
-    /// Re-enumerate; the group is reopened if still present.
+    /// Re-enumerate; the group is reopened if still present and admitted.
     Reopen,
-    /// Leave the group closed until the guard is cleared.
+    /// Leave the group closed until the next arrival, resume or refresh; the reopen cap
+    /// may hold it back longer.
     StayClosed,
+}
+
+/// Whether a rescan may open a group now.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Open,
+    /// Closed for failing until the next arrival, resume or refresh.
+    Closed,
+    /// Held back by the reopen cap until this time, or until a resume or refresh.
+    HeldUntil(Ms),
 }
 
 /// The most times [`ReadFailureGuard`] lets one group be reopened within [`REOPEN_WINDOW`].
@@ -414,39 +461,56 @@ fn in_window(at: Ms, now: Ms) -> bool {
     now.saturating_sub(at) < REOPEN_WINDOW
 }
 
-/// Decides per group, keyed by path set, whether a group whose read failed is opened again.
+/// Decides per group, keyed by path set, whether a rescan may open a group that failed.
 ///
-/// - A failure reopens the group unless the previous failure of the same group was not
-///   followed by a report from it, or the group was already reopened [`REOPEN_LIMIT`] times
-///   within the last [`REOPEN_WINDOW`]; then the group stays closed until the next
+/// - A read failure reopens the group unless the previous failure of the same group was
+///   not followed by a report from it, or the group was already reopened [`REOPEN_LIMIT`]
+///   times within the last [`REOPEN_WINDOW`]; then the group stays closed until the next
 ///   arrival ([`on_arrival`]), resume or refresh ([`clear`]).
-/// - Every open of a group that failed within the window counts as a reopen, whatever
-///   caused it: the rescan after the failure or the group arriving again. Once the window
-///   holds [`REOPEN_LIMIT`] reopens, the group is not opened ([`admit`]) until the oldest
-///   leaves the window or a resume or refresh clears the guard. An arrival does not lift
-///   this, so a device that re-enumerates after each failure is not reopened in a loop.
-/// - A group with no failure in the window is always opened: plugging a device in never
-///   counts.
+/// - Removing an open group counts as a failure for the window, though not towards the
+///   back-to-back rule, so the cap does not depend on whether a device's removal or its
+///   read failure is handled first.
+/// - Every open of a group that failed or was removed within the window counts as a
+///   reopen ([`on_open`]), whatever caused it. While the window holds [`REOPEN_LIMIT`]
+///   reopens, the group is held back ([`admission`]) until the oldest of them leaves the
+///   window, when the device thread rescans once, or until a resume or refresh. An arrival
+///   does not lift this, so a device that re-enumerates after each failure is not reopened
+///   in a loop, and one replugged more than [`REOPEN_LIMIT`] times a minute waits for the
+///   window.
+/// - A group with no failure or removal in the window is always opened.
 ///
 /// [`on_arrival`]: ReadFailureGuard::on_arrival
 /// [`clear`]: ReadFailureGuard::clear
-/// [`admit`]: ReadFailureGuard::admit
+/// [`on_open`]: ReadFailureGuard::on_open
+/// [`admission`]: ReadFailureGuard::admission
 #[derive(Default)]
 struct ReadFailureGuard {
     groups: HashMap<PathSet, Failures>,
 }
 
-/// One group's read failures since the guard was last cleared.
+/// One group's failures and reopens since the guard was last cleared.
 #[derive(Default)]
 struct Failures {
-    /// When its read last failed.
+    /// When its read last failed or it was last removed while open.
     failed_at: Ms,
-    /// Failed and reported nothing since.
+    /// Its read failed and it reported nothing since.
     pending: bool,
     /// Kept closed until the next arrival, resume or refresh.
     closed: bool,
-    /// When it was reopened within the last [`REOPEN_WINDOW`], oldest first.
+    /// When it was reopened, oldest first; those outside the window are pruned lazily.
     reopens: Vec<Ms>,
+}
+
+impl Failures {
+    /// The reopens within the window ending at `now`.
+    fn recent_reopens(&self, now: Ms) -> &[Ms] {
+        let start = self
+            .reopens
+            .iter()
+            .position(|&at| in_window(at, now))
+            .unwrap_or(self.reopens.len());
+        &self.reopens[start..]
+    }
 }
 
 impl ReadFailureGuard {
@@ -460,9 +524,8 @@ impl ReadFailureGuard {
     fn on_failure(&mut self, paths: PathSet, now: Ms) -> AfterFailure {
         let failures = self.groups.entry(paths).or_default();
         failures.failed_at = now;
-        failures.reopens.retain(|&at| in_window(at, now));
         let back_to_back = std::mem::replace(&mut failures.pending, true);
-        if back_to_back || failures.reopens.len() >= REOPEN_LIMIT {
+        if back_to_back || failures.recent_reopens(now).len() >= REOPEN_LIMIT {
             failures.closed = true;
             AfterFailure::StayClosed
         } else {
@@ -470,32 +533,47 @@ impl ReadFailureGuard {
         }
     }
 
-    /// Whether a rescan may open the group now; if so, counts the open as a reopen when
-    /// the group failed within the window.
-    fn admit(&mut self, paths: &PathSet, now: Ms) -> bool {
-        let Some(failures) = self.groups.get_mut(paths) else {
-            return true;
+    /// An open group was removed.
+    fn on_removed(&mut self, paths: PathSet, now: Ms) {
+        self.groups.entry(paths).or_default().failed_at = now;
+    }
+
+    fn admission(&self, paths: &PathSet, now: Ms) -> Admission {
+        let Some(failures) = self.groups.get(paths) else {
+            return Admission::Open;
         };
         if failures.closed {
-            return false;
+            return Admission::Closed;
         }
-        failures.reopens.retain(|&at| in_window(at, now));
-        if failures.reopens.len() >= REOPEN_LIMIT {
-            return false;
+        let recent = failures.recent_reopens(now);
+        match recent.len().checked_sub(REOPEN_LIMIT) {
+            Some(index) => Admission::HeldUntil(recent[index] + REOPEN_WINDOW),
+            None => Admission::Open,
         }
-        if in_window(failures.failed_at, now) {
+    }
+
+    /// The group was opened: a reopen if it failed or was removed within the window.
+    fn on_open(&mut self, paths: &PathSet, now: Ms) {
+        if let Some(failures) = self.groups.get_mut(paths)
+            && in_window(failures.failed_at, now)
+        {
+            failures.reopens.retain(|&at| in_window(at, now));
             failures.reopens.push(now);
         }
-        true
     }
 
     /// An interface arrived: groups closed for failing may be opened again, except those
-    /// [`REOPEN_LIMIT`] still holds back.
-    fn on_arrival(&mut self) {
-        for failures in self.groups.values_mut() {
+    /// the reopen cap holds back. Forgets groups with nothing left in the window.
+    fn on_arrival(&mut self, now: Ms) {
+        self.groups.retain(|_, failures| {
             failures.pending = false;
             failures.closed = false;
-        }
+            in_window(failures.failed_at, now)
+                || failures
+                    .reopens
+                    .last()
+                    .is_some_and(|&at| in_window(at, now))
+        });
     }
 
     /// Forgets every failure and reopen: every group may be opened.
@@ -558,10 +636,20 @@ mod tests {
         assert!(unmatched(&[], &[&a]).is_empty());
     }
 
+    /// A rescan opens `group` at `at`.
+    fn reopen(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) {
+        assert_eq!(
+            guard.admission(group, at),
+            Admission::Open,
+            "refused at {at}"
+        );
+        guard.on_open(group, at);
+    }
+
     /// A read of `group` fails at `at`, the rescan reopens it and it reads normally again.
     fn fail_and_reopen(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) {
         assert_eq!(guard.on_failure(group.clone(), at), AfterFailure::Reopen);
-        assert!(guard.admit(group, at), "reopen at {at} refused");
+        reopen(guard, group, at);
         guard.on_report(group);
     }
 
@@ -581,8 +669,8 @@ mod tests {
         assert_eq!(guard.on_failure(group.clone(), 0), AfterFailure::Reopen);
         guard.on_report(&other);
         assert_eq!(guard.on_failure(group.clone(), 1), AfterFailure::StayClosed);
-        assert!(!guard.admit(&group, 1));
-        assert!(guard.admit(&other, 1));
+        assert_eq!(guard.admission(&group, 1), Admission::Closed);
+        assert_eq!(guard.admission(&other, 1), Admission::Open);
     }
 
     #[test]
@@ -606,7 +694,7 @@ mod tests {
             guard.on_failure(group.clone(), 6_000),
             AfterFailure::StayClosed
         );
-        assert!(!guard.admit(&group, 6_000));
+        assert_eq!(guard.admission(&group, 6_000), Admission::Closed);
         guard.clear();
         fail_and_reopen(&mut guard, &group, 61_000);
     }
@@ -654,12 +742,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checking_spends_no_reopen() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        assert_eq!(guard.on_failure(group.clone(), 0), AfterFailure::Reopen);
+        for at in 0..5 {
+            assert_eq!(guard.admission(&group, at), Admission::Open);
+        }
+        guard.on_report(&group);
+        for at in [1_000, 2_000, 3_000] {
+            fail_and_reopen(&mut guard, &group, at);
+        }
+    }
+
     /// A device that re-enumerates after each failure: the failure's rescan finds it gone,
-    /// then its arrival reopens it.
-    fn fail_and_rearrive(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) -> bool {
+    /// then its arrival a second later opens it if admitted.
+    fn fail_and_rearrive(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) -> Admission {
         guard.on_failure(group.clone(), at);
-        guard.on_arrival();
-        guard.admit(group, at + 1_000)
+        guard.on_arrival(at + 1_000);
+        let admission = guard.admission(group, at + 1_000);
+        if admission == Admission::Open {
+            guard.on_open(group, at + 1_000);
+        }
+        admission
     }
 
     #[test]
@@ -667,13 +773,15 @@ mod tests {
         let group = set(&["a"]);
         let mut guard = ReadFailureGuard::default();
         for at in [0, 2_000, 4_000] {
-            assert!(fail_and_rearrive(&mut guard, &group, at), "refused at {at}");
+            let admission = fail_and_rearrive(&mut guard, &group, at);
+            assert_eq!(admission, Admission::Open, "refused at {at}");
         }
-        assert!(!fail_and_rearrive(&mut guard, &group, 6_000));
-        guard.on_arrival();
-        assert!(!guard.admit(&group, 59_000));
-        // The reopen at 1 s has left the window.
-        assert!(guard.admit(&group, 61_000));
+        // Held back until the reopen at 1 s leaves the window.
+        let held = Admission::HeldUntil(61_000);
+        assert_eq!(fail_and_rearrive(&mut guard, &group, 6_000), held);
+        guard.on_arrival(59_000);
+        assert_eq!(guard.admission(&group, 59_000), held);
+        assert_eq!(guard.admission(&group, 61_000), Admission::Open);
     }
 
     #[test]
@@ -681,11 +789,28 @@ mod tests {
         let group = set(&["a"]);
         let mut guard = ReadFailureGuard::default();
         for at in [0, 2_000, 4_000] {
-            assert!(fail_and_rearrive(&mut guard, &group, at));
+            assert_eq!(fail_and_rearrive(&mut guard, &group, at), Admission::Open);
         }
-        assert!(!fail_and_rearrive(&mut guard, &group, 6_000));
+        assert_ne!(
+            fail_and_rearrive(&mut guard, &group, 6_000),
+            Admission::Open
+        );
         guard.clear();
-        assert!(guard.admit(&group, 8_000));
+        assert_eq!(guard.admission(&group, 8_000), Admission::Open);
+    }
+
+    #[test]
+    fn removal_then_arrival_is_capped() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            guard.on_removed(group.clone(), at);
+            guard.on_arrival(at + 1_000);
+            reopen(&mut guard, &group, at + 1_000);
+        }
+        guard.on_removed(group.clone(), 6_000);
+        guard.on_arrival(7_000);
+        assert_eq!(guard.admission(&group, 7_000), Admission::HeldUntil(61_000));
     }
 
     #[test]
@@ -694,11 +819,11 @@ mod tests {
         let capped = set(&["capped"]);
         let mut guard = ReadFailureGuard::default();
         for at in [0, 2_000, 4_000] {
-            assert!(fail_and_rearrive(&mut guard, &capped, at));
+            assert_eq!(fail_and_rearrive(&mut guard, &capped, at), Admission::Open);
         }
         for at in 0..10 {
-            guard.on_arrival();
-            assert!(guard.admit(&fresh, at), "fresh set refused at {at}");
+            guard.on_arrival(at);
+            reopen(&mut guard, &fresh, at);
         }
     }
 
@@ -708,29 +833,116 @@ mod tests {
         let mut guard = ReadFailureGuard::default();
         fail_and_reopen(&mut guard, &group, 0);
         for at in [60_000, 61_000, 62_000, 63_000] {
-            guard.on_arrival();
-            assert!(guard.admit(&group, at), "refused at {at}");
+            guard.on_arrival(at);
+            reopen(&mut guard, &group, at);
         }
     }
 
     #[test]
-    fn arrival_keeps_a_capped_group_closed() {
-        let (_server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
+    fn arrival_forgets_groups_outside_the_window() {
+        let mut guard = ReadFailureGuard::default();
+        guard.on_removed(set(&["a"]), 0);
+        guard.on_arrival(59_999);
+        assert_eq!(guard.groups.len(), 1);
+        guard.on_arrival(60_000);
+        assert!(guard.groups.is_empty());
+    }
+
+    /// A device whose PRO X Wireless dongle collection is served by a fresh pipe, with its
+    /// product string cached so that nothing but the open touches the single-instance pipe.
+    fn dongle_device() -> (Device, Server, HidInterface, PathSet) {
+        let (server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let hidpp = dongle_member(pipe, 0xFF43, 0x0202, 20);
         let paths: PathSet = [path_key(&hidpp.path)].into();
         let mut device = device();
-        // Should the group open anyway, keep `product_string` off the single-instance pipe.
         let product = "PRO X Wireless Gaming Headset".to_owned();
         device.products.insert(path_key(&hidpp.path), product);
-        let now = now_ms();
-        for _ in 0..3 {
-            assert!(fail_and_rearrive(&mut device.guard, &paths, now));
+        (device, server, hidpp, paths)
+    }
+
+    /// Caps `paths` with reopens at `base` + 1, 3 and 5 s and a failure at `base` + 6 s.
+    fn cap(guard: &mut ReadFailureGuard, paths: &PathSet, base: Ms) {
+        for at in [0, 2_000, 4_000] {
+            assert_eq!(fail_and_rearrive(guard, paths, base + at), Admission::Open);
         }
-        device.guard.on_failure(paths, now);
+        guard.on_failure(paths.clone(), base + 6_000);
+    }
+
+    #[test]
+    fn arrival_keeps_a_capped_group_closed() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
 
         assert!(device.on_event(OsEvent::InterfaceArrived));
-        device.apply_scan(Some(vec![hidpp]));
+        device.apply_scan(Some(vec![hidpp]), base + 7_000);
         assert!(device.groups.is_empty());
+    }
+
+    #[test]
+    fn held_back_group_opens_when_its_window_frees() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        let release = base + 61_000;
+
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 7_000);
+        assert!(device.groups.is_empty());
+        assert_eq!(device.deadline(), Some(release));
+        assert!(!device.release_due(release - 1));
+        assert!(device.release_due(release));
+        assert_eq!(device.deadline(), None, "release is one-shot");
+
+        device.apply_scan(Some(vec![hidpp]), release);
+        assert_eq!(device.groups.len(), 1);
+    }
+
+    #[test]
+    fn absent_held_back_group_sets_no_deadline() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        device.apply_scan(Some(vec![hidpp]), base + 7_000);
+        assert!(device.deadline().is_some());
+
+        device.apply_scan(Some(Vec::new()), base + 8_000);
+        assert_eq!(device.deadline(), None);
+    }
+
+    #[test]
+    fn failed_open_spends_no_reopen() {
+        let (mut device, server, hidpp, paths) = dongle_device();
+        drop(server);
+        let base = now_ms();
+        assert_eq!(
+            device.guard.on_failure(paths.clone(), base),
+            AfterFailure::Reopen
+        );
+        for at in 1..=4 {
+            device.apply_scan(Some(vec![hidpp.clone()]), base + at);
+            assert!(device.groups.is_empty());
+        }
+        assert_eq!(device.guard.admission(&paths, base + 5), Admission::Open);
+    }
+
+    #[test]
+    fn removing_an_opened_group_records_a_failure() {
+        let mut device = device();
+        for path in ["a", "b"] {
+            device.groups.push(Opened {
+                id: GroupId(u32::MAX),
+                paths: set(&[path]),
+                collections: Vec::new(),
+            });
+        }
+
+        assert!(device.on_event(OsEvent::InterfaceRemoved { path: wide("A") }));
+        device.apply_scan(Some(Vec::new()), now_ms());
+
+        assert!(device.guard.groups.contains_key(&set(&["a"])));
+        assert!(device.guard.groups.contains_key(&set(&["b"])));
     }
 
     fn device() -> Device {
@@ -740,6 +952,7 @@ mod tests {
             groups: Vec::new(),
             products: HashMap::new(),
             guard: ReadFailureGuard::default(),
+            release_at: None,
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),
             on_change: Box::new(|| {}),
@@ -778,7 +991,7 @@ mod tests {
             device.products.insert(path_key(&member.path), product);
         }
 
-        device.apply_scan(Some(vec![consumer, hidpp]));
+        device.apply_scan(Some(vec![consumer, hidpp]), now_ms());
 
         assert_eq!(device.groups.len(), 1);
         assert_eq!(device.groups[0].collections, [hidpp_id]);
@@ -797,10 +1010,10 @@ mod tests {
             collections: Vec::new(),
         });
 
-        device.apply_scan(None);
+        device.apply_scan(None, now_ms());
         assert_eq!(device.groups.len(), 1);
 
-        device.apply_scan(Some(Vec::new()));
+        device.apply_scan(Some(Vec::new()), now_ms());
         assert!(device.groups.is_empty());
     }
 
