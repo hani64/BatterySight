@@ -11,7 +11,7 @@ use std::slice;
 use batterysight_core::hid::CollectionId;
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    GENERIC_READ, GENERIC_WRITE, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
@@ -161,11 +161,6 @@ impl Op {
     }
 }
 
-/// Whether `error` reports an operation cancelled by `CancelIoEx`.
-pub(crate) fn is_cancelled(error: &windows::core::Error) -> bool {
-    error.code() == ERROR_OPERATION_ABORTED.to_hresult()
-}
-
 /// Whether a just-issued overlapped `ReadFile`/`WriteFile` will queue a completion packet.
 ///
 /// The I/O manager queues one unless the request failed with an error status. Success,
@@ -184,6 +179,7 @@ fn queues_completion(result: &windows::core::Result<()>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
     #[test]
     fn only_mouse_and_keyboard_are_exclusive() {
