@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use batterysight_core::catalog::Catalog;
 use batterysight_core::engines;
-use batterysight_core::hid::{CollectionId, GroupId, HidGroup};
+use batterysight_core::hid::{CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
 use batterysight_core::model::{DeviceKey, DeviceState};
 use batterysight_core::scheduler::Policy;
@@ -316,7 +316,14 @@ impl Device {
                 {
                     self.guard.on_report(&group.paths);
                 }
-                self.feed(HubInput::Report { collection, bytes }, now_ms());
+                self.feed(
+                    HubInput::Report {
+                        collection,
+                        origin: ReportOrigin::Input,
+                        bytes,
+                    },
+                    now_ms(),
+                );
                 false
             }
             OsEvent::ReadFailed { collection } => {
@@ -575,11 +582,29 @@ impl Device {
         let mut changed = false;
         for output in self.hub.handle(input, now) {
             match output {
-                HubOutput::Send { collection, bytes } => {
+                HubOutput::Send {
+                    collection,
+                    kind: ReportKind::Output,
+                    bytes,
+                } => {
                     if self.reactor.write(collection, &bytes)
                         && let Some(trace) = &mut self.trace
                     {
                         trace.record(Direction::Out, collection, &bytes);
+                    }
+                }
+                // The reactor only implements Output; never downgrade a feature operation.
+                HubOutput::Send {
+                    kind: ReportKind::SetFeature | ReportKind::GetFeature,
+                    ..
+                } => {}
+                HubOutput::WriteRefused {
+                    kind,
+                    collection,
+                    reason,
+                } => {
+                    if let Some(trace) = &mut self.trace {
+                        trace.write_refused(kind, collection, reason);
                     }
                 }
                 HubOutput::StateChanged => changed = true,
@@ -1441,7 +1466,7 @@ mod tests {
             }]
         }
 
-        fn on_report(&mut self, _: CollectionId, _: &[u8], _: Ms) -> Vec<Action> {
+        fn on_report(&mut self, _: CollectionId, _: ReportOrigin, _: &[u8], _: Ms) -> Vec<Action> {
             Vec::new()
         }
 

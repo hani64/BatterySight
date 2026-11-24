@@ -4,7 +4,8 @@
 //! under a [`Grant`] handed to it by the hub. It never reads a clock or
 //! touches a handle; the hub decides what reaches the device.
 
-use crate::hid::CollectionId;
+use crate::engines::hidpp::frame::{LONG, SHORT, SW_ID};
+use crate::hid::{CollectionId, CollectionRole, ReportKind, ReportOrigin};
 use crate::model::{DeviceKey, DeviceUpdate};
 use crate::scheduler::{Capabilities, Grant, GrantId};
 use crate::time::Ms;
@@ -17,6 +18,7 @@ pub enum Action {
     Send {
         grant: GrantId,
         collection: CollectionId,
+        kind: ReportKind,
         bytes: Vec<u8>,
     },
     /// Start tracking a device discovered behind this engine's group. `wpid` is the
@@ -49,12 +51,213 @@ pub enum Action {
     DiscoveryFailed { retry_at: Option<Ms> },
 }
 
+/// A documented payload, including its report ID when numbered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BytePattern {
+    Exact(&'static [u8]),
+    ZeroPadded(&'static [u8]),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HidppTarget {
+    Receiver,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HidppFeatureParams {
+    Exact([u8; 3]),
+    RootLookup(&'static [u16]),
+    NameOffset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HidppRegisterParams {
+    Exact([u8; 3]),
+    EnableNotification { byte: usize, mask: u8 },
+}
+
+/// The complete forms of commands an engine may issue. A grant is still required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteRule {
+    Bytes {
+        role: CollectionRole,
+        kind: ReportKind,
+        wire_len: usize,
+        pattern: BytePattern,
+    },
+    /// HID++ 2.0 output, addressed to a device (not the receiver itself).
+    HidppFeature {
+        role: CollectionRole,
+        feature: u16,
+        function: u8,
+        params: HidppFeatureParams,
+    },
+    /// HID++ 1.0 output.
+    HidppRegister {
+        role: CollectionRole,
+        target: HidppTarget,
+        sub_id: u8,
+        address: u8,
+        params: HidppRegisterParams,
+    },
+}
+
+/// The HID++ payload following the report ID: destination, command, address, and
+/// three parameters. Our long requests use the same parameters as short ones.
+fn hidpp_fields(kind: ReportKind, bytes: &[u8]) -> Option<(u8, u8, u8, [u8; 3])> {
+    if kind != ReportKind::Output {
+        return None;
+    }
+    let &[report, index, command, address, a, b, c, ref padding @ ..] = bytes else {
+        return None;
+    };
+    match (report, bytes.len()) {
+        (SHORT, 7) => {}
+        (LONG, 20) if padding.iter().all(|&byte| byte == 0) => {}
+        _ => return None,
+    }
+    Some((index, command, address, [a, b, c]))
+}
+
+pub(crate) fn write_allowed(
+    engine: &dyn Engine,
+    role: CollectionRole,
+    kind: ReportKind,
+    bytes: &[u8],
+    grant: GrantId,
+    subject: &DeviceKey,
+) -> bool {
+    let mut hidpp = None;
+    let mut feature_id = None;
+    for rule in engine.allowed_writes() {
+        let candidate_role = match *rule {
+            WriteRule::Bytes {
+                role: candidate,
+                kind: wanted,
+                wire_len,
+                pattern,
+            } => {
+                if candidate == role
+                    && wanted == kind
+                    && bytes.len() == wire_len
+                    && match pattern {
+                        BytePattern::Exact(wanted) => bytes == wanted,
+                        BytePattern::ZeroPadded(prefix) => bytes
+                            .strip_prefix(prefix)
+                            .is_some_and(|tail| tail.iter().all(|&byte| byte == 0)),
+                    }
+                {
+                    return true;
+                }
+                continue;
+            }
+            WriteRule::HidppFeature { role, .. } | WriteRule::HidppRegister { role, .. } => role,
+        };
+        if candidate_role != role {
+            continue;
+        }
+        let Some((index, command, address, actual, target)) = *hidpp.get_or_insert_with(|| {
+            let (index, command, address, actual) = hidpp_fields(kind, bytes)?;
+            let target = engine.hidpp_target(index, subject)?;
+            Some((index, command, address, actual, target))
+        }) else {
+            continue;
+        };
+        let matched = match *rule {
+            WriteRule::HidppFeature {
+                feature,
+                function,
+                params,
+                ..
+            } if target == HidppTarget::Device
+                && address & 0x0F == SW_ID
+                && address >> 4 == function
+                && *feature_id.get_or_insert_with(|| engine.feature_id_for_index(index, command))
+                    == Some(feature) =>
+            {
+                match params {
+                    HidppFeatureParams::Exact(expected) => actual == expected,
+                    HidppFeatureParams::RootLookup(ids) => {
+                        actual[2] == 0 && ids.contains(&u16::from_be_bytes([actual[0], actual[1]]))
+                    }
+                    HidppFeatureParams::NameOffset => {
+                        actual[1..] == [0, 0]
+                            && engine.hidpp_name_offset(grant, index) == Some(actual[0])
+                    }
+                }
+            }
+            WriteRule::HidppRegister {
+                target: wanted,
+                sub_id,
+                address: register,
+                params,
+                ..
+            } if target == wanted && command == sub_id && address == register => match params {
+                HidppRegisterParams::Exact(expected) => actual == expected,
+                HidppRegisterParams::EnableNotification { byte, mask } => engine
+                    .hidpp_notification_read(grant, index)
+                    .is_some_and(|mut read| {
+                        let Some(flag) = read.get_mut(byte) else {
+                            return false;
+                        };
+                        if *flag & mask != 0 {
+                            return false;
+                        }
+                        *flag |= mask;
+                        actual == read
+                    }),
+            },
+            _ => false,
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
 pub trait Engine {
     /// Scheduler key for conversations with the group itself (e.g. a receiver).
     fn group_key(&self) -> DeviceKey;
     fn on_grant(&mut self, grant: &Grant, now: Ms) -> Vec<Action>;
-    fn on_report(&mut self, collection: CollectionId, bytes: &[u8], now: Ms) -> Vec<Action>;
+    fn on_report(
+        &mut self,
+        collection: CollectionId,
+        origin: ReportOrigin,
+        bytes: &[u8],
+        now: Ms,
+    ) -> Vec<Action>;
     fn on_tick(&mut self, now: Ms) -> Vec<Action>;
     /// When `on_tick` next needs to run, if ever.
     fn next_deadline(&self) -> Option<Ms>;
+
+    /// No commands are allowed unless the engine declares them explicitly.
+    fn allowed_writes(&self) -> &'static [WriteRule] {
+        &[]
+    }
+
+    fn collection_role(&self, _collection: CollectionId) -> Option<CollectionRole> {
+        None
+    }
+
+    /// HID++ destinations in scope for this grant's (engine-local) subject.
+    fn hidpp_target(&self, _device_index: u8, _subject: &DeviceKey) -> Option<HidppTarget> {
+        None
+    }
+
+    /// Resolves a feature only from the mapping for this destination.
+    fn feature_id_for_index(&self, _device_index: u8, _feature_index: u8) -> Option<u16> {
+        None
+    }
+
+    /// The current offset for an in-flight HID++ name request.
+    fn hidpp_name_offset(&self, _grant: GrantId, _device_index: u8) -> Option<u8> {
+        None
+    }
+
+    /// Unmodified flags from the matched read for an in-flight notification SET.
+    fn hidpp_notification_read(&self, _grant: GrantId, _device_index: u8) -> Option<[u8; 3]> {
+        None
+    }
 }

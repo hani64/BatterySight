@@ -8,6 +8,25 @@ pub struct CollectionId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupId(pub u32);
 
+/// A protocol-defined role assigned to a specific collection by its engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollectionRole(pub u8);
+
+/// Operation requested on an opened HID collection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportKind {
+    Output,
+    SetFeature,
+    GetFeature,
+}
+
+/// How a received report reached the runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportOrigin {
+    Input,
+    FeatureReply,
+}
+
 /// One HID top-level collection; report lengths are in bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collection {

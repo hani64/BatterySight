@@ -1,12 +1,13 @@
 //! Decides when anything may be sent to a device.
 //!
-//! Engines never query on their own: they ask for a [`Grant`] with the event
-//! that justifies it, then call [`Scheduler::admit_send`] before every report
-//! they write. Time only moves through the `now` arguments; nothing here runs
-//! on a timer or produces grants by itself.
+//! The hub hands an engine a [`Grant`] for the event that justifies a query
+//! and spends it only after checking the report. Time only moves through the
+//! `now` arguments; nothing here runs on a timer or produces grants by itself.
 
 use std::collections::HashMap;
+use std::collections::hash_map::{Entry, OccupiedEntry};
 
+use crate::hid::GroupId;
 use crate::model::DeviceKey;
 use crate::time::Ms;
 
@@ -107,8 +108,26 @@ struct DeviceSlot {
 #[derive(Debug)]
 struct OpenGrant {
     subject: DeviceKey,
+    owner: GroupId,
     expires_ms: Ms,
     remaining: u16,
+}
+
+/// A live grant held while the hub checks a request. Dropping it costs nothing.
+pub(crate) struct PendingSend<'a>(OccupiedEntry<'a, GrantId, OpenGrant>);
+
+impl PendingSend<'_> {
+    pub(crate) fn subject(&self) -> &DeviceKey {
+        &self.0.get().subject
+    }
+
+    pub(crate) fn spend(mut self) {
+        let remaining = &mut self.0.get_mut().remaining;
+        *remaining -= 1;
+        if *remaining == 0 {
+            self.0.remove();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -162,6 +181,11 @@ impl Scheduler {
     /// Forgets `key` and revokes its open grants.
     pub fn unregister(&mut self, key: &DeviceKey) {
         self.devices.remove(key);
+        self.revoke_grants(key);
+    }
+
+    /// Discards an owner's open grants without resetting the device's read history.
+    pub(crate) fn revoke_grants(&mut self, key: &DeviceKey) {
         self.grants.retain(|_, grant| grant.subject != *key);
     }
 
@@ -172,8 +196,14 @@ impl Scheduler {
         self.user_gaps = gaps;
     }
 
-    /// Grants permission to query `key` for `trigger`, or `None` if any rule refuses it.
-    pub fn request(&mut self, key: &DeviceKey, trigger: Trigger, now: Ms) -> Option<Grant> {
+    /// Grants `owner` permission to query `key` for `trigger`, if eligible.
+    pub fn request(
+        &mut self,
+        key: &DeviceKey,
+        owner: GroupId,
+        trigger: Trigger,
+        now: Ms,
+    ) -> Option<Grant> {
         // A clock that went backwards counts as no time passed.
         if trigger == Trigger::Activity && self.activity_ready_at(key).is_none_or(|at| now < at) {
             return None;
@@ -231,6 +261,7 @@ impl Scheduler {
             id,
             OpenGrant {
                 subject: key.clone(),
+                owner,
                 expires_ms,
                 remaining: max_requests,
             },
@@ -244,20 +275,25 @@ impl Scheduler {
         })
     }
 
-    /// Consumes one send from `grant`; `false` if it is unknown, expired or exhausted.
-    pub fn admit_send(&mut self, grant: GrantId, now: Ms) -> bool {
-        let Some(open) = self.grants.get_mut(&grant) else {
-            return false;
+    /// Borrows a live, unspent grant issued to this group, without spending it.
+    pub(crate) fn pending_send(
+        &mut self,
+        grant: GrantId,
+        owner: GroupId,
+        now: Ms,
+    ) -> Option<PendingSend<'_>> {
+        let Entry::Occupied(entry) = self.grants.entry(grant) else {
+            return None;
         };
+        let open = entry.get();
+        if open.owner != owner {
+            return None;
+        }
         if now > open.expires_ms || open.remaining == 0 {
-            self.grants.remove(&grant);
-            return false;
+            entry.remove();
+            return None;
         }
-        open.remaining -= 1;
-        if open.remaining == 0 {
-            self.grants.remove(&grant);
-        }
-        true
+        Some(PendingSend(entry))
     }
 
     /// Device answered "asleep/unlinked" or stayed silent: stop asking it.
@@ -322,6 +358,8 @@ impl Scheduler {
 mod tests {
     use super::*;
 
+    const OWNER: GroupId = GroupId(1);
+
     const ALL_TRIGGERS: [Trigger; 6] = [
         Trigger::Arrival,
         Trigger::Rediscovery,
@@ -352,36 +390,36 @@ mod tests {
     #[test]
     fn arrival_grants_once() {
         let mut s = scheduler_with(caps(false, false, 0));
-        assert!(s.request(&key(), Trigger::Arrival, 0).is_some());
-        assert_eq!(s.request(&key(), Trigger::Arrival, 10), None);
+        assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Arrival, 10), None);
 
         // Registering again without unregistering keeps the history.
         s.register(key(), caps(false, false, 0));
-        assert_eq!(s.request(&key(), Trigger::Arrival, 20), None);
+        assert_eq!(s.request(&key(), OWNER, Trigger::Arrival, 20), None);
 
         s.unregister(&key());
         s.register(key(), caps(false, false, 0));
-        assert!(s.request(&key(), Trigger::Arrival, 30).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Arrival, 30).is_some());
     }
 
     #[test]
     fn rediscovery_is_granted_three_times_per_arrival() {
         let mut s = scheduler_with(caps(false, false, 0));
-        assert!(s.request(&key(), Trigger::Arrival, 0).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
         for now in 1..=3 {
             assert!(
-                s.request(&key(), Trigger::Rediscovery, now).is_some(),
+                s.request(&key(), OWNER, Trigger::Rediscovery, now).is_some(),
                 "{now}"
             );
         }
-        assert_eq!(s.request(&key(), Trigger::Rediscovery, 4), None);
+        assert_eq!(s.request(&key(), OWNER, Trigger::Rediscovery, 4), None);
 
         // A resume or refresh rearms the arrival, whose grant restarts the count.
         s.rearm_arrival(&key());
-        assert_eq!(s.request(&key(), Trigger::Rediscovery, 5), None);
-        assert!(s.request(&key(), Trigger::Arrival, 6).is_some());
-        assert_eq!(s.request(&key(), Trigger::Arrival, 7), None);
-        assert!(s.request(&key(), Trigger::Rediscovery, 8).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Rediscovery, 5), None);
+        assert!(s.request(&key(), OWNER, Trigger::Arrival, 6).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Arrival, 7), None);
+        assert!(s.request(&key(), OWNER, Trigger::Rediscovery, 8).is_some());
     }
 
     #[test]
@@ -389,23 +427,23 @@ mod tests {
         // A gap of its own, so only the pushing rule refuses.
         let mut s = scheduler_with(caps(true, false, 300_000));
         for t in [0, 1, 300_000, 86_400_000, Ms::MAX] {
-            assert_eq!(s.request(&key(), Trigger::Activity, t), None, "t = {t}");
+            assert_eq!(s.request(&key(), OWNER, Trigger::Activity, t), None, "t = {t}");
         }
         // Only activity is pointless for a pushing device; arrival still reads once.
-        assert!(s.request(&key(), Trigger::Arrival, 0).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
     }
 
     #[test]
     fn poll_only_activity_respects_the_default_gap() {
         let mut s = scheduler_with(caps(false, false, 300_000));
         // The arrival grant ends the registration's wake: the default gap applies.
-        assert!(s.request(&key(), Trigger::Arrival, 0).is_some());
-        assert_eq!(s.request(&key(), Trigger::Activity, 599_999), None);
-        let grant = s.request(&key(), Trigger::Activity, 600_000).unwrap();
+        assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 599_999), None);
+        let grant = s.request(&key(), OWNER, Trigger::Activity, 600_000).unwrap();
         assert_eq!(grant.trigger, Trigger::Activity);
         // The gap restarts from the latest grant.
-        assert_eq!(s.request(&key(), Trigger::Activity, 1_199_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 1_200_000).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 1_199_999), None);
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 1_200_000).is_some());
     }
 
     #[test]
@@ -419,9 +457,9 @@ mod tests {
             Trigger::RefreshNow,
             Trigger::Connected,
         ] {
-            assert_eq!(s.request(&key(), trigger, 0), None, "{trigger:?}");
+            assert_eq!(s.request(&key(), OWNER, trigger, 0), None, "{trigger:?}");
         }
-        assert!(s.request(&key(), Trigger::Activity, gap).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, gap).is_some());
     }
 
     #[test]
@@ -429,35 +467,35 @@ mod tests {
         let mut s = scheduler_with(caps(false, false, 0));
         s.mark_asleep(&key());
         assert!(s.is_asleep(&key()));
-        assert_eq!(s.request(&key(), Trigger::Resume, 0), None);
-        assert_eq!(s.request(&key(), Trigger::RefreshNow, 0), None);
+        assert_eq!(s.request(&key(), OWNER, Trigger::Resume, 0), None);
+        assert_eq!(s.request(&key(), OWNER, Trigger::RefreshNow, 0), None);
         assert!(s.is_asleep(&key()));
 
-        assert!(s.request(&key(), Trigger::Connected, 0).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Connected, 0).is_some());
         assert!(!s.is_asleep(&key()));
     }
 
     #[test]
     fn activity_gap_does_not_block_refresh() {
         let mut s = scheduler_with(caps(false, false, 300_000));
-        assert!(s.request(&key(), Trigger::Activity, 0).is_some());
-        assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 0).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 1_000).is_some());
     }
 
     #[test]
     fn activity_respects_gap() {
         let mut s = scheduler_with(caps(false, false, 300_000));
         // The first grant after registration; the default gap follows it.
-        assert!(s.request(&key(), Trigger::Activity, 0).is_some());
-        assert_eq!(s.request(&key(), Trigger::Activity, 599_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 600_000).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 0).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 599_999), None);
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 600_000).is_some());
     }
 
     #[test]
     fn asleep_device_gets_no_activity_grant() {
         let mut s = scheduler_with(caps(false, false, 300_000));
         s.mark_asleep(&key());
-        assert_eq!(s.request(&key(), Trigger::Activity, 0), None);
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 0), None);
         assert!(s.is_asleep(&key()));
     }
 
@@ -468,7 +506,7 @@ mod tests {
             if asleep {
                 s.mark_asleep(&key());
             }
-            let granted = s.request(&key(), Trigger::Activity, 0).is_some();
+            let granted = s.request(&key(), OWNER, Trigger::Activity, 0).is_some();
             assert_eq!(granted, !asleep, "asleep = {asleep}");
             assert_eq!(s.is_asleep(&key()), asleep);
         }
@@ -478,10 +516,10 @@ mod tests {
     fn activity_ready_at_mirrors_the_activity_rules() {
         let mut s = scheduler_with(caps(false, false, 300_000));
         assert_eq!(s.activity_ready_at(&key()), Some(0));
-        assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 1_000).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(601_000));
-        assert_eq!(s.request(&key(), Trigger::Activity, 600_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 601_000).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 600_999), None);
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 601_000).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(1_201_000));
 
         s.mark_asleep(&key());
@@ -497,8 +535,8 @@ mod tests {
         let mut s = scheduler_with(caps(false, false, 300_000));
         // Registered (a wake) and read: the minimum.
         s.note_read(&key(), 1_000);
-        assert_eq!(s.request(&key(), Trigger::Activity, 300_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 301_000).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 300_999), None);
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 301_000).is_some());
         // An older read does not move the clock back.
         s.note_read(&key(), 5);
         assert_eq!(s.activity_ready_at(&key()), Some(901_000));
@@ -511,9 +549,9 @@ mod tests {
         let mut s = scheduler_with(caps(false, false, 0));
         assert_eq!(s.activity_ready_at(&key()), None);
         for t in [0, 1, 300_000] {
-            assert_eq!(s.request(&key(), Trigger::Activity, t), None, "t = {t}");
+            assert_eq!(s.request(&key(), OWNER, Trigger::Activity, t), None, "t = {t}");
         }
-        assert!(s.request(&key(), Trigger::RefreshNow, 0).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 0).is_some());
     }
 
     #[test]
@@ -522,7 +560,7 @@ mod tests {
         s.mark_asleep(&key());
         s.mark_awake(&key());
         assert!(!s.is_asleep(&key()));
-        assert!(s.request(&key(), Trigger::RefreshNow, 0).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 0).is_some());
     }
 
     #[test]
@@ -543,7 +581,7 @@ mod tests {
         s.set_user_gaps([(key(), 1)].into_iter().collect());
         let mut ids = Vec::new();
         for (now, trigger) in (1_000..).zip(ALL_TRIGGERS) {
-            let grant = s.request(&key(), trigger, now).unwrap();
+            let grant = s.request(&key(), OWNER, trigger, now).unwrap();
             let (budget, duration) = match trigger {
                 Trigger::Arrival | Trigger::Rediscovery | Trigger::Connected => (96, 10_000),
                 Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => (4, 3_000),
@@ -570,38 +608,38 @@ mod tests {
     #[test]
     fn grant_budget_and_expiry() {
         let mut s = scheduler_with(caps(false, false, 0));
-        let grant = s.request(&key(), Trigger::RefreshNow, 0).unwrap();
+        let grant = s.request(&key(), OWNER, Trigger::RefreshNow, 0).unwrap();
         for _ in 0..4 {
-            assert!(s.admit_send(grant.id, 100));
+            s.pending_send(grant.id, OWNER, 100).unwrap().spend();
         }
-        assert!(!s.admit_send(grant.id, 100));
+        assert!(s.pending_send(grant.id, OWNER, 100).is_none());
 
-        let fresh = s.request(&key(), Trigger::RefreshNow, 0).unwrap();
-        assert!(!s.admit_send(fresh.id, 3_001));
+        let fresh = s.request(&key(), OWNER, Trigger::RefreshNow, 0).unwrap();
+        assert!(s.pending_send(fresh.id, OWNER, 3_001).is_none());
 
-        let last_moment = s.request(&key(), Trigger::RefreshNow, 0).unwrap();
-        assert!(s.admit_send(last_moment.id, 3_000));
+        let last_moment = s.request(&key(), OWNER, Trigger::RefreshNow, 0).unwrap();
+        s.pending_send(last_moment.id, OWNER, 3_000).unwrap().spend();
     }
 
     #[test]
     fn unknown_grant_rejected() {
         let mut s = Scheduler::new(Policy::default());
-        assert!(!s.admit_send(GrantId(999), 0));
+        assert!(s.pending_send(GrantId(999), OWNER, 0).is_none());
     }
 
     #[test]
     fn unregister_forgets_state() {
         let mut s = scheduler_with(caps(false, false, 0));
-        let open = s.request(&key(), Trigger::Arrival, 0).unwrap();
+        let open = s.request(&key(), OWNER, Trigger::Arrival, 0).unwrap();
         s.mark_asleep(&key());
         s.unregister(&key());
 
         for trigger in ALL_TRIGGERS {
-            assert_eq!(s.request(&key(), trigger, 0), None, "{trigger:?}");
+            assert_eq!(s.request(&key(), OWNER, trigger, 0), None, "{trigger:?}");
         }
         assert!(!s.is_asleep(&key()));
         // Grants issued before the device went away no longer admit sends.
-        assert!(!s.admit_send(open.id, 0));
+        assert!(s.pending_send(open.id, OWNER, 0).is_none());
     }
 
     /// Engine minimum of the polled device in the user-gap tests.
@@ -617,7 +655,7 @@ mod tests {
         let mut s = scheduler_with(caps(false, false, MIN));
         s.note_read(&key(), 0);
         assert_eq!(s.activity_ready_at(&key()), Some(MIN));
-        assert!(s.request(&key(), Trigger::Activity, MIN).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, MIN).is_some());
         s
     }
 
@@ -626,8 +664,8 @@ mod tests {
         let mut s = polled_after_wake_grant();
         s.set_user_gaps(gaps(Some(1_800_000)));
         assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
-        assert_eq!(s.request(&key(), Trigger::Activity, 2_099_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 2_100_000).is_some());
+        assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 2_099_999), None);
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 2_100_000).is_some());
     }
 
     #[test]
@@ -646,7 +684,7 @@ mod tests {
         // The wake push.
         s.note_read(&key(), 1_000_000);
         assert_eq!(s.activity_ready_at(&key()), Some(1_300_000));
-        assert!(s.request(&key(), Trigger::Activity, 1_300_000).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 1_300_000).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(3_100_000));
     }
 
@@ -668,7 +706,7 @@ mod tests {
         s.register(key(), caps(false, false, MIN));
         s.note_read(&key(), 0);
         assert_eq!(s.activity_ready_at(&key()), Some(MIN));
-        assert!(s.request(&key(), Trigger::Activity, MIN).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, MIN).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
     }
 
@@ -720,7 +758,7 @@ mod tests {
         // A minimum above the default stays the gap.
         let mut s = scheduler_with(caps(false, false, 900_000));
         s.note_read(&key(), 0);
-        assert!(s.request(&key(), Trigger::Activity, 900_000).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::Activity, 900_000).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(1_800_000));
     }
 
@@ -728,7 +766,7 @@ mod tests {
     fn other_grants_end_the_wake() {
         let mut s = scheduler_with(caps(false, false, MIN));
         s.set_user_gaps(gaps(Some(1_800_000)));
-        assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
+        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 1_000).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(1_801_000));
     }
 
@@ -744,14 +782,14 @@ mod tests {
             if awake_first {
                 s.mark_awake(&key());
             }
-            assert!(s.request(&key(), Trigger::Connected, 1_000_000).is_some());
+            assert!(s.request(&key(), OWNER, Trigger::Connected, 1_000_000).is_some());
             s.note_read(&key(), 1_000_000);
             assert_eq!(
                 s.activity_ready_at(&key()),
                 Some(1_300_000),
                 "awake_first = {awake_first}"
             );
-            assert!(s.request(&key(), Trigger::Activity, 1_300_000).is_some());
+            assert!(s.request(&key(), OWNER, Trigger::Activity, 1_300_000).is_some());
             assert_eq!(s.activity_ready_at(&key()), Some(3_100_000));
         }
     }
