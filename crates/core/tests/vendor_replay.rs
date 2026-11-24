@@ -663,6 +663,7 @@ fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
         steelseries_input(&mut hub, OTHER, &[0, 0xB5, 3, 3, 3, 2], 2_007),
         None,
     );
+    steelseries_state(&hub, Presence::Online, Some(83), Charge::Unknown);
     steelseries_sent(
         steelseries_input(&mut hub, OTHER, &[0, 0xB7, 82, 0], 2_008),
         None,
@@ -673,6 +674,31 @@ fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
         None,
     );
     steelseries_state(&hub, Presence::Offline, Some(82), Charge::Unknown);
+    let offline = hub.snapshot();
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 0, 2, 3], 2_010),
+        request,
+    );
+    assert_eq!(
+        hub.snapshot(),
+        offline,
+        "no sample for the newly linked right bud"
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 57], 2_011),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(57), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 0, 3, 3], 2_012),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(57), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 56], 2_013),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(0), Charge::Unknown);
 }
 
 #[test]
@@ -704,18 +730,28 @@ fn steelseries_stations_keep_numbered_framing_and_only_track_headset() {
             steelseries_input(&mut hub, OTHER, &[0x07, 0xB7, push_raw, 3, 4], due + 4),
             None,
         );
+        steelseries_state(
+            &hub,
+            Presence::Online,
+            Some(push_level),
+            Charge::NotCharging,
+        );
+        let mut charged = frame;
+        charged[6] = push_raw;
+        charged[15] = 4;
+        steelseries_sent(steelseries_input(&mut hub, RX, &charged, due + 5), None);
         steelseries_state(&hub, Presence::Online, Some(push_level), Charge::Full);
         steelseries_sent(
-            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 4], due + 5),
+            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 4], due + 6),
             None,
         );
         steelseries_state(&hub, Presence::Offline, Some(push_level), Charge::Unknown);
         steelseries_sent(
-            steelseries_input(&mut hub, OTHER, &[0x07, 0xB5, 0, 0, 8], due + 6),
+            steelseries_input(&mut hub, OTHER, &[0x07, 0xB5, 0, 0, 8], due + 7),
             Some((rid, 64)),
         );
         steelseries_sent(
-            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 8], due + 7),
+            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 8], due + 8),
             None,
         );
         steelseries_sent(hub.handle(HubInput::Tick, 1_000_000), None);
@@ -861,4 +897,70 @@ fn steelseries_an_expired_arrival_grant_is_not_retried() {
     assert_eq!(hub.next_deadline(), None);
     steelseries_sent(hub.handle(HubInput::Tick, 100_000), None);
     steelseries_sent(hub.handle(HubInput::RefreshNow, 100_001), Some((6, 64)));
+}
+
+#[test]
+fn steelseries_station_unknown_push_charge_never_rearms_the_radio_edge() {
+    let mut hub = hub();
+    let group = steelseries_group(0x12E5, 4, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    let request = Some((6, 64));
+    steelseries_sent(hub.handle(HubInput::Tick, 5_000), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[7, 0xB5, 0, 0, 4], 5_001),
+        None,
+    );
+    let up = [7, 0xB5, 0, 0, 8];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &up, 5_002), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[7, 0xB7, 4, 0, 1], 5_003),
+        None,
+    );
+    steelseries_sent(steelseries_input(&mut hub, RX, &up, 5_004), None);
+    steelseries_state(&hub, Presence::Online, Some(50), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_station_b0_reports_link_up_even_when_charge_is_unknown() {
+    let mut hub = hub();
+    let group = steelseries_group(0x2290, 3, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 5_000), Some((1, 64)));
+    let linked = [1, 0xB0, 1, 0, 1, 0, 91, 0, 8, 1, 2, 10, 3, 0, 8, 1];
+    steelseries_sent(steelseries_input(&mut hub, RX, &linked, 5_001), None);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[7, 0xB5, 0, 0, 8], 5_002),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(91), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_dongle_replays_charge_before_level_but_not_across_disconnect() {
+    for disconnect in [false, true] {
+        let mut hub = hub();
+        let group = steelseries_group(0x2232, 3, 65);
+        steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+        steelseries_sent(hub.handle(HubInput::Tick, 1_500), Some((0, 65)));
+        // ASM #348/#364: BB and B7 are independent notifications.
+        assert!(steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1, 2], 1_501).is_empty());
+        assert!(hub.snapshot().is_empty(), "charging alone must not register");
+        if disconnect {
+            assert!(steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 1_502).is_empty());
+            steelseries_sent(
+                steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 1_503),
+                Some((0, 65)),
+            );
+        }
+        steelseries_sent(
+            steelseries_input(&mut hub, OTHER, &[0, 0xB7, 80, 2], 1_504),
+            None,
+        );
+        let charge = if disconnect {
+            Charge::Unknown
+        } else {
+            Charge::Charging
+        };
+        steelseries_state(&hub, Presence::Online, Some(80), charge);
+    }
 }

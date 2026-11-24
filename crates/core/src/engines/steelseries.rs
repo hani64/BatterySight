@@ -113,13 +113,8 @@ impl Link {
         self != Self::DOWN
     }
 
-    fn bud_level(self, left: u8, right: u8) -> Option<Level> {
-        match self.0 {
-            1 => Some(Level::Percent(left)),
-            2 => Some(Level::Percent(right)),
-            3 => Some(Level::Percent(left.min(right))),
-            _ => None,
-        }
+    fn bud_active(self, index: usize) -> bool {
+        self.0 & (1 << index) != 0
     }
 }
 
@@ -140,9 +135,9 @@ fn radio_link(value: u8) -> Option<Link> {
     }
 }
 
-fn station_charge(value: u8) -> Option<Charge> {
+fn station_status_charge(value: u8) -> Option<Charge> {
     Some(match value {
-        1 => Charge::Unknown, // Not connected.
+        1 => Charge::Unknown, // No charging information; radio state is independent.
         2 => Charge::Charging,
         4 => Charge::Full,
         8 => Charge::Discharging,
@@ -189,6 +184,8 @@ pub(super) struct SteelseriesEngine {
     settle_until: Ms,
     reply_until: Option<Ms>,
     link: Option<Link>,
+    bud_levels: [Option<u8>; 2],
+    pending_dongle_charge: Option<Charge>,
     registered: bool,
 }
 
@@ -273,6 +270,8 @@ impl SteelseriesEngine {
             settle_until: 0,
             reply_until: None,
             link: None,
+            bud_levels: [None; 2],
+            pending_dongle_charge: None,
             registered: false,
         })
     }
@@ -302,6 +301,7 @@ impl SteelseriesEngine {
         if !up && !self.registered {
             return Vec::new();
         }
+        let charge = charge.or(self.pending_dongle_charge.take());
         let mut update = DeviceUpdate {
             key: self.key.clone(),
             name: None,
@@ -332,16 +332,60 @@ impl SteelseriesEngine {
         }
     }
 
+    fn note_link(&mut self, link: Link) {
+        self.link = Some(link);
+        if !link.up() {
+            self.pending_dongle_charge = None;
+        }
+    }
+
+    fn sampled_bud_level(&self) -> Option<Level> {
+        self.bud_levels
+            .into_iter()
+            .flatten()
+            .min()
+            .map(Level::Percent)
+    }
+
+    fn sample_buds(&mut self, link: Link, left: u8, right: u8) -> Option<Level> {
+        self.bud_levels = [
+            link.bud_active(0).then_some(left),
+            link.bud_active(1).then_some(right),
+        ];
+        self.sampled_bud_level()
+    }
+
     fn link_event(&mut self, link: Link) -> Vec<Action> {
-        let previous = self.link.replace(link);
-        if previous.is_some_and(|previous| previous.up() == link.up()) {
+        let previous = self.link;
+        if previous == Some(link) {
             return Vec::new();
         }
-        let mut actions = self.update(link.up(), None, None, Source::Push);
+        self.note_link(link);
+        let mut actions = if self.report == SteelseriesReport::GameBuds {
+            self.buds_link_changed(link)
+        } else {
+            self.update(link.up(), None, None, Source::Push)
+        };
         if link.up() && previous == Some(Link::DOWN) {
             actions.push(Action::Connected(self.group_key.clone()));
         }
         actions
+    }
+
+    fn buds_link_changed(&mut self, link: Link) -> Vec<Action> {
+        let old_level = self.sampled_bud_level();
+        // A docked bud's reading belongs to its previous link, not its next one.
+        for (index, level) in self.bud_levels.iter_mut().enumerate() {
+            if !link.bud_active(index) {
+                *level = None;
+            }
+        }
+        let level = self.sampled_bud_level();
+        // On link-up without a sample, wait for battery input before publishing.
+        if link.up() && (level.is_none() || level == old_level) {
+            return Vec::new();
+        }
+        self.update(link.up(), level, None, Source::Push)
     }
 
     fn status(&mut self, bytes: &[u8], now: Ms) -> Option<Vec<Action>> {
@@ -356,18 +400,13 @@ impl SteelseriesEngine {
                 if left > 100 || right > 100 {
                     return None;
                 }
-                (link, link.bud_level(left, right), Charge::Unknown)
+                (link, self.sample_buds(link, left, right), Charge::Unknown)
             }
-            report if report.station() => {
-                let link = radio_link(bytes[14])?;
-                let charge = station_charge(bytes[15])?;
-                let link = if charge == Charge::Unknown {
-                    Link::DOWN
-                } else {
-                    link
-                };
-                (link, Some(report.level(bytes[6])?), charge)
-            }
+            report if report.station() => (
+                radio_link(bytes[14])?,
+                Some(report.level(bytes[6])?),
+                station_status_charge(bytes[15])?,
+            ),
             report => {
                 // Windows supplies a zero before B0; transport code must not strip it.
                 let conn = bytes[2];
@@ -386,7 +425,7 @@ impl SteelseriesEngine {
                 )
             }
         };
-        self.link = Some(link);
+        self.note_link(link);
         let source = if self.reply_until.take().is_some_and(|until| now <= until) {
             Source::Query
         } else {
@@ -407,7 +446,8 @@ impl SteelseriesEngine {
                     Some(self.link_event(Link::buds(left, right)?))
                 }
                 &[0, 0xB7, left @ 0..=100, right @ 0..=100, ..] => {
-                    let level = self.link?.bud_level(left, right)?;
+                    let link = self.link.filter(|link| link.up())?;
+                    let level = self.sample_buds(link, left, right)?;
                     Some(self.update(true, Some(level), None, Source::Push))
                 }
                 _ => None,
@@ -418,8 +458,13 @@ impl SteelseriesEngine {
             0xB7 if self.link != Some(Link::DOWN) => {
                 Some(self.update(true, Some(self.report.level(value)?), None, Source::Push))
             }
-            0xBB if self.link.is_some_and(Link::up) || (self.link.is_none() && self.registered) => {
-                Some(self.update(true, None, Some(dongle_charge(value)?), Source::Push))
+            0xBB if self.link != Some(Link::DOWN) => {
+                let charge = dongle_charge(value)?;
+                if !self.registered {
+                    self.pending_dongle_charge = Some(charge);
+                    return Some(Vec::new());
+                }
+                Some(self.update(true, None, Some(charge), Source::Push))
             }
             _ => None,
         }
@@ -430,12 +475,15 @@ impl SteelseriesEngine {
             &[0x07, 0xB5, _, _, link, ..] => Some(self.link_event(radio_link(link)?)),
             &[0x07, 0xB7, raw, _, state, ..] => {
                 let level = self.report.level(raw)?;
-                let charge = station_charge(state)?;
-                if charge == Charge::Unknown {
-                    // Disconnected status is an observation, not a link-up trigger.
-                    return Some(self.link_event(Link::DOWN));
-                }
-                if self.link == Some(Link::DOWN) {
+                // GG distinguishes the B7 charging enum from B0 headset-battery status.
+                let charge = if state == 4 {
+                    Charge::NotCharging
+                } else {
+                    station_status_charge(state)?
+                };
+                if self.link == Some(Link::DOWN)
+                    || (self.link.is_none() && charge == Charge::Unknown)
+                {
                     return None;
                 }
                 Some(self.update(true, Some(level), Some(charge), Source::Push))
