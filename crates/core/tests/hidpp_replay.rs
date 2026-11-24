@@ -10,7 +10,9 @@
 use batterysight_core::catalog::Catalog;
 use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
-use batterysight_core::model::{Charge, CoarseLevel, DeviceKind, Level, Presence, Via};
+use batterysight_core::model::{
+    Charge, CoarseLevel, DeviceKind, Level, Presence, Verification, Via,
+};
 use batterysight_core::scheduler::Policy;
 
 const CATALOG: &str = r#"
@@ -29,6 +31,15 @@ engine = "hidpp"
 status = "source-verified"
 source = "test"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
+
+[[device]]
+name = "PRO X Superlight"
+vid = 0x046D
+wpids = [0x4093]
+kind = "mouse"
+engine = "hidpp"
+status = "hardware-tested"
+source = "test"
 "#;
 
 const SHORT: CollectionId = CollectionId(1);
@@ -340,12 +351,12 @@ fn c547_late_ping_reply() {
     check(&hub, name, &c547_mouse());
 }
 
-/// The Superlight of the owner captures: it calls itself "PRO X Wireless"
-/// behind the C547 receiver; its unit id is replaced by a synthetic one.
+/// The Superlight of the owner captures, named by its catalog entry (wireless PID 0x4093 from
+/// the receiver's 0x41); it calls itself "PRO X Wireless". Its unit id is a synthetic one.
 fn superlight(level: u8, presence: Presence) -> Expect {
     Expect {
         key: "logi:unit:1A2B3C4D",
-        name: "PRO X Wireless",
+        name: "PRO X Superlight",
         kind: DeviceKind::Mouse,
         via: Via::Receiver,
         level: Level::Percent(level),
@@ -378,6 +389,10 @@ fn c547_superlight_arrival() {
         receiver(),
     );
     check(&hub, name, &superlight(80, Presence::Online));
+    assert_eq!(
+        hub.snapshot()[0].verification,
+        Verification::HardwareTested
+    );
 }
 
 #[test]

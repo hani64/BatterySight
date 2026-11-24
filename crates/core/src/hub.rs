@@ -309,8 +309,13 @@ impl Hub {
                         pass.out.push(HubOutput::Send { collection, bytes });
                     }
                 }
-                Action::Register { key, caps, initial } => {
-                    self.register(gid, key, caps, &initial, now, pass);
+                Action::Register {
+                    key,
+                    caps,
+                    initial,
+                    wpid,
+                } => {
+                    self.register(gid, key, caps, &initial, wpid, now, pass);
                 }
                 Action::Unregister(key) => {
                     if self
@@ -366,20 +371,23 @@ impl Hub {
 
     /// Registers `key` for `gid`'s engine. A key known from an earlier
     /// registration (e.g. a reconnect within grace) keeps its entry, its last
-    /// values and its scheduler history.
+    /// values and its scheduler history. A catalog entry's name replaces the
+    /// name the device reports.
+    #[allow(clippy::too_many_arguments)]
     fn register(
         &mut self,
         gid: GroupId,
         key: DeviceKey,
         caps: Capabilities,
         initial: &DeviceUpdate,
+        wpid: Option<u16>,
         now: Ms,
         pass: &mut Pass,
     ) {
         let Some(slot) = self.engines.get(&gid) else {
             return;
         };
-        let verification = self.verification(slot.ids);
+        let (verification, catalog_name) = self.identity(slot.ids, wpid);
         let product = slot.product.clone();
 
         let groups = self.owners.entry(key.clone()).or_default();
@@ -408,6 +416,9 @@ impl Hub {
             });
         state.verification = verification;
         state.apply(initial, now);
+        if let Some(name) = catalog_name {
+            state.name = name;
+        }
         if initial.presence.is_none() {
             state.presence = Presence::Online;
         }
@@ -422,18 +433,30 @@ impl Hub {
         }
     }
 
-    /// Catalog status for a group's `(vid, pid)`: device entry, else vendor family, else `Generic`.
-    fn verification(&self, ids: Option<(u16, u16)>) -> Verification {
+    /// Catalog status and name of a device registered by a group with `ids`: its device
+    /// entry (by `wpid` for a device behind a receiver, else by the group's USB pid), else
+    /// the vendor family's status and no name, else `Generic`.
+    fn identity(
+        &self,
+        ids: Option<(u16, u16)>,
+        wpid: Option<u16>,
+    ) -> (Verification, Option<String>) {
         let Some((vid, pid)) = ids else {
-            return Verification::Generic;
+            return (Verification::Generic, None);
         };
-        if let Some(device) = self.catalog.device(vid, pid) {
-            return device.status;
+        let entry = match wpid {
+            Some(wpid) => self.catalog.device_by_wpid(vid, wpid),
+            None => self.catalog.device(vid, pid),
+        };
+        if let Some(device) = entry {
+            return (device.status, Some(device.name.clone()));
         }
         // M1: only HID++ engines exist; the engine's kind joins this lookup with the second one.
-        self.catalog
+        let status = self
+            .catalog
             .family(vid, EngineKind::Hidpp)
-            .map_or(Verification::Generic, |family| family.status)
+            .map_or(Verification::Generic, |family| family.status);
+        (status, None)
     }
 }
 
@@ -529,6 +552,15 @@ name = "PRO X Wireless"
 vid = 0x046D
 pids = [0x0ABA]
 kind = "headset"
+engine = "hidpp"
+status = "hardware-tested"
+source = "test"
+
+[[device]]
+name = "PRO X Superlight"
+vid = 0x046D
+wpids = [0x4093]
+kind = "mouse"
 engine = "hidpp"
 status = "hardware-tested"
 source = "test"
@@ -649,6 +681,23 @@ source = "test"
                 source: Source::Query,
                 ..update(key)
             },
+            wpid: None,
+        }
+    }
+
+    /// A device behind a receiver that reported wireless PID `wpid`.
+    fn register_wireless(key: &DeviceKey, wpid: u16) -> Action {
+        let Action::Register {
+            key, caps, initial, ..
+        } = register(key, None)
+        else {
+            unreachable!()
+        };
+        Action::Register {
+            key,
+            caps,
+            initial,
+            wpid: Some(wpid),
         }
     }
 
@@ -951,10 +1000,37 @@ source = "test"
         assert_eq!(verification(&r), Verification::SourceVerified);
         assert_eq!(verification(&o), Verification::Generic);
         let s = state(&hub, &h).unwrap();
-        assert_eq!(s.name, "Mouse");
+        // A catalog entry names the device, whatever it calls itself.
+        assert_eq!(s.name, "PRO X Wireless");
         assert_eq!(s.kind, DeviceKind::Mouse);
         assert_eq!(s.presence, Presence::Online);
         assert_eq!(s.source, Source::Query);
+    }
+
+    #[test]
+    fn receiver_device_matched_by_wireless_pid() {
+        let receiver = fake();
+        let (known, unknown, plain) = (dev("superlight"), dev("other-mouse"), dev("no-wpid"));
+        receiver.borrow_mut().on_grant.push_back(vec![
+            register_wireless(&known, 0x4093),
+            register_wireless(&unknown, 0x4074),
+            register(&plain, None),
+        ]);
+        let mut hub = hub(&[(1, &receiver)]);
+
+        // A receiver whose own USB PID (0x0ABA here) has an entry: the entry is not the slots'.
+        hub.handle(HubInput::GroupArrived(group(1, 0x046D, 0x0ABA)), 0);
+
+        let s = state(&hub, &known).unwrap();
+        assert_eq!(s.name, "PRO X Superlight");
+        assert_eq!(s.verification, Verification::HardwareTested);
+        let s = state(&hub, &unknown).unwrap();
+        assert_eq!(s.name, "Mouse");
+        assert_eq!(s.verification, Verification::SourceVerified);
+        // Without a wireless PID the group's USB PID decides, as for a direct device.
+        let s = state(&hub, &plain).unwrap();
+        assert_eq!(s.name, "PRO X Wireless");
+        assert_eq!(s.verification, Verification::HardwareTested);
     }
 
     #[test]
