@@ -27,7 +27,7 @@ Otherwise it only listens. Opening the menu never queries; it shows the last kno
 
 ### Known limitations
 
-- The PRO X Wireless headset does not report its battery while it is in use. Its level updates when the headset is switched on, when the PC resumes, on "Refresh now" and every 10 minutes by default (adjustable, never below 5; the first check after a wake or after it is first found comes after 5) while audio plays to it; during a long silent stretch (for example a muted call) it can lag behind.
+- The PRO X Wireless headset does not report its battery while it is in use. Its level updates when the headset is switched on, when the PC resumes, on "Refresh now" and every 10 minutes by default (adjustable, never below 5; the first check after a wake or after it is first found comes after 5) while audio plays to it or while it charges; during a long silent stretch on battery (for example a muted call) it can lag behind.
 - When "Show on" is set to one secondary monitor and that monitor is turned off and on again, the widget stays on the main taskbar until BatterySight restarts or that monitor is chosen again.
 
 ## Privacy

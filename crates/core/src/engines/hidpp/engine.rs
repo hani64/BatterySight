@@ -429,6 +429,11 @@ impl HidppEngine {
             Decoder::Reg0D => battery::decode_reg_0d(p),
             Decoder::Reg07 => battery::decode_reg_07(p),
         };
+        Self::outcome(decoder, p, r)
+    }
+
+    /// What `r`, decoded by `decoder` from `p`, says.
+    fn outcome(decoder: Decoder, p: &[u8], r: Reading) -> Outcome {
         if r.online {
             Outcome::Reading(r)
         } else if decoder == Decoder::Adc && p.len() >= 3 {
@@ -590,6 +595,7 @@ impl HidppEngine {
             // a LIGHTSPEED receiver answers 0x08. Unpairing is the receiver's 0x40/0x02 notification.
             Reply::Err20(_)
             | Reply::Err10(ERR_CONNECT_FAIL | ERR_UNKNOWN_DEVICE | ERR_RESOURCE_ERROR) => {
+                d.charge.reset();
                 actions.push(Action::Asleep(d.key.clone()));
             }
             Reply::Err10(_) | Reply::NotMine => {}
@@ -648,15 +654,18 @@ impl HidppEngine {
         let outcome = match d.decoder {
             // Source: kernel hid-logitech-hidpp.c / Solaar `notifications.py`:
             // short register notifications carry the register payload from byte 3.
-            Decoder::Reg0D | Decoder::Reg07 if report == SHORT => match sub {
-                REG_BATTERY_STATUS => {
-                    Self::interpret(curve, Decoder::Reg07, &frame[3..], &mut d.charge)
+            Decoder::Reg0D | Decoder::Reg07 if report == SHORT => {
+                let p = &frame[3..];
+                match sub {
+                    REG_BATTERY_STATUS => {
+                        Self::outcome(Decoder::Reg07, p, battery::decode_reg_07(p))
+                    }
+                    REG_BATTERY_CHARGE => {
+                        Self::outcome(Decoder::Reg0D, p, battery::decode_reg_0d(p))
+                    }
+                    _ => return,
                 }
-                REG_BATTERY_CHARGE => {
-                    Self::interpret(curve, Decoder::Reg0D, &frame[3..], &mut d.charge)
-                }
-                _ => return,
-            },
+            }
             Decoder::Reg0D | Decoder::Reg07 => return,
             // HID++ 2.0 broadcasts: battery feature index, function 0, software id 0.
             _ if sub == d.battery_fi && address == 0x00 => {
@@ -827,11 +836,12 @@ impl Engine for HidppEngine {
                     self.discover(RECEIVER_SLOTS, f.conversation.grant, now, &mut actions);
                 }
                 Step::Read => {
-                    let Some(d) = self.devices.get(&index) else {
+                    let Some(d) = self.devices.get_mut(&index) else {
                         continue;
                     };
                     if !(self.receiver && RECEIVER_SLOTS.contains(&index)) {
                         // A direct device that stays silent is gone.
+                        d.charge.reset();
                         actions.push(Action::Asleep(d.key.clone()));
                     } else if !f.conversation.retried {
                         // A receiver reports a sleeping device with an error, so
@@ -1621,8 +1631,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert_eq!(
             a,
             vec![Action::Update(DeviceUpdate {
-                // PRO X charging curve, ascending branch: 3.971 V -> 14.71 %.
-                level: Some(Level::Percent(14)),
+                // PRO X charging curve, ascending 3.971 V -> 14.70 %, below the level the
+                // discovery read before the charge (3828 mV discharging, 68 %): that level stays.
+                level: Some(Level::Percent(68)),
                 millivolts: Some(3971),
                 charge: Some(Charge::Charging),
                 presence: Some(Presence::Online),
@@ -1649,6 +1660,32 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         // Back on after being off: no peak known, so ascending again.
         assert_eq!(level(push(4232, 0x03)), Some(Level::Percent(81)));
         assert_eq!(level(push(4100, 0x07)), Some(Level::Percent(100)));
+    }
+
+    #[test]
+    fn adc_charge_is_forgotten_when_a_read_finds_the_headset_gone() {
+        let err = l(&[0x11, 0xFF, 0xFF, 0x08, 0x0B, 0x05]);
+        for reply in [None, Some(err)] {
+            let mut e = headset_engine();
+            let push = |e: &mut HidppEngine, mv: u16| {
+                let [hi, lo] = mv.to_be_bytes();
+                let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x00, hi, lo, 0x03]), 10);
+                match a.as_slice() {
+                    [Action::Update(u)] => u.level,
+                    _ => panic!("{a:?}"),
+                }
+            };
+            assert_eq!(push(&mut e, 4258), Some(Level::Percent(84)));
+            e.on_grant(&grant(2, &headset_key(), Trigger::RefreshNow), 100);
+            let a = match &reply {
+                Some(r) => e.on_report(LONG_C, r, 110),
+                None => e.on_tick(4_100),
+            };
+            assert_eq!(a, vec![Action::Asleep(headset_key())], "{reply:02X?}");
+            // Charging when it answers again: a new charge on the ascending curve (82 %), not
+            // topping after the old 4258 mV peak (92 %).
+            assert_eq!(push(&mut e, 4240), Some(Level::Percent(82)), "{reply:02X?}");
+        }
     }
 
     /// Headset dongle with every feature (owner trace 2026-11-23 shape), discovered up to
