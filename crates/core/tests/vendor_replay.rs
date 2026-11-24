@@ -200,12 +200,38 @@ fn rapoo_vt3_pro_legacy_unknown_level_does_not_replace_last_percent() {
     let unavailable = [0xBB, 0xB0, 0x51, 0x20, 3, 2, 0x7F];
     assert_eq!(report(&mut hub, &LEGACY, 1), [HubOutput::StateChanged]);
     assert!(report(&mut hub, &[0xBB, 0xB0, 0x51, 0x20, 3, 1, 0x7F], 2).is_empty());
-    assert_eq!(report(&mut hub, &unavailable, 3), [HubOutput::StateChanged]);
-    let state = &hub.snapshot()[0];
-    assert_eq!(state.presence, Presence::Online);
-    assert_eq!(state.level, Some(Level::Percent(98)));
-    assert_eq!(state.charge, Charge::Unknown);
+    let out = report(&mut hub, &unavailable, 3);
+    let online = hub.snapshot();
+    assert_eq!(online[0].updated_ms, 1, "presence is not a new measurement");
+    assert_eq!(online[0].presence, Presence::Online);
+    assert_eq!(online[0].level, Some(Level::Percent(98)));
+    assert_eq!(online[0].charge, Charge::Unknown);
+    assert!(out.is_empty(), "no snapshot change while already online");
     assert_eq!(hub.next_deadline(), Some(60_003));
+    assert!(feed(&mut hub, HubInput::Tick, 60_002).is_empty());
+    assert_eq!(
+        feed(&mut hub, HubInput::Tick, 60_003),
+        [HubOutput::StateChanged]
+    );
+    assert_eq!(hub.snapshot()[0].presence, Presence::Asleep);
+    assert_eq!(
+        report(&mut hub, &unavailable, 60_004),
+        [HubOutput::StateChanged]
+    );
+    assert_eq!(
+        hub.snapshot(),
+        online,
+        "wake without a new battery measurement"
+    );
+    assert_eq!(hub.next_deadline(), Some(120_004));
+
+    let mut unread = Hub::new(Catalog::builtin(), Policy::default());
+    feed(&mut unread, HubInput::GroupArrived(group(collection(0x1215, 2, 7))), 0);
+    assert_eq!(report(&mut unread, &unavailable, 1), [HubOutput::StateChanged]);
+    let initial = unread.snapshot();
+    assert_eq!(initial[0].presence, Presence::Online);
+    assert_eq!(initial[0].level, None);
+    assert_eq!(unread.next_deadline(), Some(60_001));
 }
 
 #[test]

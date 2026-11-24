@@ -194,6 +194,10 @@ impl Engine for RapooEngine {
             return Vec::new();
         };
         self.expires = Some(now.saturating_add(SILENCE_MS));
+        if self.registered && level.is_none() {
+            // This heartbeat proves presence but does not refresh the last measurement.
+            return vec![Action::Awake(self.key.clone())];
+        }
         let initial = DeviceUpdate {
             key: self.key.clone(),
             name: None,
