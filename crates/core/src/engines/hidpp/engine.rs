@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
-use crate::catalog::Catalog;
+use crate::catalog::Quirks;
 use crate::engine::{Action, Engine, HidppDestination, WriteRule};
 use crate::hid::{Collection, CollectionId, CollectionRole, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{DeviceKey, DeviceKind, DeviceUpdate, Presence, Source, Via};
@@ -37,6 +37,8 @@ use super::discovery::{
     Next, REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
 };
 use super::frame::{FIRST_REGISTER_SUB_ID, LONG, Reply, ReplyAddress, SHORT, SW_ID};
+
+pub(crate) const COMMAND_ROLE: CollectionRole = discovery::COMMAND;
 
 /// Timeout of a request to the receiver itself.
 /// Source: Solaar `base.py` `_RECEIVER_REQUEST_TIMEOUT` (0.9 s).
@@ -178,14 +180,6 @@ pub struct HidppEngine {
     retry_at: Option<Ms>,
 }
 
-fn is_short(c: &Collection) -> bool {
-    c.vid == LOGITECH && (c.usage_page, c.usage) == SHORT_USAGE && c.output_len == SHORT_LEN
-}
-
-fn is_long(c: &Collection) -> bool {
-    c.vid == LOGITECH && LONG_USAGES.contains(&(c.usage_page, c.usage)) && c.output_len == LONG_LEN
-}
-
 fn update(key: DeviceKey, presence: Presence, source: Source) -> DeviceUpdate {
     DeviceUpdate {
         key,
@@ -209,34 +203,37 @@ fn reading_update(key: DeviceKey, r: &Reading, source: Source) -> DeviceUpdate {
     }
 }
 
-/// A short command collection wins over long candidates, but ties fail closed.
-fn command_collection(group: &HidGroup) -> Option<(u8, &Collection)> {
-    let mut short = group.collections.iter().filter(|c| is_short(c));
-    if let Some(c) = short.next() {
-        return short.next().is_none().then_some((SHORT, c));
-    }
-    let mut long = group.collections.iter().filter(|c| is_long(c));
-    let c = long.next()?;
-    long.next().is_none().then_some((LONG, c))
-}
-
 impl HidppEngine {
-    /// A Logitech group with a unique preferred HID++ command collection.
-    pub fn accepts(group: &HidGroup) -> bool {
-        command_collection(group).is_some()
+    fn report_shape(c: &Collection) -> Option<(u8, u16)> {
+        if c.vid != LOGITECH {
+            return None;
+        }
+        let usage = (c.usage_page, c.usage);
+        if usage == SHORT_USAGE {
+            Some((SHORT, SHORT_LEN))
+        } else if LONG_USAGES.contains(&usage) {
+            Some((LONG, LONG_LEN))
+        } else {
+            None
+        }
     }
 
-    /// A short or long HID++ collection: the only collections the engine reads or writes.
-    pub fn reads(c: &Collection) -> bool {
-        is_short(c) || is_long(c)
+    /// Report ID for a Logitech HID++ collection with its documented command width.
+    pub(crate) fn command_report(c: &Collection) -> Option<u8> {
+        let (report_id, width) = Self::report_shape(c)?;
+        (c.output_len == width).then_some(report_id)
     }
 
-    /// # Panics
-    /// If [`HidppEngine::accepts`] rejects `group`.
-    pub fn new(group: &HidGroup, catalog: &Catalog) -> Self {
-        let (report_id, out) =
-            command_collection(group).expect("HidppEngine::new needs a group it accepts");
-        let quirks = catalog.device(out.vid, out.pid).map(|d| &d.quirks);
+    pub(crate) fn receives(c: &Collection) -> bool {
+        Self::report_shape(c).is_some_and(|(_, width)| c.input_len == width)
+    }
+
+    pub(crate) fn from_selection(
+        group: &HidGroup,
+        (report_id, out): (u8, &Collection),
+        receive: &[CollectionId],
+        quirks: Option<&Quirks>,
+    ) -> Self {
         let curve = quirks
             .and_then(|q| q.voltage_curve.as_deref())
             .and_then(curves::curve_by_name)
@@ -244,7 +241,7 @@ impl HidppEngine {
         let fallback_kind = if group
             .collections
             .iter()
-            .any(|c| c.usage_page == HEADSET_PAGE)
+            .any(|c| c.usage_page == HEADSET_PAGE && receive.contains(&c.id))
         {
             DeviceKind::Headset
         } else {
@@ -750,7 +747,7 @@ impl Engine for HidppEngine {
     }
 
     fn collection_role(&self, collection: CollectionId) -> Option<CollectionRole> {
-        (collection == self.out).then_some(discovery::COMMAND)
+        (collection == self.out).then_some(COMMAND_ROLE)
     }
 
     fn hidpp_destination(&self, index: u8) -> Option<HidppDestination<'_>> {
@@ -952,6 +949,8 @@ impl Engine for HidppEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Catalog;
+    use crate::engines;
     use crate::hid::{Collection, GroupId};
     use crate::model::{
         Charge, CoarseLevel, DeviceKind, DeviceUpdate, Level, Presence, Source, Via,
@@ -997,6 +996,14 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         Catalog::parse(CATALOG).unwrap()
     }
 
+    impl HidppEngine {
+        fn new(group: &HidGroup, catalog: &Catalog) -> Self {
+            engines::select(group, catalog)
+                .and_then(|selection| selection.hidpp(group, catalog))
+                .unwrap()
+        }
+    }
+
     fn coll(
         id: CollectionId,
         page: u16,
@@ -1011,6 +1018,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             pid,
             usage_page: page,
             usage,
+            interface: None,
             input_len: len,
             output_len: len,
             feature_len: 0,
@@ -1268,25 +1276,26 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     #[test]
     fn accepts_logitech_hidpp_groups_only() {
-        assert!(HidppEngine::accepts(&receiver_group()));
-        assert!(HidppEngine::accepts(&headset_group()));
+        let catalog = catalog();
+        assert!(engines::wants(&receiver_group(), &catalog));
+        assert!(engines::wants(&headset_group(), &catalog));
 
         let mut other_vendor = receiver_group();
         for c in &mut other_vendor.collections {
             c.vid = 0x1532;
         }
-        assert!(!HidppEngine::accepts(&other_vendor));
+        assert!(!engines::wants(&other_vendor, &catalog));
 
         let mut wrong_len = receiver_group();
         wrong_len.collections[0].output_len = 20;
         wrong_len.collections[1].output_len = 7;
-        assert!(!HidppEngine::accepts(&wrong_len));
+        assert!(!engines::wants(&wrong_len, &catalog));
 
         let mut mouse_only = receiver_group();
         for c in &mut mouse_only.collections {
             (c.usage_page, c.usage) = (0x0001, 0x0002);
         }
-        assert!(!HidppEngine::accepts(&mouse_only));
+        assert!(!engines::wants(&mouse_only, &catalog));
     }
 
     #[test]
@@ -1511,7 +1520,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     #[test]
     fn headset_without_curve_quirk_uses_default_curve() {
-        let plain = Catalog::parse("").unwrap();
+        let (family, _) = CATALOG.split_once("[[device]]").unwrap();
+        let plain = Catalog::parse(family).unwrap();
         let (_, a) = headset_with(&plain);
         let [Action::Register { initial, .. }] = a.as_slice() else {
             panic!("{a:?}");

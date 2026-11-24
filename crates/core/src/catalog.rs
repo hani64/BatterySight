@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
+use crate::hid::Collection;
 use crate::model::{DeviceKind, Verification};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
@@ -35,6 +36,45 @@ pub struct Family {
     pub source: String,
 }
 
+/// All specified fields must match the same HID top-level collection.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectionSelector {
+    pub usage_page: Option<u16>,
+    pub usage: Option<u16>,
+    pub interface: Option<u8>,
+    pub input_len: Option<u16>,
+    pub output_len: Option<u16>,
+    pub feature_len: Option<u16>,
+    /// An ASCII case-insensitive substring of the OS-cached product name.
+    pub product: Option<String>,
+}
+
+impl CollectionSelector {
+    pub fn matches(&self, collection: &Collection) -> bool {
+        self.matches_descriptor(collection) && self.matches_product(&collection.product)
+    }
+
+    pub(crate) fn matches_descriptor(&self, collection: &Collection) -> bool {
+        self.usage_page.is_none_or(|v| v == collection.usage_page)
+            && self.usage.is_none_or(|v| v == collection.usage)
+            && self.interface.is_none_or(|v| Some(v) == collection.interface)
+            && self.input_len.is_none_or(|v| v == collection.input_len)
+            && self.output_len.is_none_or(|v| v == collection.output_len)
+            && self.feature_len.is_none_or(|v| v == collection.feature_len)
+    }
+
+    pub fn matches_product(&self, name: &str) -> bool {
+        self.product.as_ref().is_none_or(|needle| {
+            !needle.is_empty()
+                && name
+                    .as_bytes()
+                    .windows(needle.len())
+                    .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceEntry {
     pub name: String,
@@ -48,6 +88,8 @@ pub struct DeviceEntry {
     pub engine: EngineKind,
     pub status: Verification,
     pub source: String,
+    pub receive: Option<CollectionSelector>,
+    pub send: Option<CollectionSelector>,
     pub quirks: Quirks,
 }
 
@@ -113,6 +155,8 @@ struct RawDevice {
     engine: EngineKind,
     status: String,
     source: String,
+    receive: Option<CollectionSelector>,
+    send: Option<CollectionSelector>,
     #[serde(default)]
     quirks: Quirks,
 }
@@ -175,6 +219,8 @@ impl Catalog {
                     engine: d.engine,
                     status,
                     source: d.source,
+                    receive: d.receive,
+                    send: d.send,
                     quirks: d.quirks,
                 })
             })
@@ -206,11 +252,21 @@ impl Catalog {
         &self.devices
     }
 
-    /// The first entry listing USB product id `pid` for vendor `vid`.
-    pub fn device(&self, vid: u16, pid: u16) -> Option<&DeviceEntry> {
+    /// Candidates in the direct USB ID namespace, before collection matching.
+    pub(crate) fn direct_entries(
+        &self,
+        vid: u16,
+        pid: u16,
+    ) -> impl Iterator<Item = (usize, &DeviceEntry)> {
         self.devices
             .iter()
-            .find(|d| d.vid == vid && d.pids.contains(&pid))
+            .enumerate()
+            .filter(move |(_, d)| d.vid == vid && d.pids.contains(&pid))
+    }
+
+    #[cfg(test)]
+    fn device(&self, vid: u16, pid: u16) -> Option<&DeviceEntry> {
+        self.direct_entries(vid, pid).next().map(|(_, entry)| entry)
     }
 
     /// The first entry listing wireless product id `wpid` for vendor `vid`.
@@ -249,6 +305,51 @@ status = "source-verified"
 source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 "#;
+
+    #[test]
+    fn parses_distinct_receive_and_send_selectors() {
+        let cat = Catalog::parse(
+            r#"
+[[device]]
+name = "Synthetic HID fixture"
+vid = 0x1234
+pids = [0x5678]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "synthetic selector fixture"
+receive = { usage_page = 0xFF00, usage = 2, interface = 3, input_len = 20 }
+send = { usage_page = 0xFF00, usage = 1, interface = 4, output_len = 7, feature_len = 0, product = "FiXtUrE" }
+"#,
+        )
+        .unwrap();
+        let entry = &cat.devices()[0];
+        let mut rx = Collection {
+            id: crate::hid::CollectionId(1),
+            vid: 0x1234,
+            pid: 0x5678,
+            usage_page: 0xFF00,
+            usage: 2,
+            interface: Some(3),
+            input_len: 20,
+            output_len: 0,
+            feature_len: 0,
+            product: String::new(),
+        };
+        let receive = entry.receive.as_ref().unwrap();
+        let send = entry.send.as_ref().unwrap();
+        assert!(receive.matches(&rx));
+        assert!(!send.matches(&rx));
+        rx.interface = Some(4);
+        rx.usage = 1;
+        rx.output_len = 7;
+        assert!(!send.matches(&rx), "missing required name");
+        rx.product = "USB fixture protocol".into();
+        assert!(send.matches(&rx));
+        assert!(!receive.matches(&rx));
+        rx.product = "USB fİxture protocol".into();
+        assert!(!send.matches(&rx), "case-insensitive only for ASCII");
+    }
 
     #[test]
     fn parses_family_and_device() {
@@ -479,8 +580,8 @@ source = "test"
             assert!(!d.source.trim().is_empty(), "{} has no source", d.name);
             for &pid in &d.pids {
                 assert!(
-                    pids.insert((d.vid, pid)),
-                    "{:#06X}:{pid:#06X} listed twice ({})",
+                    pids.insert((d.vid, pid, &d.receive, &d.send)),
+                    "{:#06X}:{pid:#06X} listed twice with the same selectors ({})",
                     d.vid,
                     d.name
                 );

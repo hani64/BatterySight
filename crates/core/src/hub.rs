@@ -5,10 +5,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::catalog::{Catalog, EngineKind};
+use crate::catalog::{Catalog, CollectionSelector, EngineKind};
 use crate::engine::{Action, Engine, WriteDestination, write_allowed};
-use crate::engines;
-use crate::hid::{CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin};
+use crate::engines::{self, Selection};
+use crate::hid::{CollectionId, CollectionRole, GroupId, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{
     Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, Verification, Via,
 };
@@ -21,6 +21,8 @@ pub const REMOVAL_GRACE_MS: Ms = 60_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HubInput {
     GroupArrived(HidGroup),
+    /// Runtime arrival after opening the collections selected before any device I/O.
+    MatchedGroupArrived(HidGroup, Selection),
     GroupRemoved(GroupId),
     Report {
         collection: CollectionId,
@@ -84,6 +86,8 @@ const MAX_NESTED_GRANTS: usize = 4;
 
 struct Route {
     group: GroupId,
+    reads: bool,
+    role: Option<CollectionRole>,
     output_len: u16,
     feature_len: u16,
 }
@@ -92,8 +96,11 @@ struct Route {
 struct Slot {
     engine: Box<dyn Engine>,
     key: DeviceKey,
-    /// `(vid, pid)` of the group's first collection, for catalog lookups.
-    ids: Option<(u16, u16)>,
+    /// Vendor ID for wireless PID and family lookups, never a receiver's USB PID.
+    vid: Option<u16>,
+    kind: EngineKind,
+    /// Direct entry chosen during admission, not a second VID/PID search.
+    direct: Option<usize>,
     /// HID product string, the name of a device whose engine gives none.
     product: String,
     collections: Vec<CollectionId>,
@@ -131,7 +138,7 @@ struct Pass {
 
 pub struct Hub {
     catalog: Catalog,
-    factory: EngineFactory,
+    factory: Option<EngineFactory>,
     scheduler: Scheduler,
     engines: BTreeMap<GroupId, Slot>,
     routes: HashMap<CollectionId, Route>,
@@ -148,7 +155,7 @@ impl Hub {
     pub fn new(catalog: Catalog, policy: Policy) -> Self {
         Self {
             catalog,
-            factory: Box::new(crate::engines::engine_for),
+            factory: None,
             scheduler: Scheduler::new(policy),
             engines: BTreeMap::new(),
             routes: HashMap::new(),
@@ -159,20 +166,38 @@ impl Hub {
     }
 
     pub fn with_engine_factory(self, f: EngineFactory) -> Self {
-        Self { factory: f, ..self }
+        Self {
+            factory: Some(f),
+            ..self
+        }
+    }
+
+    /// Resolve the roles against this hub's catalog, using only cached OS names for product gates.
+    pub fn select_group(
+        &self,
+        group: &HidGroup,
+        product: impl FnMut(usize, &CollectionSelector) -> Option<bool>,
+    ) -> Option<Selection> {
+        engines::select_with(group, &self.catalog, product)
     }
 
     pub fn handle(&mut self, input: HubInput, now: Ms) -> Vec<HubOutput> {
         let mut pass = Pass::default();
         match input {
-            HubInput::GroupArrived(group) => self.arrive(&group, now, &mut pass),
+            HubInput::GroupArrived(group) => self.arrive(&group, None, now, &mut pass),
+            HubInput::MatchedGroupArrived(group, selection) => {
+                self.arrive(&group, Some(&selection), now, &mut pass)
+            }
             HubInput::GroupRemoved(id) => self.remove_group(id, now, &mut pass),
             HubInput::Report {
                 collection,
                 origin,
                 bytes,
             } => {
-                if let Some(route) = self.routes.get(&collection)
+                if let Some(route) = self.routes.get(&collection).filter(|route| match origin {
+                    ReportOrigin::Input => route.reads,
+                    ReportOrigin::FeatureReply => route.role.is_some(),
+                })
                     && let Some(slot) = self.engines.get_mut(&route.group)
                 {
                     let gid = route.group;
@@ -243,31 +268,82 @@ impl Hub {
         self.scheduler.activity_ready_at(key)
     }
 
-    fn arrive(&mut self, group: &HidGroup, now: Ms, pass: &mut Pass) {
+    fn arrive(
+        &mut self,
+        group: &HidGroup,
+        prepared: Option<&Selection>,
+        now: Ms,
+        pass: &mut Pass,
+    ) {
         // The same id again means the old handles are gone.
         self.remove_group(group.id, now, pass);
-        let Some(engine) = (self.factory)(group, &self.catalog) else {
-            return;
-        };
+        let resolved;
+        let (engine, selection): (Box<dyn Engine>, Option<&Selection>) =
+            if let Some(factory) = self.factory.as_ref().filter(|_| prepared.is_none()) {
+                let Some(engine) = factory(group, &self.catalog) else {
+                    return;
+                };
+                (engine, None)
+            } else {
+                let selection = if let Some(selection) = prepared {
+                    selection
+                } else {
+                    resolved = engines::select(group, &self.catalog);
+                    let Some(selection) = resolved.as_ref() else {
+                        return;
+                    };
+                    selection
+                };
+                let engine = match selection.kind() {
+                    EngineKind::Hidpp => selection.hidpp(group, &self.catalog),
+                };
+                let Some(engine) = engine else { return };
+                (Box::new(engine), Some(selection))
+            };
         let key = engine.group_key();
-        let collections: Vec<CollectionId> = group.collections.iter().map(|c| c.id).collect();
-        for c in &group.collections {
+        let mut collections = Vec::new();
+        let mut routed = group
+            .collections
+            .iter()
+            .filter(|c| selection.is_none_or(|selection| selection.opens(c.id)))
+            .peekable();
+        let first = routed.peek().copied();
+        let direct = if let Some(selection) = selection {
+            selection.direct()
+        } else {
+            // Custom engines supply their own routes; a gated entry still requires selection.
+            first.and_then(|c| {
+                let mut entries = self.catalog.direct_entries(c.vid, c.pid);
+                let (index, entry) = entries.next()?;
+                (entries.next().is_none() && entry.receive.is_none() && entry.send.is_none())
+                    .then_some(index)
+            })
+        };
+        for c in routed {
+            collections.push(c.id);
+            let (reads, role) = selection.map_or_else(
+                || (true, engine.collection_role(c.id)),
+                |selection| (selection.reads(c.id), selection.send_role(c.id)),
+            );
             self.routes.insert(
                 c.id,
                 Route {
                     group: group.id,
+                    reads,
+                    role,
                     output_len: c.output_len,
                     feature_len: c.feature_len,
                 },
             );
         }
-        let first = group.collections.first();
         self.engines.insert(
             group.id,
             Slot {
                 engine,
                 key: key.clone(),
-                ids: first.map(|c| (c.vid, c.pid)),
+                vid: first.map(|c| c.vid),
+                kind: selection.map_or(EngineKind::Hidpp, Selection::kind),
+                direct,
                 product: first.map(|c| c.product.clone()).unwrap_or_default(),
                 collections,
                 aliases: BTreeMap::new(),
@@ -393,8 +469,8 @@ impl Hub {
             return false;
         };
         let query_wakes = slot
-            .ids
-            .and_then(|(vid, pid)| self.catalog.device(vid, pid))
+            .direct
+            .and_then(|index| self.catalog.devices().get(index))
             .is_some_and(|device| device.quirks.query_wakes);
         !query_wakes && !self.owners.values().any(|groups| groups.contains(&gid))
     }
@@ -517,9 +593,9 @@ impl Hub {
             .filter(|route| route.group == gid)
             .ok_or(WriteRefusal::Collection)?;
         let slot = self.engines.get(&gid).ok_or(WriteRefusal::Collection)?;
-        let role = slot
-            .engine
-            .collection_role(collection)
+        let role = route
+            .role
+            .filter(|&role| slot.engine.collection_role(collection) == Some(role))
             .ok_or(WriteRefusal::Collection)?;
         let width = match kind {
             ReportKind::Output => route.output_len,
@@ -690,7 +766,7 @@ impl Hub {
             return;
         };
         let behind_receiver = initial.via == Some(Via::Receiver);
-        let (verification, catalog_name) = self.identity(slot.ids, behind_receiver, wpid);
+        let (verification, catalog_name) = self.identity(slot, behind_receiver, wpid);
         let product = slot.product.clone();
 
         let groups = self.owners.entry(key.clone()).or_default();
@@ -747,31 +823,29 @@ impl Hub {
         }
     }
 
-    /// Catalog status and name of a device registered by a group with `ids`: its device
-    /// entry, else the vendor family's status and no name, else `Generic`. A device behind a
-    /// receiver is looked up by its wireless PID only (the receiver's USB PID says nothing
-    /// about it); any other device by the group's USB PID.
+    /// A receiver's devices use the reported wireless PID, independently of the entry
+    /// that admitted the physical group. Other devices use that exact direct entry.
+    /// Both fall back to the selected engine's family status, if present.
     fn identity(
         &self,
-        ids: Option<(u16, u16)>,
+        slot: &Slot,
         behind_receiver: bool,
         wpid: Option<u16>,
     ) -> (Verification, Option<String>) {
-        let Some((vid, pid)) = ids else {
+        let Some(vid) = slot.vid else {
             return (Verification::Generic, None);
         };
         let entry = if behind_receiver {
             wpid.and_then(|wpid| self.catalog.device_by_wpid(vid, wpid))
         } else {
-            self.catalog.device(vid, pid)
+            slot.direct.and_then(|index| self.catalog.devices().get(index))
         };
         if let Some(device) = entry {
             return (device.status, Some(device.name.clone()));
         }
-        // M1: only HID++ engines exist; the engine's kind joins this lookup with the second one.
         let status = self
             .catalog
-            .family(vid, EngineKind::Hidpp)
+            .family(vid, slot.kind)
             .map_or(Verification::Generic, |family| family.status);
         (status, None)
     }
@@ -997,6 +1071,7 @@ quirks = { query_wakes = true }
                 pid,
                 usage_page: 0xFF00,
                 usage: 0x0002,
+                interface: None,
                 input_len: 20,
                 output_len: 1,
                 feature_len: 0,
@@ -1367,6 +1442,30 @@ quirks = { query_wakes = true }
             &mut pass,
         );
         pass.out
+    }
+
+    #[test]
+    fn hidpp_does_not_route_a_volume_collection_from_the_same_group() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        let volume = CollectionId(31);
+        let mut control = group.collections[0].clone();
+        control.id = volume;
+        (control.usage_page, control.usage) = (0x000C, 1);
+        group.collections.push(control);
+        assert!(!sends(&hub.handle(HubInput::GroupArrived(group), 0)).is_empty());
+
+        let reply = [0x11, 0xFF, 0x81, 0, 0, 0, 0];
+        let unrelated = hub.handle(
+            HubInput::Report {
+                collection: volume,
+                origin: ReportOrigin::Input,
+                bytes: hidpp_frame(&reply),
+            },
+            1,
+        );
+        assert!(sends(&unrelated).is_empty(), "{unrelated:?}");
+        assert!(!sends(&hidpp_reply(&mut hub, &reply)).is_empty());
     }
 
     #[test]

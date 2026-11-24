@@ -109,6 +109,7 @@ fn collection(
         pid,
         usage_page,
         usage,
+        interface: None,
         input_len: len,
         output_len: len,
         feature_len: 0,

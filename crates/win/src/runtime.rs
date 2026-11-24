@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use batterysight_core::catalog::Catalog;
-use batterysight_core::engines;
+use batterysight_core::catalog::{Catalog, EngineKind};
+use batterysight_core::engines::Selection;
 use batterysight_core::hid::{CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
 use batterysight_core::model::{DeviceKey, DeviceState};
@@ -199,7 +199,7 @@ struct Device {
     hub: Hub,
     reactor: Reactor,
     groups: Vec<Opened>,
-    /// Product strings by lowercased path; each is read from the device until a read succeeds.
+    /// Legacy HID++ display/receiver names, never used by catalog selectors.
     products: HashMap<String, String>,
     /// Keeps a group closed after back-to-back read failures until the next arrival, resume
     /// or refresh, and holds back one reopened too often in the last minute.
@@ -487,16 +487,23 @@ impl Device {
         let Some(scanned) = scanned else {
             return;
         };
-        let scanned: Vec<(HidGroup, Vec<HidInterface>, PathSet)> = hid_enum::group(scanned)
+        let scanned: Vec<_> = hid_enum::group(scanned)
             .into_iter()
-            .filter(|(group, _)| engines::wants(group))
-            .map(|(group, members)| {
+            .filter_map(|(group, members)| {
+                let mut names = HashMap::new();
+                let selection = self.hub.select_group(&group, |index, selector| {
+                    let name = names
+                        .entry(index)
+                        .or_insert_with(|| hid_enum::cached_product_name(&members[index]))
+                        .as_deref()?;
+                    Some(selector.matches_product(name))
+                })?;
                 let paths = members.iter().map(|m| path_key(&m.path)).collect();
-                (group, members, paths)
+                Some((group, members, selection, paths))
             })
             .collect();
         let known: Vec<&PathSet> = self.groups.iter().map(|group| &group.paths).collect();
-        let found: Vec<&PathSet> = scanned.iter().map(|(_, _, paths)| paths).collect();
+        let found: Vec<&PathSet> = scanned.iter().map(|(_, _, _, paths)| paths).collect();
         let gone = unmatched(&known, &found);
         let new = unmatched(&found, &known);
         for &index in gone.iter().rev() {
@@ -505,12 +512,12 @@ impl Device {
         }
         self.release_at = None;
         let mut held = BTreeMap::new();
-        for (index, (group, members, paths)) in scanned.into_iter().enumerate() {
+        for (index, (group, members, selection, paths)) in scanned.into_iter().enumerate() {
             if !new.contains(&index) {
                 continue;
             }
             match self.guard.admission(&paths, now) {
-                Admission::Open => self.arrive(group, members, paths, now),
+                Admission::Open => self.arrive(group, members, selection, paths, now),
                 Admission::Closed => {}
                 Admission::HeldUntil(at) => {
                     if self.held.get(&paths) != Some(&at)
@@ -526,28 +533,35 @@ impl Device {
         self.held = held;
     }
 
-    /// Fills in the product strings of the collections an engine reads, opens those and
-    /// hands them to the hub. The group's other collections (such as a headset's consumer
-    /// control) are never opened, so their reports never reach the process. Traces an open
-    /// that failed, and the release of a group the last scan held back.
-    fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet, now: Ms) {
+    /// Opens only the preselected roles, preserving their identity through a failure or
+    /// the legacy Logitech product request. Traces a failed open or release after a hold.
+    fn arrive(
+        &mut self,
+        mut group: HidGroup,
+        members: Vec<HidInterface>,
+        selection: Selection,
+        paths: PathSet,
+        now: Ms,
+    ) {
         let container = members.iter().find_map(|member| member.container);
-        let mut opened = Vec::new();
+        group.collections.clear();
         for mut member in members
             .into_iter()
-            .filter(|member| engines::reads(&member.collection))
+            .filter(|m| selection.opens(m.collection.id))
         {
-            member.collection.product =
-                cached_product(&mut self.products, path_key(&member.path), || {
-                    hid_enum::product_string(&member.path)
-                });
-            if self.reactor.open(group.id, &member).is_ok() {
-                opened.push(member.collection);
+            if selection.kind() == EngineKind::Hidpp {
+                member.collection.product =
+                    cached_product(&mut self.products, path_key(&member.path), || {
+                        hid_enum::product_string(&member.path)
+                    });
+            }
+            let read = selection.reads(member.collection.id);
+            if self.reactor.open(group.id, &member, read).is_ok() {
+                group.collections.push(member.collection);
             }
         }
-        group.collections = opened;
-        if !engines::wants(&group) {
-            // None of its HID++ collections opened; the next rescan tries again.
+        if !selection.ready(&group) {
+            // A required role failed to open; never substitute another command collection.
             self.reactor.close_group(group.id);
             if let Some(trace) = &mut self.trace {
                 trace.open_failed(&paths);
@@ -566,7 +580,7 @@ impl Device {
             collections: group.collections.iter().map(|c| c.id).collect(),
             container,
         });
-        self.feed(HubInput::GroupArrived(group), now_ms());
+        self.feed(HubInput::MatchedGroupArrived(group, selection), now_ms());
     }
 
     /// Closes the group at `index` and tells the hub.
@@ -1243,6 +1257,7 @@ mod tests {
                 pid: 0x0ABA,
                 usage_page: 0xFF43,
                 usage: 0x0202,
+                interface: None,
                 input_len: 20,
                 output_len: 20,
                 feature_len: 0,
@@ -1341,12 +1356,14 @@ mod tests {
                 pid: 0x0ABA,
                 usage_page,
                 usage,
+                interface: None,
                 input_len: len,
                 output_len: len,
                 feature_len: 0,
                 product: String::new(),
             },
             container: None,
+            node: None,
         }
     }
 
@@ -1372,6 +1389,86 @@ mod tests {
             !device.reactor.write(consumer_id, &[0x03]),
             "consumer control opened"
         );
+    }
+
+    #[test]
+    fn only_collections_an_engine_reads_are_opened_with_input_armed() {
+        let (rx_server, rx) = Server::new(PIPE_ACCESS_DUPLEX);
+        let (tx_server, tx) = Server::new(PIPE_ACCESS_DUPLEX);
+        let mut rx = dongle_member(rx, 0xFF00, 2, 20);
+        let mut tx = dongle_member(tx, 0xFF00, 1, 7);
+        rx.collection.output_len = 0;
+        for (member, interface) in [(&mut rx, 3), (&mut tx, 4)] {
+            member.collection.pid = 0xBEEF;
+            member.collection.interface = Some(interface);
+            member.container = Some([1; 16]);
+        }
+        let ids = [rx.collection.id, tx.collection.id];
+        let catalog = Catalog::parse(
+            r#"
+[[device]]
+name = "Synthetic device"
+vid = 0x046D
+pids = [0xBEEF]
+kind = "mouse"
+engine = "hidpp"
+status = "source-verified"
+source = "synthetic HID++ collection-role fixture"
+receive = { interface = 3, usage = 2, input_len = 20 }
+send = { interface = 4, usage = 1, output_len = 7 }
+"#,
+        )
+        .unwrap();
+        let mut device = device();
+        device.hub = Hub::new(catalog, Policy::default());
+        for member in [&rx, &tx] {
+            device
+                .products
+                .insert(path_key(&member.path), "Fixture".into());
+        }
+        device.apply_scan(Some(vec![rx, tx]), now_ms());
+        assert_eq!(device.groups.len(), 1);
+        assert_eq!(device.groups[0].collections, ids);
+
+        // Both handles open, but only RX issues an input read.
+        tx_server.send(&[0x10, 1]);
+        rx_server.send(&[0x11, 2]);
+        let now = now_ms();
+        assert_eq!(
+            device.reactor.wait(Some(now + 1_000), now),
+            [OsEvent::Report {
+                collection: ids[0],
+                bytes: vec![0x11, 2],
+            }]
+        );
+        assert!(device.reactor.wait(Some(0), 0).is_empty());
+    }
+
+    #[test]
+    fn only_collections_an_engine_reads_are_opened_after_cached_product_gate() {
+        let (mut device, _server, mut hidpp, _) = dongle_device();
+        hidpp.collection.pid = 0xBEEF;
+        let id = hidpp.collection.id;
+        let catalog = Catalog::parse(
+            r#"
+[[device]]
+name = "Synthetic device"
+vid = 0x046D
+pids = [0xBEEF]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "synthetic cached-product fixture"
+receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
+"#,
+        )
+        .unwrap();
+        device.hub = Hub::new(catalog, Policy::default());
+        // The legacy HID++ name in dongle_device() matches the text, but the synthetic
+        // pipe has no PnP node and thus no trusted cached product for selection.
+        device.apply_scan(Some(vec![hidpp]), now_ms());
+        assert!(device.groups.is_empty());
+        assert!(!device.reactor.write(id, &[0x11]));
     }
 
     #[test]

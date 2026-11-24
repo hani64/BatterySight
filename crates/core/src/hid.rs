@@ -35,9 +35,12 @@ pub struct Collection {
     pub pid: u16,
     pub usage_page: u16,
     pub usage: u16,
+    /// USB interface number from the PnP instance ID, when present.
+    pub interface: Option<u8>,
     pub input_len: u16,
     pub output_len: u16,
     pub feature_len: u16,
+    /// Product metadata for pure matching, or the display name after runtime admission.
     pub product: String,
 }
 

@@ -2,9 +2,9 @@
 //!
 //! Interfaces are opened with access 0 and shared read/write, only long enough to read
 //! attributes and capabilities, which the HID class driver serves without a request to the
-//! device; container ids come from Configuration Manager. No reports are read or written
-//! here. [`product_string`] is the one request to a device; the runtime calls it only for
-//! collections an engine reads.
+//! device; identity and product metadata come from Configuration Manager. No reports are
+//! read or written here. [`product_string`] is a legacy HID request made only after
+//! Logitech admission, never to resolve a catalog selector.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -14,7 +14,7 @@ use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_DevNode_PropertyW,
     CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW,
-    CM_Get_Device_Interface_PropertyW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
+    CM_Get_Device_Interface_PropertyW, CM_Get_Parent, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
     CR_BUFFER_SMALL, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
@@ -23,8 +23,8 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId, DEVPROP_TYPE_GUID, DEVPROP_TYPE_STRING,
-    DEVPROPTYPE,
+    DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId,
+    DEVPROP_TYPE_GUID, DEVPROP_TYPE_STRING, DEVPROPTYPE,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -53,10 +53,10 @@ pub type ContainerId = [u8; 16];
 /// identifies none of them.
 const SYSTEM_CONTAINER: u128 = 0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF;
 
-/// `guid` as a [`ContainerId`]; `None` for the shared system container.
+/// `guid` as a [`ContainerId`]; `None` for an unset or shared system container.
 pub(crate) fn container_id(guid: &GUID) -> Option<ContainerId> {
     let id = guid.to_u128();
-    (id != SYSTEM_CONTAINER).then(|| id.to_be_bytes())
+    (id != 0 && id != SYSTEM_CONTAINER).then(|| id.to_be_bytes())
 }
 
 /// `container` as 32 uppercase hex digits, in the GUID's text order without dashes.
@@ -76,6 +76,8 @@ pub struct HidInterface {
     pub collection: Collection,
     /// Container id of the interface's device node; `None` when it cannot be read.
     pub container: Option<ContainerId>,
+    /// The Configuration Manager node, available for cached metadata during this scan.
+    pub(crate) node: Option<u32>,
 }
 
 /// Lists the present HID interfaces in the order Configuration Manager returns them, or
@@ -84,8 +86,7 @@ pub struct HidInterface {
 ///
 /// Each interface gets a fresh `CollectionId`. Only attributes and capabilities are read; both
 /// come from the HID class driver without a request to the device. An interface whose
-/// attributes or capabilities cannot be read is skipped. `collection.product` is left empty:
-/// see [`product_string`].
+/// attributes or capabilities cannot be read is skipped. Names are not fetched here.
 pub fn enumerate() -> Option<Vec<HidInterface>> {
     let list = interface_list()?;
     Some(
@@ -128,19 +129,26 @@ pub fn physical_key(path: &str) -> String {
     key
 }
 
-/// Groups interfaces by `(vid, pid, physical_key(path))`, one group per physical device.
-///
-/// Groups keep first-seen order, and so do the interfaces within a group. Paths of an
-/// unexpected shape have an empty physical key, so they are grouped by vid/pid alone. Every
-/// call assigns fresh `GroupId`s.
+#[derive(PartialEq, Eq, Hash)]
+enum PhysicalIdentity {
+    Container(ContainerId),
+    Path(String),
+}
+
+/// Groups a VID/PID by its non-system PnP container when available, otherwise by
+/// [`physical_key`]. A path fallback cannot join two different known containers.
+/// Groups and their members keep first-seen order. Every call assigns fresh `GroupId`s.
 pub fn group(interfaces: Vec<HidInterface>) -> Vec<(HidGroup, Vec<HidInterface>)> {
-    let mut slots: HashMap<(u16, u16, String), usize> = HashMap::new();
+    let mut slots: HashMap<(u16, u16, PhysicalIdentity), usize> = HashMap::new();
     let mut groups: Vec<(HidGroup, Vec<HidInterface>)> = Vec::new();
     for interface in interfaces {
         let key = (
             interface.collection.vid,
             interface.collection.pid,
-            physical_key(&path_string(&interface.path)),
+            interface.container.map_or_else(
+                || PhysicalIdentity::Path(physical_key(&path_string(&interface.path))),
+                PhysicalIdentity::Container,
+            ),
         );
         let slot = *slots.entry(key).or_insert_with(|| {
             let id = GroupId(NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed));
@@ -162,6 +170,35 @@ fn path_string(path: &[u16]) -> String {
         .position(|&unit| unit == 0)
         .unwrap_or(path.len());
     String::from_utf16_lossy(&path[..end])
+}
+
+/// Reads `MI_xx` only from a device instance ID's hardware component, not its bus or
+/// instance-specific suffix. The HID and USB buses use the same hex interface token.
+fn interface_number(instance: &[u16]) -> Option<u8> {
+    let mut components = instance.split(|&unit| unit == u16::from(b'\\'));
+    let (bus, hardware, suffix) = (components.next()?, components.next()?, components.next()?);
+    if bus.is_empty()
+        || suffix.first() == Some(&0)
+        || suffix.is_empty()
+        || components.next().is_some()
+    {
+        return None;
+    }
+    let mut parts = hardware.split(|&unit| unit == u16::from(b'&')).filter(|part| {
+        part.get(..3).is_some_and(|prefix| {
+            prefix.iter().zip(b"mi_").all(|(&unit, expected)| {
+                u8::try_from(unit).is_ok_and(|byte| byte.eq_ignore_ascii_case(expected))
+            })
+        })
+    });
+    let [_, _, _, hi, lo] = *parts.next()? else {
+        return None;
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let digit = |unit| char::from_u32(u32::from(unit))?.to_digit(16).map(|n| n as u8);
+    Some(digit(hi)? * 16 + digit(lo)?)
 }
 
 /// `col` followed by exactly two hex digits, the `&colNN` top-level collection suffix
@@ -256,7 +293,10 @@ fn query(path: &[u16]) -> Option<HidInterface> {
         return None;
     }
 
-    let container = container(&wide);
+    let instance = instance_id(&wide);
+    let interface = instance.as_ref().and_then(|id| interface_number(id));
+    let node = instance.as_ref().and_then(locate_node);
+    let container = node.and_then(container);
     Some(HidInterface {
         path: wide,
         collection: Collection {
@@ -265,18 +305,19 @@ fn query(path: &[u16]) -> Option<HidInterface> {
             pid: attributes.ProductID,
             usage_page: caps.UsagePage,
             usage: caps.Usage,
+            interface,
             input_len: caps.InputReportByteLength,
             output_len: caps.OutputReportByteLength,
             feature_len: caps.FeatureReportByteLength,
             product: String::new(),
         },
         container,
+        node,
     })
 }
 
-/// The container id of the device node behind the interface at `path` (NUL-terminated),
-/// from Configuration Manager, or `None` when it cannot be read.
-fn container(path: &[u16]) -> Option<ContainerId> {
+/// The PnP instance ID of the device node behind the NUL-terminated interface path.
+fn instance_id(path: &[u16]) -> Option<[u16; INSTANCE_ID_LEN]> {
     let mut instance = [0u16; INSTANCE_ID_LEN];
     let mut kind = DEVPROPTYPE::default();
     // The last unit is left out, so the id stays NUL-terminated whatever is written.
@@ -295,7 +336,10 @@ fn container(path: &[u16]) -> Option<ContainerId> {
     if status != CR_SUCCESS || kind != DEVPROP_TYPE_STRING {
         return None;
     }
+    Some(instance)
+}
 
+fn locate_node(instance: &[u16; INSTANCE_ID_LEN]) -> Option<u32> {
     let mut node = 0u32;
     // SAFETY: `node` is a valid out pointer; `instance` ends in a NUL the property read
     // could not overwrite.
@@ -306,10 +350,11 @@ fn container(path: &[u16]) -> Option<ContainerId> {
             CM_LOCATE_DEVNODE_NORMAL,
         )
     };
-    if status != CR_SUCCESS {
-        return None;
-    }
+    (status == CR_SUCCESS).then_some(node)
+}
 
+fn container(node: u32) -> Option<ContainerId> {
+    let mut kind = DEVPROPTYPE::default();
     let mut guid = GUID::zeroed();
     let mut size = size_of::<GUID>() as u32;
     // SAFETY: `guid` is writable for the `size` bytes passed.
@@ -329,11 +374,45 @@ fn container(path: &[u16]) -> Option<ContainerId> {
     container_id(&guid)
 }
 
+/// The bus-reported name cached by PnP, not a HID product-string request. A composite
+/// device's name can be on its parent; do not cross a container boundary to use it.
+pub(crate) fn cached_product_name(interface: &HidInterface) -> Option<String> {
+    let mut node = interface.node?;
+    loop {
+        let mut name = [0u16; PRODUCT_LEN];
+        let mut size = size_of_val(&name) as u32;
+        let mut kind = DEVPROPTYPE::default();
+        // SAFETY: `name` is writable for the `size` bytes passed.
+        let status = unsafe {
+            CM_Get_DevNode_PropertyW(
+                node,
+                &DEVPKEY_Device_BusReportedDeviceDesc,
+                &mut kind,
+                Some(name.as_mut_ptr().cast()),
+                &mut size,
+                0,
+            )
+        };
+        if status == CR_SUCCESS && kind == DEVPROP_TYPE_STRING && name[0] != 0 {
+            return Some(path_string(&name));
+        }
+        let id = interface.container?;
+        let mut parent = 0;
+        // SAFETY: `parent` is a valid out pointer.
+        if unsafe { CM_Get_Parent(&mut parent, node, 0) } != CR_SUCCESS
+            || container(parent) != Some(id)
+        {
+            return None;
+        }
+        node = parent;
+    }
+}
+
 /// The product string of the interface at `path`, or an empty string on any failure.
 ///
 /// `HidD_GetProductString` is a request to the device and can block for seconds, for example
-/// on a paired but disconnected Bluetooth device. Call it only for interfaces in groups an
-/// engine accepts, once per path. `path` may include the trailing NUL.
+/// on a paired but disconnected Bluetooth device. Call it only after Logitech admission.
+/// `path` may include the trailing NUL.
 pub fn product_string(path: &[u16]) -> String {
     let terminated;
     let path = if path.last() == Some(&0) {
@@ -403,17 +482,45 @@ mod tests {
                 pid,
                 usage_page: 0xFF00,
                 usage,
+                interface: None,
                 input_len: 7,
                 output_len: 7,
                 feature_len: 0,
                 product: String::new(),
             },
             container: None,
+            node: None,
         }
     }
 
     fn usages(list: &[HidInterface]) -> Vec<u16> {
         list.iter().map(|i| i.collection.usage).collect()
+    }
+
+    #[test]
+    fn interface_number_uses_only_a_complete_hex_instance_component() {
+        for (instance, expected) in [
+            (r"hId\VID_1234&PID_5678&Mi_03&COL01\opaque", Some(3)),
+            (r"USB\VID_1234&PID_5678&mi_aF\opaque", Some(0xAF)),
+            (r"HID\VID_1234&PID_5678\opaque&MI_03", None),
+            (r"MI_03\VID_1234&PID_5678\opaque", None),
+            (r"HID\VID_1234&PID_5678&XMI_03\opaque", None),
+            (r"HID\VID_1234&PID_5678&MI_3\opaque", None),
+            (r"HID\VID_1234&PID_5678&MI_003\opaque", None),
+            (r"HID\VID_1234&PID_5678&MI_0Z\opaque", None),
+            (r"HID\VID_1234&PID_5678&MI_+3\opaque", None),
+            (r"HID\VID_1234&PID_5678&MI_03&MI_04\opaque", None),
+            (r"HID\VID_1234&PID_5678\opaque", None),
+            (r"HID\VID_1234&PID_5678&MI_03", None),
+        ] {
+            let wide: Vec<_> = instance.encode_utf16().chain([0]).collect();
+            assert_eq!(interface_number(&wide), expected, "{instance}");
+        }
+    }
+
+    #[test]
+    fn null_container_is_no_container() {
+        assert_eq!(container_id(&GUID::zeroed()), None);
     }
 
     #[test]
@@ -484,6 +591,33 @@ mod tests {
             iface(C547_COL01, 0x046D, 0xC547, 1),
             iface(C547_OTHER, 0x046D, 0xC547, 2),
         ]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(usages(&groups[0].1), [1]);
+        assert_eq!(usages(&groups[1].1), [2]);
+    }
+
+    #[test]
+    fn group_merges_distinct_interfaces_in_the_same_container() {
+        let mut rx = iface(C547_COL01, 0x046D, 0xC547, 1);
+        let mut tx = iface(&C547_OTHER.replace("mi_02", "mi_03"), 0x046D, 0xC547, 2);
+        rx.container = Some([1; 16]);
+        tx.container = rx.container;
+        rx.collection.interface = Some(2);
+        tx.collection.interface = Some(3);
+        let groups = group(vec![rx, tx]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(usages(&groups[0].1), [1, 2]);
+        assert_eq!(groups[0].0.collections[0].interface, Some(2));
+        assert_eq!(groups[0].0.collections[1].interface, Some(3));
+    }
+
+    #[test]
+    fn group_never_merges_distinct_known_containers_with_the_same_fallback_key() {
+        let mut first = iface(C547_COL01, 0x046D, 0xC547, 1);
+        let mut second = iface(C547_COL02, 0x046D, 0xC547, 2);
+        first.container = Some([1; 16]);
+        second.container = Some([2; 16]);
+        let groups = group(vec![first, second]);
         assert_eq!(groups.len(), 2);
         assert_eq!(usages(&groups[0].1), [1]);
         assert_eq!(usages(&groups[1].1), [2]);

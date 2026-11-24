@@ -101,12 +101,17 @@ impl Reactor {
         })
     }
 
-    /// Opens `iface` as part of `group` and starts reading it when it has input reports.
+    /// Opens `iface` as part of `group`, arming input only for a selected receive collection.
     ///
     /// Mouse and keyboard collections are skipped: Windows holds them exclusively. Opening a
     /// collection that is already open does nothing. A read that cannot be started is
     /// reported as `ReadFailed` by the next `wait`.
-    pub fn open(&mut self, group: GroupId, iface: &HidInterface) -> windows::core::Result<()> {
+    pub fn open(
+        &mut self,
+        group: GroupId,
+        iface: &HidInterface,
+        read: bool,
+    ) -> windows::core::Result<()> {
         let collection = &iface.collection;
         if hid_io::is_exclusive(collection.usage_page, collection.usage)
             || self.opens.contains_key(&collection.id)
@@ -125,7 +130,7 @@ impl Reactor {
             closing: false,
         };
         let input_len = usize::from(collection.input_len);
-        if input_len > 0 {
+        if read && input_len > 0 {
             if Op::new(collection.id, Kind::Read, vec![0; input_len]).start(open.handle.0) {
                 open.pending += 1;
             } else {
@@ -370,12 +375,14 @@ pub(crate) mod tests {
                 pid: 0,
                 usage_page,
                 usage,
+                interface: None,
                 input_len: 7,
                 output_len: 7,
                 feature_len: 0,
                 product: String::new(),
             },
             container: None,
+            node: None,
         }
     }
 
@@ -407,7 +414,7 @@ pub(crate) mod tests {
             (Server(handle), iface(name, 0xFF00, 0x0001))
         }
 
-        fn send(&self, bytes: &[u8]) {
+        pub(crate) fn send(&self, bytes: &[u8]) {
             let mut written = 0;
             // SAFETY: synchronous write from a live buffer on an open handle.
             unsafe { WriteFile(self.0, Some(bytes), Some(&mut written), None) }.unwrap();
@@ -509,7 +516,7 @@ pub(crate) mod tests {
         let missing = wide(r"\\.\pipe\batterysight-test-missing");
         for usage in [0x02, 0x06] {
             let skipped = iface(missing.clone(), 0x01, usage);
-            reactor.open(GroupId(1), &skipped).unwrap();
+            reactor.open(GroupId(1), &skipped, true).unwrap();
             reactor.write(skipped.collection.id, &[0x10]);
             assert_eq!(
                 reactor.wait(Some(0), 0),
@@ -520,7 +527,7 @@ pub(crate) mod tests {
         }
         assert!(
             reactor
-                .open(GroupId(1), &iface(missing, 0xFF00, 1))
+                .open(GroupId(1), &iface(missing, 0xFF00, 1), true)
                 .is_err()
         );
     }
@@ -530,7 +537,7 @@ pub(crate) mod tests {
         let (server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe).unwrap();
+        reactor.open(GroupId(1), &pipe, true).unwrap();
 
         server.send(&[0x11, 1, 2, 3, 4, 5, 6]);
         assert_eq!(
@@ -550,7 +557,7 @@ pub(crate) mod tests {
         let (_server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe).unwrap();
+        reactor.open(GroupId(1), &pipe, true).unwrap();
         assert!(!reactor.write(id, &[0; 8]));
         assert_eq!(
             reactor.wait(Some(0), 0),
@@ -563,7 +570,7 @@ pub(crate) mod tests {
         let (_server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(3), &pipe).unwrap();
+        reactor.open(GroupId(3), &pipe, true).unwrap();
         reactor.close_group(GroupId(3));
         reactor.write(id, &[0x10]);
         assert_eq!(
@@ -577,8 +584,8 @@ pub(crate) mod tests {
         let (_server_a, pipe_a) = Server::new(PIPE_ACCESS_DUPLEX);
         let (server_b, pipe_b) = Server::new(PIPE_ACCESS_DUPLEX);
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe_a).unwrap();
-        reactor.open(GroupId(2), &pipe_b).unwrap();
+        reactor.open(GroupId(1), &pipe_a, true).unwrap();
+        reactor.open(GroupId(2), &pipe_b, true).unwrap();
         let poster = reactor.poster();
 
         server_b.send(&[0x11, 7]);
@@ -595,7 +602,7 @@ pub(crate) mod tests {
         let (server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe).unwrap();
+        reactor.open(GroupId(1), &pipe, true).unwrap();
         drop(server);
         assert_eq!(
             reactor.wait(Some(1000), 0),
@@ -609,7 +616,7 @@ pub(crate) mod tests {
         let (_server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe).unwrap();
+        reactor.open(GroupId(1), &pipe, true).unwrap();
         // Something other than `close_group` aborts the pending read.
         // SAFETY: the reactor's handle is open.
         unsafe { CancelIoEx(reactor.opens[&id].handle.0, None) }.unwrap();
@@ -625,7 +632,7 @@ pub(crate) mod tests {
         let (server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe).unwrap();
+        reactor.open(GroupId(1), &pipe, true).unwrap();
         // Message read mode makes a short read fail with ERROR_MORE_DATA, as a HID read into
         // a too-small buffer does (the client end of a pipe starts in byte mode).
         let mode = PIPE_READMODE_MESSAGE;
@@ -654,7 +661,7 @@ pub(crate) mod tests {
         let (_server, mut pipe) = Server::new(PIPE_ACCESS_DUPLEX);
         pipe.path.pop();
         let mut reactor = Reactor::new().unwrap();
-        let error = reactor.open(GroupId(1), &pipe).unwrap_err();
+        let error = reactor.open(GroupId(1), &pipe, true).unwrap_err();
         assert_eq!(error.code(), ERROR_INVALID_PARAMETER.to_hresult());
         assert!(reactor.opens.is_empty());
     }
@@ -665,7 +672,7 @@ pub(crate) mod tests {
         let (server, pipe) = Server::new(PIPE_ACCESS_OUTBOUND);
         let id = pipe.collection.id;
         let mut reactor = Reactor::new().unwrap();
-        reactor.open(GroupId(1), &pipe).unwrap();
+        reactor.open(GroupId(1), &pipe, true).unwrap();
         assert!(!reactor.opens[&id].writable);
         server.send(&[0x10, 1]);
         assert_eq!(reactor.wait(Some(1000), 0), vec![report(id, &[0x10, 1])]);
@@ -695,7 +702,7 @@ pub(crate) mod tests {
             let Some(short) = short else { continue };
             for member in &members {
                 let c = &member.collection;
-                let opened = reactor.open(hid_group.id, member);
+                let opened = reactor.open(hid_group.id, member, true);
                 println!(
                     "open group {} collection {} {:04X}:{:04X} in {} out {} -> {:?}",
                     hid_group.id.0,
