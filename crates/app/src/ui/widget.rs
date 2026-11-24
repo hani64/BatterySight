@@ -48,7 +48,7 @@ use super::{DeviceView, WIDGET_CLASS, WM_APP_CLOCKS, WM_APP_MENU, hinstance, pos
 const CLOCK_RETRY: Duration = Duration::from_millis(500);
 const CLOCK_RETRIES: u32 = 20;
 
-/// Windows refused to create the widget window: this Windows build gets tray icons.
+/// Windows refused to create a widget window: tray icons, until the widget is tried again.
 #[derive(Debug)]
 pub struct CreateFailed;
 
@@ -535,6 +535,15 @@ fn taskbars() -> Vec<(HWND, bool)> {
         }
     }
     out
+}
+
+/// Whether the primary taskbar has a visible notification area: the anchor without which no
+/// new widget shows at once ([`Widgets::shown`] right after [`Widgets::new`]). Reads
+/// window-manager state only.
+pub fn primary_anchor_ready() -> bool {
+    // SAFETY: literal class name.
+    unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }
+        .is_ok_and(|bar| tray_notify(bar).is_some())
 }
 
 /// The visible, non-empty notification area of `bar`.
