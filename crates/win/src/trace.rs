@@ -1,10 +1,11 @@
-//! Opt-in log of every report the runtime sends and reads.
+//! Opt-in log of every report the runtime sends and reads, and of UI events.
 //!
 //! With `BATTERYSIGHT_TRACE=1`, each write the reactor started and each input report read
 //! is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
-//! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread. Tracing only
-//! records frames the hub already exchanges, so it adds no device traffic, and it never
-//! fails the app: an unwritable file just means no trace.
+//! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread, and the UI
+//! adds `"<unix ms> ui <text>"` lines ([`ui_line`]). Tracing only records frames the hub
+//! already exchanges, so it adds no device traffic, and it never fails the app: an
+//! unwritable file just means no trace.
 
 use std::env;
 use std::ffi::OsStr;
@@ -16,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use batterysight_core::hid::CollectionId;
 
-/// The open trace file. Used only on the device thread.
+/// The open trace file: the device thread's, held for the runtime's life, or one opened
+/// for a single [`ui_line`].
 pub(crate) struct Trace(File);
 
 impl Trace {
@@ -37,13 +39,28 @@ impl Trace {
 
     /// Appends one frame; write errors are ignored.
     pub(crate) fn record(&mut self, direction: Direction, collection: CollectionId, bytes: &[u8]) {
-        let unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as u64);
-        let mut text = line(unix_ms, direction, collection, bytes);
+        let mut text = line(unix_ms(), direction, collection, bytes);
         text.push('\n');
         let _ = self.0.write_all(text.as_bytes());
     }
+}
+
+/// Appends `"<unix ms> ui <text>"` to the trace file when `BATTERYSIGHT_TRACE=1`; does
+/// nothing otherwise, and ignores errors. It opens, appends to and closes the file on the
+/// calling thread, the UI thread included: tracing is a debug switch, so that small append
+/// is accepted there.
+pub fn ui_line(text: &str) {
+    if let Some(mut trace) = Trace::from_env() {
+        let mut text = ui_text(unix_ms(), text);
+        text.push('\n');
+        let _ = trace.0.write_all(text.as_bytes());
+    }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// Which way a traced frame went.
@@ -67,6 +84,11 @@ fn line(unix_ms: u64, direction: Direction, collection: CollectionId, bytes: &[u
         let _ = write!(text, "{byte:02X}");
     }
     text
+}
+
+/// `"<unix ms> ui <text>"`.
+fn ui_text(unix_ms: u64, text: &str) -> String {
+    format!("{unix_ms} ui {text}")
 }
 
 #[cfg(test)]
@@ -97,5 +119,13 @@ mod tests {
     #[test]
     fn line_of_empty_frame() {
         assert_eq!(line(5, Direction::Out, CollectionId(1), &[]), "5 out 1 ");
+    }
+
+    #[test]
+    fn ui_line_has_time_and_text() {
+        assert_eq!(
+            ui_text(1_763_900_000_123, "fallback NoAnchor"),
+            "1763900000123 ui fallback NoAnchor"
+        );
     }
 }
