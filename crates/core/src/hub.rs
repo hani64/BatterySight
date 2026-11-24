@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::{Catalog, EngineKind};
-use crate::engine::{Action, Engine, write_allowed};
+use crate::engine::{Action, Engine, WriteDestination, write_allowed};
 use crate::engines;
 use crate::hid::{CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{
@@ -541,15 +541,18 @@ impl Hub {
         {
             return Err(WriteRefusal::Grant);
         }
-        if !write_allowed(
-            &*slot.engine,
-            role,
-            kind,
-            bytes,
-            grant,
-            slot.engine_key(subject),
-        ) {
-            return Err(WriteRefusal::Rule);
+        match write_allowed(&*slot.engine, role, kind, bytes, grant).ok_or(WriteRefusal::Rule)? {
+            WriteDestination::Collection => {}
+            WriteDestination::Device(key) => {
+                let key = slot.aliases.get(key).unwrap_or(key);
+                if (subject != &slot.key && subject != key)
+                    || self.owners.get(key).and_then(|groups| groups.last()) != Some(&gid)
+                {
+                    return Err(WriteRefusal::Grant);
+                }
+            }
+            WriteDestination::Group if subject != &slot.key => return Err(WriteRefusal::Grant),
+            WriteDestination::Group => {}
         }
         permit.spend();
         Ok(())
@@ -1313,16 +1316,27 @@ quirks = { query_wakes = true }
         bytes
     }
 
-    fn hidpp_receiver() -> HubInput {
-        let mut group = group(1, 0x046D, 0xC547);
+    fn hidpp_group(id: u32, receiver: bool) -> HidGroup {
+        let mut group = group(id, 0x046D, 0xC547);
         group.collections[0].output_len = 20;
-        HubInput::GroupArrived(group)
+        if !receiver {
+            group.collections[0].product = "Fake USB Mouse".into();
+        }
+        group
+    }
+
+    fn hidpp_receiver() -> HubInput {
+        HubInput::GroupArrived(hidpp_group(1, true))
     }
 
     fn hidpp_reply(hub: &mut Hub, head: &[u8]) -> Vec<HubOutput> {
+        hidpp_report(hub, 1, head)
+    }
+
+    fn hidpp_report(hub: &mut Hub, group: u32, head: &[u8]) -> Vec<HubOutput> {
         hub.handle(
             HubInput::Report {
-                collection: coll(1),
+                collection: coll(group),
                 origin: ReportOrigin::Input,
                 bytes: hidpp_frame(head),
             },
@@ -1331,12 +1345,21 @@ quirks = { query_wakes = true }
     }
 
     fn hidpp_try_send(hub: &mut Hub, head: &[u8]) -> Vec<HubOutput> {
+        hidpp_group_send(hub, 1, GrantId(1), head)
+    }
+
+    fn hidpp_group_send(
+        hub: &mut Hub,
+        group: u32,
+        grant: GrantId,
+        head: &[u8],
+    ) -> Vec<HubOutput> {
         let mut pass = Pass::default();
         hub.apply(
-            GroupId(1),
+            GroupId(group),
             vec![Action::Send {
-                grant: GrantId(1),
-                collection: coll(1),
+                grant,
+                collection: coll(group),
                 kind: ReportKind::Output,
                 bytes: hidpp_frame(head),
             }],
@@ -1421,6 +1444,192 @@ quirks = { query_wakes = true }
             let out = hidpp_try_send(&mut hub, &frame);
             assert!(sends(&out).is_empty(), "{frame:02X?}: {out:?}");
         }
+    }
+
+    #[test]
+    fn hidpp_reserved_index_from_root_never_emits_a_feature_call() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        for reply in [
+            &[0x10, 1, 0x41, 0, 0, 0, 0][..],
+            &[0x11, 1, 0, 0x1B, 2],
+            &[0x11, 1, 0, 0x0B, 0x80], // A malformed Root reply for the name feature.
+            &[0x11, 1, 0, 0x0B, 0],    // No unit ID.
+        ] {
+            hidpp_reply(&mut hub, reply);
+        }
+        let out = hidpp_reply(&mut hub, &[0x11, 1, 0, 0x0B, 8]); // Unified battery.
+        assert_eq!(
+            out,
+            [HubOutput::WriteRefused {
+                collection: coll(1),
+                kind: ReportKind::Output,
+                reason: WriteRefusal::Rule,
+            }]
+        );
+    }
+
+    #[test]
+    fn hidpp_receiver_slot_rejects_complemented_feature_replies_and_errors() {
+        for foreign in [
+            &[0x11, 0xFE, 0, 0x0B, 5][..],
+            &[0x11, 0xFE, 0xFF, 0, 0x0B, 0x02],
+            &[0x10, 0xFE, 0x8F, 0, 0x0B, 0x02, 0],
+        ] {
+            let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+            hub.handle(hidpp_receiver(), 0);
+            hidpp_reply(&mut hub, &[0x10, 1, 0x41, 0, 0, 0, 0]);
+            hidpp_reply(&mut hub, &[0x11, 1, 0, 0x1B, 2]);
+            let out = hidpp_reply(&mut hub, foreign);
+            assert!(out.is_empty(), "{foreign:02X?}: {out:?}");
+            assert_eq!(
+                sends(&hidpp_reply(&mut hub, &[0x11, 1, 0, 0x0B, 5])),
+                [hidpp_frame(&[0x11, 1, 0, 0x0B, 0, 3])]
+            );
+        }
+    }
+
+    #[test]
+    fn hidpp_receiver_slot_rejects_complemented_register_replies_and_errors() {
+        for foreign in [
+            &[0x11, 0xFE, 0x81, 0, 0xA4, 0x20, 0x44][..],
+            &[0x10, 0xFE, 0x8F, 0x81, 0, 0x02, 0],
+        ] {
+            let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+            hub.handle(hidpp_receiver(), 0);
+            hidpp_reply(&mut hub, &[0x10, 1, 0x41, 0, 0, 0, 0]);
+            assert_eq!(
+                sends(&hidpp_reply(&mut hub, &[0x10, 1, 0x8F, 0, 0x1B, 1, 0])),
+                [hidpp_frame(&[0x11, 1, 0x81, 0])]
+            );
+            let out = hidpp_reply(&mut hub, foreign);
+            assert!(out.is_empty(), "{foreign:02X?}: {out:?}");
+            assert_eq!(
+                sends(&hidpp_reply(&mut hub, &[0x11, 1, 0x81, 0, 0xA4, 0x20, 0x44])),
+                [hidpp_frame(&[0x11, 1, 0x80, 0, 0xB4, 0x20, 0x44])]
+            );
+        }
+    }
+
+    #[test]
+    fn hidpp_receiver_itself_does_not_accept_the_direct_device_reply_alias() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        let out = hidpp_reply(&mut hub, &[0x11, 0, 0x81, 0, 0xA4, 0x20, 0x44]);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(
+            sends(&hidpp_reply(&mut hub, &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44])),
+            [hidpp_frame(&[0x11, 0xFF, 0x80, 0, 0xA4, 0x21, 0x44])]
+        );
+    }
+
+    fn hidpp_discover_unified(hub: &mut Hub, group: u32, device: u8, reply: u8, unit: [u8; 4]) {
+        let [a, b, c, d] = unit;
+        if device != 0xFF {
+            hidpp_report(hub, group, &[0x10, device, 0x41, 0, 0, 0, 0]);
+        }
+        for frame in [
+            &[0x11, reply, 0, 0x1B, 2][..],
+            &[0x11, reply, 0, 0x0B, 0], // No name feature.
+            &[0x11, reply, 0, 0x0B, 3], // Unit ID at index 3.
+            &[0x11, reply, 0, 0x0B, 8], // Unified battery at index 8.
+            &[0x11, reply, 3, 0x0B, 0, a, b, c, d],
+            &[0x11, reply, 8, 0x1B, 34, 4, 0, 0],
+        ] {
+            hidpp_report(hub, group, frame);
+        }
+    }
+
+    #[test]
+    fn hidpp_live_receiver_group_grant_cannot_read_a_device_owned_by_its_cable() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let unit = [0x12, 0x34, 0x56, 0x78];
+        let key = dev("logi:unit:12345678");
+        hub.handle(hidpp_receiver(), 0);
+        hidpp_discover_unified(&mut hub, 1, 1, 1, unit);
+        assert_eq!(hub.keys_of(GroupId(1)), [key.clone()]);
+        let read = [0x11, 1, 8, 0x1B];
+        assert_eq!(sends(&hidpp_try_send(&mut hub, &read)), [hidpp_frame(&read)]);
+
+        hub.handle(HubInput::GroupArrived(hidpp_group(2, false)), 1);
+        // Direct devices can answer an FF request with address 00.
+        hidpp_discover_unified(&mut hub, 2, 0xFF, 0, unit);
+        assert!(hub.keys_of(GroupId(1)).is_empty());
+        assert_eq!(hub.keys_of(GroupId(2)), [key]);
+
+        let refused = hidpp_try_send(&mut hub, &read);
+        let unknown_slot_ping = [0x11, 2, 0, 0x1B, 0, 0, 0x5A];
+        assert_eq!(
+            sends(&hidpp_try_send(&mut hub, &unknown_slot_ping)),
+            [hidpp_frame(&unknown_slot_ping)],
+            "the receiver group grant must still permit discovery of an unknown slot"
+        );
+        assert!(sends(&refused).is_empty(), "{refused:?}");
+    }
+
+    #[test]
+    fn hidpp_receiver_group_grant_can_read_its_device_under_a_hub_alias() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        hidpp_discover_unified(&mut hub, 1, 1, 1, [0; 4]);
+        hub.handle(HubInput::GroupArrived(hidpp_group(2, true)), 1);
+        hidpp_discover_unified(&mut hub, 2, 1, 1, [0; 4]);
+        assert_eq!(hub.keys_of(GroupId(1)), [dev("logi:C547:1")]);
+        assert_eq!(hub.keys_of(GroupId(2)), [dev("logi:C547:1#2")]);
+
+        let read = [0x11, 1, 8, 0x1B];
+        assert_eq!(
+            sends(&hidpp_group_send(&mut hub, 2, GrantId(3), &read)),
+            [hidpp_frame(&read)]
+        );
+    }
+
+    fn with_hidpp_collection(group: &mut HidGroup, id: CollectionId, short: bool) {
+        let mut collection = group.collections[0].clone();
+        collection.id = id;
+        if short {
+            collection.usage = 1;
+            collection.input_len = 7;
+            collection.output_len = 7;
+        }
+        group.collections.push(collection);
+    }
+
+    #[test]
+    fn hidpp_duplicate_short_command_collections_are_refused_without_long_fallback() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        with_hidpp_collection(&mut group, CollectionId(31), true);
+        with_hidpp_collection(&mut group, CollectionId(32), true);
+        let out = hub.handle(HubInput::GroupArrived(group), 0);
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidpp_duplicate_long_only_command_collections_are_refused() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        with_hidpp_collection(&mut group, CollectionId(31), false);
+        let out = hub.handle(HubInput::GroupArrived(group), 0);
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidpp_unique_short_command_collection_wins_over_duplicate_longs() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        with_hidpp_collection(&mut group, CollectionId(31), false);
+        let short = CollectionId(32);
+        with_hidpp_collection(&mut group, short, true);
+        let out = hub.handle(HubInput::GroupArrived(group), 0);
+        assert_eq!(
+            out,
+            [HubOutput::Send {
+                collection: short,
+                kind: ReportKind::Output,
+                bytes: vec![0x10, 0xFF, 0x81, 0, 0, 0, 0],
+            }]
+        );
     }
 
     #[test]

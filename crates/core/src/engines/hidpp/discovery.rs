@@ -10,7 +10,7 @@ use crate::engine::{HidppFeatureParams, HidppRegisterParams, HidppTarget, WriteR
 use crate::hid::CollectionRole;
 use crate::model::DeviceKind;
 
-use super::frame::{self, Reply};
+use super::frame::{self, Reply, ReplyAddress};
 
 // HID++ 1.0 registers and notification flags. Source: Solaar `hidpp10_constants.py`
 // (`Registers`, `NotificationFlag`).
@@ -239,12 +239,12 @@ impl Request {
         }
     }
 
-    pub(super) fn reply(self, bytes: &[u8], index: u8) -> Reply<'_> {
+    pub(super) fn reply(self, bytes: &[u8], from: ReplyAddress) -> Reply<'_> {
         match self {
-            Self::Feature { fi, function, .. } => frame::match_fap(bytes, index, fi, function),
+            Self::Feature { fi, function, .. } => frame::match_fap(bytes, from, fi, function),
             Self::Register {
                 sub_id, address, ..
-            } => frame::match_register(bytes, index, sub_id, address),
+            } => frame::match_register(bytes, from, sub_id, address),
         }
     }
 }

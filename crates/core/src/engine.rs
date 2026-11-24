@@ -4,7 +4,7 @@
 //! under a [`Grant`] handed to it by the hub. It never reads a clock or
 //! touches a handle; the hub decides what reaches the device.
 
-use crate::engines::hidpp::frame::{LONG, SHORT, SW_ID};
+use crate::engines::hidpp::frame::{FIRST_REGISTER_SUB_ID, LONG, SHORT, SW_ID};
 use crate::hid::{CollectionId, CollectionRole, ReportKind, ReportOrigin};
 use crate::model::{DeviceKey, DeviceUpdate};
 use crate::scheduler::{Capabilities, Grant, GrantId};
@@ -64,6 +64,28 @@ pub enum HidppTarget {
     Device,
 }
 
+/// The HID++ destination, with the engine's local key if the device is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HidppDestination<'a> {
+    Receiver,
+    Device(Option<&'a DeviceKey>),
+}
+
+impl HidppDestination<'_> {
+    fn target(self) -> HidppTarget {
+        match self {
+            Self::Receiver => HidppTarget::Receiver,
+            Self::Device(_) => HidppTarget::Device,
+        }
+    }
+}
+
+pub(crate) enum WriteDestination<'a> {
+    Collection,
+    Group,
+    Device(&'a DeviceKey),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HidppFeatureParams {
     Exact([u8; 3]),
@@ -120,14 +142,13 @@ fn hidpp_fields(kind: ReportKind, bytes: &[u8]) -> Option<(u8, u8, u8, [u8; 3])>
     Some((index, command, address, [a, b, c]))
 }
 
-pub(crate) fn write_allowed(
-    engine: &dyn Engine,
+pub(crate) fn write_allowed<'a>(
+    engine: &'a dyn Engine,
     role: CollectionRole,
     kind: ReportKind,
     bytes: &[u8],
     grant: GrantId,
-    subject: &DeviceKey,
-) -> bool {
+) -> Option<WriteDestination<'a>> {
     let mut hidpp = None;
     let mut feature_id = None;
     for rule in engine.allowed_writes() {
@@ -148,7 +169,7 @@ pub(crate) fn write_allowed(
                             .is_some_and(|tail| tail.iter().all(|&byte| byte == 0)),
                     }
                 {
-                    return true;
+                    return Some(WriteDestination::Collection);
                 }
                 continue;
             }
@@ -157,10 +178,10 @@ pub(crate) fn write_allowed(
         if candidate_role != role {
             continue;
         }
-        let Some((index, command, address, actual, target)) = *hidpp.get_or_insert_with(|| {
+        let Some((index, command, address, actual, destination)) = *hidpp.get_or_insert_with(|| {
             let (index, command, address, actual) = hidpp_fields(kind, bytes)?;
-            let target = engine.hidpp_target(index, subject)?;
-            Some((index, command, address, actual, target))
+            let destination = engine.hidpp_destination(index)?;
+            Some((index, command, address, actual, destination))
         }) else {
             continue;
         };
@@ -170,7 +191,8 @@ pub(crate) fn write_allowed(
                 function,
                 params,
                 ..
-            } if target == HidppTarget::Device
+            } if destination.target() == HidppTarget::Device
+                && command < FIRST_REGISTER_SUB_ID
                 && address & 0x0F == SW_ID
                 && address >> 4 == function
                 && *feature_id.get_or_insert_with(|| engine.feature_id_for_index(index, command))
@@ -193,28 +215,35 @@ pub(crate) fn write_allowed(
                 address: register,
                 params,
                 ..
-            } if target == wanted && command == sub_id && address == register => match params {
-                HidppRegisterParams::Exact(expected) => actual == expected,
-                HidppRegisterParams::EnableNotification { byte, mask } => engine
-                    .hidpp_notification_read(grant, index)
-                    .is_some_and(|mut read| {
-                        let Some(flag) = read.get_mut(byte) else {
-                            return false;
-                        };
-                        if *flag & mask != 0 {
-                            return false;
-                        }
-                        *flag |= mask;
-                        actual == read
-                    }),
-            },
+            } if destination.target() == wanted && command == sub_id && address == register => {
+                match params {
+                    HidppRegisterParams::Exact(expected) => actual == expected,
+                    HidppRegisterParams::EnableNotification { byte, mask } => engine
+                        .hidpp_notification_read(grant, index)
+                        .is_some_and(|mut read| {
+                            let Some(flag) = read.get_mut(byte) else {
+                                return false;
+                            };
+                            if *flag & mask != 0 {
+                                return false;
+                            }
+                            *flag |= mask;
+                            actual == read
+                        }),
+                }
+            }
             _ => false,
         };
         if matched {
-            return true;
+            return Some(match destination {
+                HidppDestination::Device(Some(key)) => WriteDestination::Device(key),
+                HidppDestination::Device(None) | HidppDestination::Receiver => {
+                    WriteDestination::Group
+                }
+            });
         }
     }
-    false
+    None
 }
 
 pub trait Engine {
@@ -241,8 +270,8 @@ pub trait Engine {
         None
     }
 
-    /// HID++ destinations in scope for this grant's (engine-local) subject.
-    fn hidpp_target(&self, _device_index: u8, _subject: &DeviceKey) -> Option<HidppTarget> {
+    /// Resolves a valid HID++ wire destination within this group.
+    fn hidpp_destination(&self, _device_index: u8) -> Option<HidppDestination<'_>> {
         None
     }
 

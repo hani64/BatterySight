@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
 use crate::catalog::Catalog;
-use crate::engine::{Action, Engine, HidppTarget, WriteRule};
+use crate::engine::{Action, Engine, HidppDestination, WriteRule};
 use crate::hid::{Collection, CollectionId, CollectionRole, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{DeviceKey, DeviceKind, DeviceUpdate, Presence, Source, Via};
 use crate::scheduler::{Capabilities, Grant, GrantId, REDISCOVERIES, Trigger};
@@ -36,7 +36,7 @@ use super::discovery::{
     self, Decoder, ERR_CONNECT_FAIL, ERR_RESOURCE_ERROR, ERR_UNKNOWN_DEVICE, Found, IdentityFeatures,
     Next, REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
 };
-use super::frame::{LONG, Reply, SHORT, SW_ID};
+use super::frame::{FIRST_REGISTER_SUB_ID, LONG, Reply, ReplyAddress, SHORT, SW_ID};
 
 /// Timeout of a request to the receiver itself.
 /// Source: Solaar `base.py` `_RECEIVER_REQUEST_TIMEOUT` (0.9 s).
@@ -56,8 +56,6 @@ pub const ACTIVITY_GAP_MS: Ms = 300_000;
 /// not the 0x0005 lookup that followed, while another HID++ client set it up, and broadcast
 /// its battery 1 to 13 s later (owner capture 2026-11-24).
 const REDISCOVERY_DELAYS_MS: [Ms; REDISCOVERIES as usize] = [2_000, 10_000, 60_000];
-/// HID++ 1.0 sub ids from 0x80 up are register access and errors, never a feature reply.
-const FIRST_REGISTER_SUB_ID: u8 = 0x80;
 
 const LOGITECH: u16 = 0x046D;
 
@@ -211,10 +209,21 @@ fn reading_update(key: DeviceKey, r: &Reading, source: Source) -> DeviceUpdate {
     }
 }
 
+/// A short command collection wins over long candidates, but ties fail closed.
+fn command_collection(group: &HidGroup) -> Option<(u8, &Collection)> {
+    let mut short = group.collections.iter().filter(|c| is_short(c));
+    if let Some(c) = short.next() {
+        return short.next().is_none().then_some((SHORT, c));
+    }
+    let mut long = group.collections.iter().filter(|c| is_long(c));
+    let c = long.next()?;
+    long.next().is_none().then_some((LONG, c))
+}
+
 impl HidppEngine {
-    /// A Logitech group with a short or long HID++ collection.
+    /// A Logitech group with a unique preferred HID++ command collection.
     pub fn accepts(group: &HidGroup) -> bool {
-        group.collections.iter().any(Self::reads)
+        command_collection(group).is_some()
     }
 
     /// A short or long HID++ collection: the only collections the engine reads or writes.
@@ -225,19 +234,8 @@ impl HidppEngine {
     /// # Panics
     /// If [`HidppEngine::accepts`] rejects `group`.
     pub fn new(group: &HidGroup, catalog: &Catalog) -> Self {
-        // Requests go out short when the device has a short collection;
-        // long-only devices get long frames for everything.
-        let (report_id, out) = match group.collections.iter().find(|c| is_short(c)) {
-            Some(c) => (SHORT, c),
-            None => (
-                LONG,
-                group
-                    .collections
-                    .iter()
-                    .find(|c| is_long(c))
-                    .expect("HidppEngine::new needs a group it accepts"),
-            ),
-        };
+        let (report_id, out) =
+            command_collection(group).expect("HidppEngine::new needs a group it accepts");
         let quirks = catalog.device(out.vid, out.pid).map(|d| &d.quirks);
         let curve = quirks
             .and_then(|q| q.voltage_curve.as_deref())
@@ -755,20 +753,16 @@ impl Engine for HidppEngine {
         (collection == self.out).then_some(discovery::COMMAND)
     }
 
-    fn hidpp_target(&self, index: u8, subject: &DeviceKey) -> Option<HidppTarget> {
-        let target = if self.receiver {
-            match index {
-                DIRECT if *subject == self.group_key => return Some(HidppTarget::Receiver),
-                index if RECEIVER_SLOTS.contains(&index) => HidppTarget::Device,
-                _ => return None,
-            }
-        } else if index == DIRECT {
-            HidppTarget::Device
-        } else {
-            return None;
-        };
-        (*subject == self.group_key || self.devices.get(&index).is_some_and(|d| d.key == *subject))
-            .then_some(target)
+    fn hidpp_destination(&self, index: u8) -> Option<HidppDestination<'_>> {
+        if self.receiver && index == DIRECT {
+            return Some(HidppDestination::Receiver);
+        }
+        if self.is_direct(index) || (self.receiver && RECEIVER_SLOTS.contains(&index)) {
+            return Some(HidppDestination::Device(
+                self.devices.get(&index).map(|device| &device.key),
+            ));
+        }
+        None
     }
 
     fn feature_id_for_index(&self, index: u8, feature_index: u8) -> Option<u16> {
@@ -856,13 +850,17 @@ impl Engine for HidppEngine {
         }
         let mut actions = Vec::new();
         // Replies may come on either collection of the group.
-        let answer =
-            self.in_flight
-                .iter()
-                .find_map(|(&index, f)| match f.request.reply(bytes, index) {
-                    Reply::NotMine => None,
-                    reply => Some((index, reply)),
-                });
+        let answer = self.in_flight.iter().find_map(|(&index, f)| {
+            let from = if self.is_direct(index) {
+                ReplyAddress::Direct
+            } else {
+                ReplyAddress::Exact(index)
+            };
+            match f.request.reply(bytes, from) {
+                Reply::NotMine => None,
+                reply => Some((index, reply)),
+            }
+        });
         match answer {
             Some((index, reply)) => {
                 if let Some(f) = self.in_flight.remove(&index) {
