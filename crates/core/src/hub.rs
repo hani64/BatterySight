@@ -51,8 +51,9 @@ pub enum HubOutput {
 type EngineFactory = Box<dyn Fn(&HidGroup, &Catalog) -> Option<Box<dyn Engine>>>;
 
 /// A group key gets its arrival conversation, `Rediscovery` grants while its engine
-/// registered no device, an arrival again on resume or refresh in that case, and the
-/// `Connected` grants its engine asks for (e.g. to discover a newly paired device).
+/// registered no device, an arrival again on resume or refresh in that case (never for a
+/// catalog `query_wakes` device), and the `Connected` grants its engine asks for (e.g. to
+/// discover a newly paired device).
 const GROUP_CAPS: Capabilities = Capabilities {
     pushes_battery: false,
     query_wakes: false,
@@ -297,20 +298,28 @@ impl Hub {
         let empty: Vec<(GroupId, DeviceKey)> = self
             .engines
             .iter()
-            .filter(|&(&gid, _)| !self.registers_any(gid))
+            .filter(|&(&gid, _)| self.rediscoverable(gid))
             .map(|(&gid, slot)| (gid, slot.key.clone()))
             .collect();
         for (gid, key) in empty {
-            if self.engines.contains_key(&gid) && !self.registers_any(gid) {
+            if self.rediscoverable(gid) {
                 self.scheduler.rearm_arrival(&key);
                 self.grant(gid, &key, Trigger::Arrival, now, pass);
             }
         }
     }
 
-    /// Whether `gid`'s engine is a registrant of any device.
-    fn registers_any(&self, gid: GroupId) -> bool {
-        self.owners.values().any(|groups| groups.contains(&gid))
+    /// Whether `gid`'s group may be discovered again: it is live, its engine registers no
+    /// device, and its catalog entry does not say that a query wakes it.
+    fn rediscoverable(&self, gid: GroupId) -> bool {
+        let Some(slot) = self.engines.get(&gid) else {
+            return false;
+        };
+        let query_wakes = slot
+            .ids
+            .and_then(|(vid, pid)| self.catalog.device(vid, pid))
+            .is_some_and(|device| device.quirks.query_wakes);
+        !query_wakes && !self.owners.values().any(|groups| groups.contains(&gid))
     }
 
     /// Requests a grant on `key` and, if the scheduler allows it, hands it to `gid`'s engine.
@@ -502,7 +511,7 @@ impl Hub {
                     self.grant(gid, &key, Trigger::Connected, now, pass);
                 }
                 Action::Rediscover => {
-                    if !self.registers_any(gid)
+                    if self.rediscoverable(gid)
                         && let Some(key) = self.engines.get(&gid).map(|slot| slot.key.clone())
                     {
                         self.grant(gid, &key, Trigger::Rediscovery, now, pass);
@@ -731,6 +740,16 @@ kind = "mouse"
 engine = "hidpp"
 status = "source-verified"
 source = "test"
+
+[[device]]
+name = "Wakes On Query"
+vid = 0x046D
+pids = [0x0AAB]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "test"
+quirks = { query_wakes = true }
 "#;
 
     fn fake() -> Fake {
@@ -1101,6 +1120,20 @@ source = "test"
         hub.handle(report(1), 1);
 
         assert_eq!(grants(&f), vec![(group_key(1), Trigger::Arrival)]);
+    }
+
+    #[test]
+    fn group_with_query_wakes_quirk_is_not_rediscovered() {
+        let f = fake();
+        f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        let mut hub = hub(&[(3, &f)]);
+        hub.handle(HubInput::GroupArrived(group(3, 0x046D, 0x0AAB)), 0);
+
+        hub.handle(report(3), 1);
+        hub.handle(HubInput::Resume, 2);
+        hub.handle(HubInput::RefreshNow, 3);
+
+        assert_eq!(grants(&f), vec![(group_key(3), Trigger::Arrival)]);
     }
 
     #[test]
