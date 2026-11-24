@@ -25,7 +25,8 @@ pub enum Trigger {
     Resume,
     /// Explicit "Refresh now" command.
     RefreshNow,
-    /// User or audio activity observed on the device. Refused while the device is asleep
+    /// User or audio activity observed on the device, or a charging device's timed read (the
+    /// hub asks it when the gap allows, without activity). Refused while the device is asleep
     /// and never wakes it: a headset's dongle plays audio with the headset off, so activity
     /// proves nothing about the device itself.
     Activity,
