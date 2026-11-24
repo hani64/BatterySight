@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::{Catalog, EngineKind};
 use crate::engine::{Action, Engine};
+use crate::engines;
 use crate::hid::{CollectionId, GroupId, HidGroup};
 use crate::model::{
     Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, Verification, Via,
@@ -39,12 +40,20 @@ pub enum HubOutput {
     },
     /// The snapshot changed during this call.
     StateChanged,
+    /// The discovery of the group with key `group` registered no device; it is retried at
+    /// `retry_at`, or not at all until the next arrival, resume or refresh (`None`).
+    DiscoveryFailed {
+        group: DeviceKey,
+        retry_at: Option<Ms>,
+    },
 }
 
 type EngineFactory = Box<dyn Fn(&HidGroup, &Catalog) -> Option<Box<dyn Engine>>>;
 
-/// A group key only ever gets its one arrival conversation, plus `Connected`
-/// grants its engine asks for (e.g. to discover a newly paired device).
+/// A group key gets its arrival conversation, `Rediscovery` grants while its engine
+/// registered no device, an arrival again on resume or refresh in that case (never for a
+/// catalog `query_wakes` device), and the `Connected` grants its engine asks for (e.g. to
+/// discover a newly paired device).
 const GROUP_CAPS: Capabilities = Capabilities {
     pushes_battery: false,
     query_wakes: false,
@@ -64,6 +73,9 @@ struct Slot {
     /// HID product string, the name of a device whose engine gives none.
     product: String,
     collections: Vec<CollectionId>,
+    /// Hub keys of devices this engine registered under a shared key another live group
+    /// already held (see [`Hub::claim`]), by the engine's own key, which it keeps using.
+    aliases: BTreeMap<DeviceKey, DeviceKey>,
 }
 
 /// The fields of an [`Action::Register`].
@@ -159,6 +171,22 @@ impl Hub {
             .min()
     }
 
+    /// The registered devices `group`'s engine currently owns, ordered by key: those an
+    /// [`HubInput::Activity`] on the group's physical device would reach.
+    pub fn keys_of(&self, group: GroupId) -> Vec<DeviceKey> {
+        self.owners
+            .iter()
+            .filter(|(_, groups)| groups.last() == Some(&group))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// When an [`HubInput::Activity`] for `key` may next be granted; `None` while none can
+    /// be (unknown device, one that pushes its battery, or one asleep).
+    pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
+        self.scheduler.activity_ready_at(key)
+    }
+
     fn arrive(&mut self, group: &HidGroup, now: Ms, pass: &mut Pass) {
         // The same id again means the old handles are gone.
         self.remove_group(group.id, now, pass);
@@ -179,6 +207,7 @@ impl Hub {
                 ids: first.map(|c| (c.vid, c.pid)),
                 product: first.map(|c| c.product.clone()).unwrap_or_default(),
                 collections,
+                aliases: BTreeMap::new(),
             },
         );
         self.scheduler.register(key.clone(), GROUP_CAPS);
@@ -252,7 +281,8 @@ impl Hub {
         }
     }
 
-    /// Asks the scheduler for `trigger` on every registered device (never group keys).
+    /// Asks the scheduler for `trigger` on every registered device, then discovers each
+    /// group whose engine registered no device again, as on its arrival.
     fn request_all(&mut self, trigger: Trigger, now: Ms, pass: &mut Pass) {
         let devices: Vec<(DeviceKey, GroupId)> = self
             .owners
@@ -265,6 +295,31 @@ impl Hub {
                 self.grant(gid, &key, trigger, now, pass);
             }
         }
+        let empty: Vec<(GroupId, DeviceKey)> = self
+            .engines
+            .iter()
+            .filter(|&(&gid, _)| self.rediscoverable(gid))
+            .map(|(&gid, slot)| (gid, slot.key.clone()))
+            .collect();
+        for (gid, key) in empty {
+            if self.rediscoverable(gid) {
+                self.scheduler.rearm_arrival(&key);
+                self.grant(gid, &key, Trigger::Arrival, now, pass);
+            }
+        }
+    }
+
+    /// Whether `gid`'s group may be discovered again: it is live, its engine registers no
+    /// device, and its catalog entry does not say that a query wakes it.
+    fn rediscoverable(&self, gid: GroupId) -> bool {
+        let Some(slot) = self.engines.get(&gid) else {
+            return false;
+        };
+        let query_wakes = slot
+            .ids
+            .and_then(|(vid, pid)| self.catalog.device(vid, pid))
+            .is_some_and(|device| device.quirks.query_wakes);
+        !query_wakes && !self.owners.values().any(|groups| groups.contains(&gid))
     }
 
     /// Requests a grant on `key` and, if the scheduler allows it, hands it to `gid`'s engine.
@@ -273,10 +328,13 @@ impl Hub {
         if pass.depth > MAX_NESTED_GRANTS {
             return;
         }
-        let Some(grant) = self.scheduler.request(key, trigger, now) else {
+        let Some(mut grant) = self.scheduler.request(key, trigger, now) else {
             return;
         };
         if let Some(slot) = self.engines.get_mut(&gid) {
+            if let Some((own, _)) = slot.aliases.iter().find(|(_, hub)| **hub == grant.subject) {
+                grant.subject = own.clone();
+            }
             let actions = slot.engine.on_grant(&grant, now);
             pass.depth += 1;
             self.apply(gid, actions, now, pass);
@@ -300,6 +358,70 @@ impl Hub {
                 .find(|(_, slot)| slot.key == *key)
                 .map(|(&gid, _)| gid)
         })
+    }
+
+    /// The hub key of the device `gid`'s engine calls `key`.
+    fn hub_key(&self, gid: GroupId, key: DeviceKey) -> DeviceKey {
+        self.engines
+            .get(&gid)
+            .and_then(|slot| slot.aliases.get(&key))
+            .cloned()
+            .unwrap_or(key)
+    }
+
+    /// The hub key `gid`'s engine registers `key` under. A key that may be shared
+    /// ([`engines::shared_key`]) held by another live group becomes the first `key#n`,
+    /// n ≥ 2, no other live group holds; any other key is kept as is, so one device served
+    /// by several groups stays one entry. Recomputed on every registration: a device that
+    /// got `#2` keeps it until it registers again. A device `gid` alone served under an
+    /// earlier hub key for `key` moves to the new key with its last values, replacing what
+    /// another device left there in grace; one shared with other groups loses `gid` as a
+    /// registrant instead.
+    fn claim(&mut self, gid: GroupId, key: DeviceKey, now: Ms, pass: &mut Pass) -> DeviceKey {
+        if !engines::shared_key(&key) {
+            return key;
+        }
+        let held_elsewhere = |k: &DeviceKey| {
+            self.owners
+                .get(k)
+                .is_some_and(|groups| groups.iter().any(|&g| g != gid))
+        };
+        let mut claimed = key.clone();
+        let mut n = 1;
+        while held_elsewhere(&claimed) {
+            n += 1;
+            claimed = DeviceKey(format!("{}#{n}", key.0));
+        }
+        let previous = self.hub_key(gid, key.clone());
+        if previous != claimed {
+            if self
+                .owners
+                .get(&previous)
+                .is_some_and(|groups| groups.as_slice() == [gid])
+            {
+                self.owners.remove(&previous);
+                self.grace.remove(&previous);
+                self.scheduler.unregister(&previous);
+                if self.grace.remove(&claimed).is_some() {
+                    self.scheduler.unregister(&claimed);
+                }
+                if let Some(mut state) = self.states.remove(&previous) {
+                    state.key = claimed.clone();
+                    self.states.insert(claimed.clone(), state);
+                }
+                pass.changed = true;
+            } else {
+                self.drop_registrant(&previous, gid, now, pass);
+            }
+        }
+        if let Some(slot) = self.engines.get_mut(&gid) {
+            if claimed == key {
+                slot.aliases.remove(&key);
+            } else {
+                slot.aliases.insert(key, claimed.clone());
+            }
+        }
+        claimed
     }
 
     /// Carries out `actions` from `gid`'s engine. Actions on devices or
@@ -333,6 +455,7 @@ impl Hub {
                     self.register(gid, registration, now, pass);
                 }
                 Action::Unregister(key) => {
+                    let key = self.hub_key(gid, key);
                     if self
                         .owners
                         .get(&key)
@@ -341,11 +464,16 @@ impl Hub {
                         self.drop_registrant(&key, gid, now, pass);
                     }
                 }
-                Action::Update(update) => {
+                Action::Update(mut update) => {
+                    update.key = self.hub_key(gid, update.key);
                     if self.device_owner(&update.key) != Some(gid) {
                         continue;
                     }
                     self.note_presence(&update.key, update.presence);
+                    // A fresh level (pushed or queried) is as good as an activity read.
+                    if update.level.is_some() {
+                        self.scheduler.note_read(&update.key, now);
+                    }
                     if let Some(state) = self.states.get_mut(&update.key) {
                         state.apply(&update, now);
                         if update.presence.is_none() {
@@ -355,6 +483,7 @@ impl Hub {
                     }
                 }
                 Action::Asleep(key) => {
+                    let key = self.hub_key(gid, key);
                     if self.device_owner(&key) != Some(gid) {
                         continue;
                     }
@@ -367,6 +496,7 @@ impl Hub {
                     }
                 }
                 Action::Connected(key) => {
+                    let key = self.hub_key(gid, key);
                     if self.owner(&key) != Some(gid) {
                         continue;
                     }
@@ -379,6 +509,21 @@ impl Hub {
                         pass.changed = true;
                     }
                     self.grant(gid, &key, Trigger::Connected, now, pass);
+                }
+                Action::Rediscover => {
+                    if self.rediscoverable(gid)
+                        && let Some(key) = self.engines.get(&gid).map(|slot| slot.key.clone())
+                    {
+                        self.grant(gid, &key, Trigger::Rediscovery, now, pass);
+                    }
+                }
+                Action::DiscoveryFailed { retry_at } => {
+                    if let Some(slot) = self.engines.get(&gid) {
+                        pass.out.push(HubOutput::DiscoveryFailed {
+                            group: slot.key.clone(),
+                            retry_at,
+                        });
+                    }
                 }
             }
         }
@@ -395,6 +540,10 @@ impl Hub {
             initial,
             wpid,
         } = registration;
+        if !self.engines.contains_key(&gid) {
+            return;
+        }
+        let key = self.claim(gid, key, now, pass);
         let Some(slot) = self.engines.get(&gid) else {
             return;
         };
@@ -407,6 +556,9 @@ impl Hub {
         groups.push(gid);
         self.grace.remove(&key);
         self.scheduler.register(key.clone(), caps);
+        // The discovery that registered the device read its battery: audio already playing
+        // waits the device's gap before asking again.
+        self.scheduler.note_read(&key, now);
         self.note_presence(&key, initial.presence);
 
         let state = self
@@ -588,6 +740,16 @@ kind = "mouse"
 engine = "hidpp"
 status = "source-verified"
 source = "test"
+
+[[device]]
+name = "Wakes On Query"
+vid = 0x046D
+pids = [0x0AAB]
+kind = "headset"
+engine = "hidpp"
+status = "source-verified"
+source = "test"
+quirks = { query_wakes = true }
 "#;
 
     fn fake() -> Fake {
@@ -685,11 +847,13 @@ source = "test"
         })
     }
 
+    /// A device that pushes its battery. Its gap would allow activity reads, so only the
+    /// pushing rule refuses them.
     fn pushing() -> Capabilities {
         Capabilities {
             pushes_battery: true,
             query_wakes: false,
-            min_query_gap_ms: 0,
+            min_query_gap_ms: 300_000,
         }
     }
 
@@ -737,7 +901,7 @@ source = "test"
         out.iter()
             .filter_map(|o| match o {
                 HubOutput::Send { bytes, .. } => Some(bytes.clone()),
-                HubOutput::StateChanged => None,
+                HubOutput::StateChanged | HubOutput::DiscoveryFailed { .. } => None,
             })
             .collect()
     }
@@ -854,7 +1018,7 @@ source = "test"
     }
 
     #[test]
-    fn resume_requests_grants_for_registered_devices_only() {
+    fn resume_and_refresh_read_registered_devices_and_rediscover_empty_groups() {
         let f = fake();
         let a = dev("dev-a");
         f.borrow_mut().on_grant.push_back(vec![register(&a, None)]);
@@ -862,13 +1026,17 @@ source = "test"
             .on_grant
             .push_back(vec![send(THIS_GRANT, coll(1), 0xD0)]);
         let idle = fake();
+        idle.borrow_mut().on_grant.push_back(Vec::new());
+        idle.borrow_mut()
+            .on_grant
+            .push_back(vec![send(THIS_GRANT, coll(2), 0xD2)]);
         let mut hub = hub(&[(1, &f), (2, &idle)]);
         hub.handle(logi(1), 0);
         hub.handle(logi(2), 0);
 
         let out = hub.handle(HubInput::Resume, 1_000);
 
-        assert_eq!(sends(&out), vec![vec![0xD0]]);
+        assert_eq!(sends(&out), vec![vec![0xD0], vec![0xD2]]);
         assert_eq!(
             grants(&f),
             vec![
@@ -876,11 +1044,125 @@ source = "test"
                 (a.clone(), Trigger::Resume)
             ]
         );
-        assert_eq!(grants(&idle), vec![(group_key(2), Trigger::Arrival)]);
+        // The group that registered nothing is discovered again, as on arrival.
+        assert_eq!(
+            grants(&idle),
+            vec![
+                (group_key(2), Trigger::Arrival),
+                (group_key(2), Trigger::Arrival)
+            ]
+        );
 
         hub.handle(HubInput::RefreshNow, 2_000);
         assert_eq!(grants(&f).last(), Some(&(a, Trigger::RefreshNow)));
-        assert_eq!(grants(&idle).len(), 1);
+        assert_eq!(grants(&f).len(), 3);
+        assert_eq!(grants(&idle).len(), 3);
+        assert_eq!(
+            grants(&idle).last(),
+            Some(&(group_key(2), Trigger::Arrival))
+        );
+    }
+
+    #[test]
+    fn rediscover_is_granted_three_times_to_a_group_without_devices() {
+        let f = fake();
+        for _ in 0..4 {
+            f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        }
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        for now in 1..=4 {
+            hub.handle(report(1), now);
+        }
+
+        let rediscovery = (group_key(1), Trigger::Rediscovery);
+        assert_eq!(
+            grants(&f),
+            vec![
+                (group_key(1), Trigger::Arrival),
+                rediscovery.clone(),
+                rediscovery.clone(),
+                rediscovery
+            ]
+        );
+
+        // A refresh starts over: one arrival grant, then three rediscoveries again.
+        hub.handle(HubInput::RefreshNow, 5);
+        for _ in 0..4 {
+            f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        }
+        for now in 6..=9 {
+            hub.handle(report(1), now);
+        }
+        let after: Vec<Trigger> = grants(&f)[4..].iter().map(|(_, t)| *t).collect();
+        assert_eq!(
+            after,
+            [
+                Trigger::Arrival,
+                Trigger::Rediscovery,
+                Trigger::Rediscovery,
+                Trigger::Rediscovery
+            ]
+        );
+    }
+
+    #[test]
+    fn rediscover_is_refused_to_a_group_with_a_registered_device() {
+        let f = fake();
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&dev("dev-a"), None)]);
+        f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        hub.handle(report(1), 1);
+
+        assert_eq!(grants(&f), vec![(group_key(1), Trigger::Arrival)]);
+    }
+
+    #[test]
+    fn group_with_query_wakes_quirk_is_not_rediscovered() {
+        let f = fake();
+        f.borrow_mut().on_report.push_back(vec![Action::Rediscover]);
+        let mut hub = hub(&[(3, &f)]);
+        hub.handle(HubInput::GroupArrived(group(3, 0x046D, 0x0AAB)), 0);
+
+        hub.handle(report(3), 1);
+        hub.handle(HubInput::Resume, 2);
+        hub.handle(HubInput::RefreshNow, 3);
+
+        assert_eq!(grants(&f), vec![(group_key(3), Trigger::Arrival)]);
+    }
+
+    #[test]
+    fn discovery_failure_is_reported_with_the_group_key() {
+        let f = fake();
+        f.borrow_mut().on_report.push_back(vec![
+            Action::DiscoveryFailed {
+                retry_at: Some(2_001),
+            },
+            Action::DiscoveryFailed { retry_at: None },
+        ]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        let out = hub.handle(report(1), 1);
+
+        assert_eq!(
+            out,
+            vec![
+                HubOutput::DiscoveryFailed {
+                    group: group_key(1),
+                    retry_at: Some(2_001),
+                },
+                HubOutput::DiscoveryFailed {
+                    group: group_key(1),
+                    retry_at: None,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -907,9 +1189,11 @@ source = "test"
     fn removal_keeps_state_for_grace_then_drops() {
         let f = fake();
         let a = dev("dev-a");
-        f.borrow_mut()
-            .on_grant
-            .push_back(vec![register(&a, Some(Level::Percent(50)))]);
+        f.borrow_mut().on_grant.push_back(vec![register_with(
+            &a,
+            activity_gap(),
+            Some(Level::Percent(50)),
+        )]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
 
@@ -922,10 +1206,13 @@ source = "test"
         let out = hub.handle(HubInput::Tick, 1_000 + 59_999);
         assert!(out.is_empty(), "{out:?}");
         assert!(state(&hub, &a).is_some());
+        // The scheduler keeps the device through the grace.
+        assert_eq!(hub.activity_ready_at(&a), Some(100_000));
 
         let out = hub.handle(HubInput::Tick, 1_000 + 60_000);
         assert_eq!(out, vec![HubOutput::StateChanged]);
         assert!(hub.snapshot().is_empty());
+        assert_eq!(hub.activity_ready_at(&a), None, "scheduler forgot it");
     }
 
     #[test]
@@ -1173,75 +1460,95 @@ source = "test"
         let out = hub.handle(report(1), 2);
 
         assert_eq!(out, vec![HubOutput::StateChanged]);
-        assert_eq!(grants(&f).len(), 2, "both Connected requests are refused");
-        for key in [&a, &wakes] {
-            assert_eq!(state(&hub, key).unwrap().presence, Presence::Online);
-            assert!(!hub.scheduler.is_asleep(key));
-        }
-        hub.handle(HubInput::RefreshNow, 10_000);
+        // The min gap limits only activity; a query-waking device is never asked on a link-up.
         assert_eq!(
             grants(&f),
             vec![
                 (group_key(1), Trigger::Arrival),
                 (a.clone(), Trigger::RefreshNow),
-                (a, Trigger::RefreshNow),
+                (a.clone(), Trigger::Connected),
             ]
+        );
+        for key in [&a, &wakes] {
+            assert_eq!(state(&hub, key).unwrap().presence, Presence::Online);
+            assert!(!hub.scheduler.is_asleep(key));
+        }
+    }
+
+    /// A device that is read on activity, at most every 100 s.
+    fn activity_gap() -> Capabilities {
+        Capabilities {
+            pushes_battery: false,
+            min_query_gap_ms: 100_000,
+            ..pushing()
+        }
+    }
+
+    #[test]
+    fn registration_restarts_the_activity_gap() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
+        let mut hub = hub(&[(1, &f)]);
+        // The discovery that registers a device reads its battery: audio already playing
+        // must not ask again at once.
+        hub.handle(logi(1), 1_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(101_000));
+
+        hub.handle(HubInput::Activity(a.clone()), 100_999);
+        hub.handle(HubInput::Activity(a.clone()), 101_000);
+
+        assert_eq!(
+            grants(&f),
+            vec![(group_key(1), Trigger::Arrival), (a, Trigger::Activity)]
         );
     }
 
     #[test]
-    fn reregister_within_grace_keeps_scheduler_history() {
+    fn reregister_within_grace_restarts_the_activity_gap() {
         let a = dev("dev-a");
-        let gap = Capabilities {
-            min_query_gap_ms: 100_000,
-            ..pushing()
-        };
         let (first, second) = (fake(), fake());
         first
             .borrow_mut()
             .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
         second
             .borrow_mut()
             .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
         let mut hub = hub(&[(1, &first), (2, &second)]);
         hub.handle(logi(1), 0);
         hub.handle(HubInput::RefreshNow, 0);
         hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
         hub.handle(logi(2), 2_000);
 
-        hub.handle(HubInput::RefreshNow, 3_000);
-
+        hub.handle(HubInput::Activity(a.clone()), 101_999);
         assert_eq!(grants(&second), vec![(group_key(2), Trigger::Arrival)]);
+        hub.handle(HubInput::Activity(a.clone()), 102_000);
+        assert_eq!(grants(&second).last(), Some(&(a, Trigger::Activity)));
     }
 
     #[test]
-    fn grace_expiry_forgets_scheduler_history() {
-        let a = dev("dev-a");
-        let gap = Capabilities {
-            min_query_gap_ms: 100_000,
-            ..pushing()
-        };
-        let (first, second) = (fake(), fake());
-        first
-            .borrow_mut()
-            .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
-        second
-            .borrow_mut()
-            .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
-        let mut hub = hub(&[(1, &first), (2, &second)]);
+    fn activity_ready_at_is_none_for_devices_activity_cannot_reach() {
+        let f = fake();
+        let (poll, push) = (dev("poll"), dev("push"));
+        f.borrow_mut().on_grant.push_back(vec![
+            register_with(&poll, activity_gap(), None),
+            register(&push, None),
+        ]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Asleep(poll.clone())]);
+        let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
-        hub.handle(HubInput::RefreshNow, 0);
-        hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
-        hub.handle(HubInput::Tick, 61_000);
-        hub.handle(logi(2), 62_000);
+        assert_eq!(hub.activity_ready_at(&poll), Some(100_000));
+        assert_eq!(hub.activity_ready_at(&push), None, "pushes");
+        assert_eq!(hub.activity_ready_at(&dev("unknown")), None);
 
-        hub.handle(HubInput::RefreshNow, 63_000);
-
-        assert_eq!(grants(&second).last(), Some(&(a, Trigger::RefreshNow)));
+        hub.handle(report(1), 1);
+        assert_eq!(hub.activity_ready_at(&poll), None, "asleep");
     }
 
     #[test]
@@ -1266,24 +1573,69 @@ source = "test"
     fn activity_requests_grant_unless_device_pushes() {
         let f = fake();
         let (poll, push) = (dev("poll"), dev("push"));
-        let polled = Capabilities {
-            pushes_battery: false,
-            ..pushing()
-        };
         f.borrow_mut().on_grant.push_back(vec![
-            register_with(&poll, polled, None),
+            register_with(&poll, activity_gap(), None),
             register(&push, None),
         ]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
 
-        hub.handle(HubInput::Activity(push), 10);
-        hub.handle(HubInput::Activity(poll.clone()), 10);
+        hub.handle(HubInput::Activity(push), 100_000);
+        hub.handle(HubInput::Activity(poll.clone()), 100_000);
 
         assert_eq!(
             grants(&f),
             vec![(group_key(1), Trigger::Arrival), (poll, Trigger::Activity)]
         );
+    }
+
+    #[test]
+    fn a_reading_restarts_the_activity_gap() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
+        // A headset switched on during playback broadcasts its level: no read right after.
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&a, 80)]);
+        // A presence change alone is no reading.
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Update(DeviceUpdate {
+                presence: Some(Presence::Online),
+                ..update(&a)
+            })]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+        assert_eq!(hub.activity_ready_at(&a), Some(100_000));
+
+        hub.handle(report(1), 50_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(150_000));
+        hub.handle(report(1), 60_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(150_000));
+    }
+
+    #[test]
+    fn keys_of_lists_devices_the_group_owns() {
+        let (f1, f2) = (fake(), fake());
+        let (a, b) = (dev("a"), dev("b"));
+        f1.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&a, None), register(&b, None)]);
+        f2.borrow_mut().on_grant.push_back(vec![register(&b, None)]);
+        let mut hub = hub(&[(1, &f1), (2, &f2)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+
+        // `b` moved to group 2; group keys are not devices.
+        assert_eq!(hub.keys_of(GroupId(1)), std::slice::from_ref(&a));
+        assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&b));
+        assert!(hub.keys_of(GroupId(3)).is_empty());
+
+        hub.handle(HubInput::GroupRemoved(GroupId(2)), 1);
+        assert_eq!(hub.keys_of(GroupId(1)), [a, b]);
     }
 
     #[test]
@@ -1442,5 +1794,112 @@ source = "test"
         hub.handle(logi(1), 0);
 
         assert_eq!(grants(&f).len(), 1 + MAX_NESTED_GRANTS);
+    }
+
+    #[test]
+    fn duplicate_fallback_keys_get_suffix() {
+        let k = dev("logi:0ABA:255");
+        let (k2, k3) = (dev("logi:0ABA:255#2"), dev("logi:0ABA:255#3"));
+        let (first, second, third) = (fake(), fake(), fake());
+        first
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, Some(Level::Percent(90)))]);
+        for f in [&second, &third] {
+            f.borrow_mut().on_grant.push_back(vec![register(&k, None)]);
+        }
+        second
+            .borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&k, 40)]);
+        second
+            .borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&k, 39)]);
+        // Registers again without a reading (e.g. the device is asleep).
+        let Action::Register {
+            caps,
+            mut initial,
+            wpid,
+            ..
+        } = register(&k, None)
+        else {
+            unreachable!()
+        };
+        initial.presence = Some(Presence::Asleep);
+        second
+            .borrow_mut()
+            .on_report
+            .push_back(vec![Action::Register {
+                key: k.clone(),
+                caps,
+                initial,
+                wpid,
+            }]);
+        third
+            .borrow_mut()
+            .on_report
+            .push_back(vec![Action::Unregister(k.clone())]);
+        let mut hub = hub(&[(1, &first), (2, &second), (3, &third)]);
+        // Two identical dongles without unit ids, then a third.
+        for id in 1..=3 {
+            hub.handle(HubInput::GroupArrived(group(id, 0x046D, 0x0ABA)), 0);
+        }
+        let keys: Vec<DeviceKey> = hub.snapshot().into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, [k.clone(), k2.clone(), k3.clone()]);
+        assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&k2));
+
+        // The engine keeps speaking its own key; the hub maps it both ways.
+        hub.handle(report(2), 10);
+        assert_eq!(state(&hub, &k2).unwrap().level, Some(Level::Percent(40)));
+        assert_eq!(state(&hub, &k).unwrap().level, Some(Level::Percent(90)));
+        hub.handle(HubInput::RefreshNow, 20);
+        assert_eq!(
+            grants(&second).last(),
+            Some(&(k.clone(), Trigger::RefreshNow))
+        );
+        assert_eq!(
+            grants(&first).last(),
+            Some(&(k.clone(), Trigger::RefreshNow))
+        );
+        hub.handle(report(3), 30);
+        assert_eq!(state(&hub, &k3).unwrap().presence, Presence::Offline);
+
+        // The first leaves: the second keeps `#2` until it registers again.
+        hub.handle(HubInput::GroupRemoved(GroupId(1)), 40);
+        hub.handle(report(2), 50);
+        assert_eq!(state(&hub, &k2).unwrap().level, Some(Level::Percent(39)));
+        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Offline);
+        hub.handle(report(2), 60);
+        assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&k));
+        // It takes its own last values along, not those the first device left behind.
+        let s = state(&hub, &k).unwrap();
+        assert_eq!(s.level, Some(Level::Percent(39)));
+        assert_eq!(s.presence, Presence::Asleep);
+        let keys: Vec<DeviceKey> = hub.snapshot().into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, [k.clone(), k3.clone()], "no `#2` entry left behind");
+        // The first device's grace no longer applies to the key.
+        hub.handle(HubInput::Tick, 40 + REMOVAL_GRACE_MS);
+        assert!(state(&hub, &k).is_some());
+    }
+
+    #[test]
+    fn unit_keys_are_never_suffixed() {
+        let k = dev("logi:unit:1A2B3C4D");
+        let (receiver, cable) = (fake(), fake());
+        receiver
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        cable
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        let mut hub = hub(&[(1, &receiver), (2, &cable)]);
+        hub.handle(HubInput::GroupArrived(group(1, 0x046D, 0xC547)), 0);
+        hub.handle(HubInput::GroupArrived(group(2, 0x046D, 0xC547)), 0);
+
+        let keys: Vec<DeviceKey> = hub.snapshot().into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, std::slice::from_ref(&k));
     }
 }

@@ -3,8 +3,15 @@
 //! The device thread owns the [`Reactor`], the HID and power notification registrations and
 //! the [`Hub`]; none of them leave it. Other threads see the devices through the
 //! [`Snapshot`] and talk to the thread through a [`RuntimeHandle`].
+//!
+//! While audio plays to a physical device (its container has an active audio session and a
+//! peak level of at least -60 dBFS), the device thread hands the hub an activity input for
+//! each of that device's registered devices as soon as the scheduler would grant one (for
+//! the PRO X Wireless, 5 minutes after its last read). Devices the scheduler would refuse
+//! (asleep, or pushing their battery) are not metered. Without an active session it sets no
+//! deadline for this, so a silent PC never wakes the thread.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15,13 +22,14 @@ use batterysight_core::catalog::Catalog;
 use batterysight_core::engines;
 use batterysight_core::hid::{CollectionId, GroupId, HidGroup};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
-use batterysight_core::model::DeviceState;
+use batterysight_core::model::{DeviceKey, DeviceState};
 use batterysight_core::scheduler::Policy;
 use batterysight_core::time::Ms;
 use windows::Win32::Foundation::E_UNEXPECTED;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
-use crate::hid_enum::{self, HidInterface};
+use crate::audio::{self, Mta};
+use crate::hid_enum::{self, ContainerId, HidInterface};
 use crate::notify::register_hid_notifications;
 use crate::power::register_power;
 use crate::reactor::{OsEvent, Poster, Reactor};
@@ -104,14 +112,23 @@ pub fn start(on_change: Box<dyn Fn() + Send>) -> windows::core::Result<RuntimeHa
     })
 }
 
-/// Sets up the reactor and the notifications, reports the outcome on `ready`, then runs
-/// until told to stop. Everything is released before it returns.
+/// Enters the multithreaded apartment, sets up the reactor and the notifications, reports
+/// the outcome on `ready`, starts watching audio activity, then runs until told to stop.
+/// Everything is released before it returns.
 fn device_thread(
     ready: &SyncSender<windows::core::Result<Poster>>,
     commands: &Receiver<Command>,
     states: Arc<Mutex<Vec<DeviceState>>>,
     on_change: Box<dyn Fn() + Send>,
 ) {
+    // Left last, after every COM object of this thread (`audio::peak` creates them) is gone.
+    let _mta = match Mta::enter() {
+        Ok(mta) => mta,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     let setup = Reactor::new().and_then(|reactor| {
         // Registered before the first enumeration so that no arrival is missed.
         let notify = register_hid_notifications(reactor.poster())?;
@@ -126,12 +143,23 @@ fn device_thread(
         }
     };
     let _ = ready.send(Ok(reactor.poster()));
+    // Without it no device is read on audio activity; every other trigger still works.
+    let _audio = audio::start(reactor.poster())
+        .inspect_err(|_| {
+            reactor
+                .poster()
+                .post(OsEvent::AudioUnavailable { stage: "thread" });
+        })
+        .ok();
     Device {
         hub: Hub::new(Catalog::builtin(), Policy::default()),
         reactor,
         groups: Vec::new(),
         products: HashMap::new(),
         guard: ReadFailureGuard::default(),
+        release_at: None,
+        held: BTreeMap::new(),
+        audio: AudioActivity::default(),
         trace: Trace::from_env(),
         states,
         on_change,
@@ -155,6 +183,8 @@ struct Opened {
     paths: PathSet,
     /// The collections opened, as the hub knows them.
     collections: Vec<CollectionId>,
+    /// The physical device's container id, which its audio endpoints share.
+    container: Option<ContainerId>,
 }
 
 /// The device thread's state.
@@ -164,12 +194,60 @@ struct Device {
     groups: Vec<Opened>,
     /// Product strings by lowercased path; each is read from the device until a read succeeds.
     products: HashMap<String, String>,
-    /// Keeps a group closed after back-to-back read failures until the next arrival,
-    /// resume or refresh.
+    /// Keeps a group closed after back-to-back read failures until the next arrival, resume
+    /// or refresh, and holds back one reopened too often in the last minute.
     guard: ReadFailureGuard,
+    /// When the first present group the reopen cap holds back may open; the device thread
+    /// rescans once then.
+    release_at: Option<Ms>,
+    /// The present groups the reopen cap held back at the last scan, with their release.
+    held: BTreeMap<PathSet, Ms>,
+    audio: AudioActivity,
     trace: Option<Trace>,
     states: Arc<Mutex<Vec<DeviceState>>>,
     on_change: Box<dyn Fn() + Send>,
+}
+
+/// What the device thread knows about audio playing to the devices.
+#[derive(Default)]
+struct AudioActivity {
+    /// Containers whose render endpoints have an active audio session.
+    active: BTreeSet<ContainerId>,
+    /// Active containers found silent, and when to look at them again.
+    silent: HashMap<ContainerId, Silence>,
+}
+
+/// An active container found silent at its last check.
+struct Silence {
+    /// When to look at it again.
+    until: Ms,
+    /// How long it waits after that check; doubles up to [`SILENT_RECHECK_MAX_MS`].
+    wait: Ms,
+}
+
+impl AudioActivity {
+    /// Records whether `container` has an active audio session.
+    fn set(&mut self, container: ContainerId, active: bool) {
+        if active {
+            self.active.insert(container);
+        } else {
+            self.active.remove(&container);
+            self.silent.remove(&container);
+        }
+    }
+
+    /// `container` was silent at `now`: looked at again [`SILENT_RECHECK_MS`] later, twice
+    /// as late after each further silent check, at most [`SILENT_RECHECK_MAX_MS`] later.
+    fn silent_at(&mut self, container: ContainerId, now: Ms) {
+        let wait = self
+            .silent
+            .get(&container)
+            .map_or(SILENT_RECHECK_MS, |silence| {
+                silence.wait.saturating_mul(2).min(SILENT_RECHECK_MAX_MS)
+            });
+        let until = now.saturating_add(wait);
+        self.silent.insert(container, Silence { until, wait });
+    }
 }
 
 impl Device {
@@ -184,8 +262,14 @@ impl Device {
             {
                 self.feed(HubInput::Tick, now);
             }
+            if self.release_due(now) {
+                self.rescan();
+            }
+            if self.activity_deadline().is_some_and(|at| now >= at) {
+                self.check_activity(now, audio::peak);
+            }
             // May return nothing before the deadline; the loop then checks it again.
-            let events = self.reactor.wait(self.hub.next_deadline(), now_ms());
+            let events = self.reactor.wait(self.deadline(), now_ms());
             let mut rescan = false;
             for event in events {
                 rescan |= self.on_event(event);
@@ -233,7 +317,7 @@ impl Device {
                     .position(|group| group.collections.contains(&collection));
                 failed.is_some_and(|index| {
                     let gone = self.remove(index);
-                    self.guard.on_failure(&gone.paths) == AfterFailure::Reopen
+                    self.guard.on_failure(gone.paths, now_ms()) == AfterFailure::Reopen
                 })
             }
             OsEvent::InterfaceRemoved { path } => {
@@ -243,12 +327,13 @@ impl Device {
                     .iter()
                     .position(|group| group.paths.contains(&path));
                 removed.is_some_and(|index| {
-                    self.remove(index);
+                    let gone = self.remove(index);
+                    self.guard.on_removed(gone.paths, now_ms());
                     true
                 })
             }
             OsEvent::InterfaceArrived => {
-                self.guard.clear();
+                self.guard.on_arrival(now_ms());
                 true
             }
             OsEvent::Resume => {
@@ -258,19 +343,130 @@ impl Device {
                 self.feed(HubInput::Resume, now_ms());
                 false
             }
+            OsEvent::AudioActive { container, active } => {
+                if let Some(trace) = &mut self.trace {
+                    trace.audio(&container, active);
+                }
+                self.audio.set(container, active);
+                false
+            }
+            OsEvent::AudioUnavailable { stage } => {
+                if let Some(trace) = &mut self.trace {
+                    trace.audio_unavailable(stage);
+                }
+                false
+            }
             OsEvent::WriteFailed { .. } | OsEvent::Wake => false,
         }
     }
 
     /// Enumerates the HID groups engines want, closes the opened ones no longer present
-    /// and opens the new ones, except those the read-failure guard keeps closed.
+    /// and opens the new ones the read-failure guard admits.
     fn rescan(&mut self) {
-        self.apply_scan(hid_enum::enumerate());
+        self.apply_scan(hid_enum::enumerate(), now_ms());
     }
 
-    /// [`Device::rescan`] on the interfaces `scanned`. `None` (the enumeration failed) says
-    /// nothing about which devices are present, so every group stays as it is.
-    fn apply_scan(&mut self, scanned: Option<Vec<HidInterface>>) {
+    /// When the device thread must next wake: the hub's deadline, a held-back group's
+    /// release or an activity check, whichever comes first.
+    fn deadline(&self) -> Option<Ms> {
+        [
+            self.hub.next_deadline(),
+            self.release_at,
+            self.activity_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Whether a held-back group's release is due at `now`; if so, the release is spent.
+    fn release_due(&mut self, now: Ms) -> bool {
+        let due = self.release_at.is_some_and(|at| now >= at);
+        if due {
+            self.release_at = None;
+        }
+        due
+    }
+
+    /// Every registered device of an opened group whose container has an active audio
+    /// session and that the scheduler could grant an activity read, with that container and
+    /// when the scheduler could grant it ([`Hub::activity_ready_at`]).
+    fn activity_candidates(&self) -> Vec<(ContainerId, DeviceKey, Ms)> {
+        let mut candidates = Vec::new();
+        if self.audio.active.is_empty() {
+            return candidates;
+        }
+        for group in &self.groups {
+            let Some(container) = group.container else {
+                continue;
+            };
+            if !self.audio.active.contains(&container) {
+                continue;
+            }
+            for key in self.hub.keys_of(group.id) {
+                if let Some(ready) = self.hub.activity_ready_at(&key) {
+                    candidates.push((container, key, ready));
+                }
+            }
+        }
+        candidates
+    }
+
+    /// When a device of `container` that the scheduler could grant at `ready` may next be
+    /// checked: not while its container is known to be silent.
+    fn activity_check_at(&self, container: &ContainerId, ready: Ms) -> Ms {
+        let silent_until = self
+            .audio
+            .silent
+            .get(container)
+            .map(|silence| silence.until);
+        ready.max(silent_until.unwrap_or(0))
+    }
+
+    /// When an activity check is next due. `None` while no device the scheduler could grant
+    /// an activity read has an active audio session: silence, an asleep device or one that
+    /// pushes its battery never wakes the device thread.
+    fn activity_deadline(&self) -> Option<Ms> {
+        self.activity_candidates()
+            .iter()
+            .map(|(container, _, ready)| self.activity_check_at(container, *ready))
+            .min()
+    }
+
+    /// Reads the `peak` of each container with a device due at `now`, once, and hands
+    /// [`HubInput::Activity`] to its due devices if it plays something. A silent container
+    /// is looked at again later ([`AudioActivity::silent_at`]); an audible one starts over.
+    fn check_activity(&mut self, now: Ms, peak: impl Fn(&ContainerId) -> Option<f32>) {
+        let due: Vec<(ContainerId, DeviceKey)> = self
+            .activity_candidates()
+            .into_iter()
+            .filter(|(container, _, ready)| now >= self.activity_check_at(container, *ready))
+            .map(|(container, key, _)| (container, key))
+            .collect();
+        let mut containers: Vec<ContainerId> =
+            due.iter().map(|(container, _)| *container).collect();
+        containers.sort_unstable();
+        containers.dedup();
+        for container in containers {
+            let level = peak(&container);
+            if audible(level) {
+                self.audio.silent.remove(&container);
+            } else {
+                self.audio.silent_at(container, now);
+            }
+            for (_, key) in due.iter().filter(|(of, _)| *of == container) {
+                // An earlier input of this pass may have changed what the scheduler allows.
+                let ready = self.hub.activity_ready_at(key);
+                if activity_due(ready, now, self.audio.active.contains(&container), level) {
+                    self.feed(HubInput::Activity(key.clone()), now);
+                }
+            }
+        }
+    }
+
+    /// [`Device::rescan`] on the interfaces `scanned` at `now`. `None` (the enumeration
+    /// failed) says nothing about which devices are present, so every group stays as it is.
+    fn apply_scan(&mut self, scanned: Option<Vec<HidInterface>>, now: Ms) {
         let Some(scanned) = scanned else {
             return;
         };
@@ -287,19 +483,38 @@ impl Device {
         let gone = unmatched(&known, &found);
         let new = unmatched(&found, &known);
         for &index in gone.iter().rev() {
-            self.remove(index);
+            let gone = self.remove(index);
+            self.guard.on_removed(gone.paths, now);
         }
+        self.release_at = None;
+        let mut held = BTreeMap::new();
         for (index, (group, members, paths)) in scanned.into_iter().enumerate() {
-            if new.contains(&index) && !self.guard.is_closed(&paths) {
-                self.arrive(group, members, paths);
+            if !new.contains(&index) {
+                continue;
+            }
+            match self.guard.admission(&paths, now) {
+                Admission::Open => self.arrive(group, members, paths, now),
+                Admission::Closed => {}
+                Admission::HeldUntil(at) => {
+                    if self.held.get(&paths) != Some(&at)
+                        && let Some(trace) = &mut self.trace
+                    {
+                        trace.held(&paths, at.saturating_sub(now));
+                    }
+                    self.release_at = Some(self.release_at.map_or(at, |release| release.min(at)));
+                    held.insert(paths, at);
+                }
             }
         }
+        self.held = held;
     }
 
     /// Fills in the product strings of the collections an engine reads, opens those and
     /// hands them to the hub. The group's other collections (such as a headset's consumer
-    /// control) are never opened, so their reports never reach the process.
-    fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet) {
+    /// control) are never opened, so their reports never reach the process. Traces an open
+    /// that failed, and the release of a group the last scan held back.
+    fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet, now: Ms) {
+        let container = members.iter().find_map(|member| member.container);
         let mut opened = Vec::new();
         for mut member in members
             .into_iter()
@@ -317,12 +532,22 @@ impl Device {
         if !engines::wants(&group) {
             // None of its HID++ collections opened; the next rescan tries again.
             self.reactor.close_group(group.id);
+            if let Some(trace) = &mut self.trace {
+                trace.open_failed(&paths);
+            }
             return;
         }
+        if self.held.contains_key(&paths)
+            && let Some(trace) = &mut self.trace
+        {
+            trace.released(&paths);
+        }
+        self.guard.on_open(&paths, now);
         self.groups.push(Opened {
             id: group.id,
             paths,
             collections: group.collections.iter().map(|c| c.id).collect(),
+            container,
         });
         self.feed(HubInput::GroupArrived(group), now_ms());
     }
@@ -348,6 +573,11 @@ impl Device {
                     }
                 }
                 HubOutput::StateChanged => changed = true,
+                HubOutput::DiscoveryFailed { group, retry_at } => {
+                    if let Some(trace) = &mut self.trace {
+                        trace.discovery_failed(&group, retry_at.map(|at| at.saturating_sub(now)));
+                    }
+                }
             }
         }
         if changed {
@@ -394,60 +624,195 @@ fn unmatched(sets: &[&PathSet], others: &[&PathSet]) -> Vec<usize> {
         .collect()
 }
 
+/// How long an active container found silent first waits before it is looked at again: a
+/// pause between two tracks must not cost a whole activity gap.
+const SILENT_RECHECK_MS: Ms = 15_000;
+
+/// The longest wait between two looks at an active but silent container, such as one whose
+/// session a paused app or a voice chat keeps open: the PRO X Wireless activity gap.
+const SILENT_RECHECK_MAX_MS: Ms = 300_000;
+
+/// The lowest peak level (linear, full scale 1.0) that counts as audio playing: -60 dBFS.
+/// A paused player can keep its stream open and feed it digital near-silence; in the owner's
+/// hardware session a paused headset endpoint metered about 1.6e-6 (-115 dBFS), and `> 0.0`
+/// counted that as playing, so the headset was read every 5 minutes while paused.
+const AUDIBLE_PEAK: f32 = 0.001;
+
+/// Whether a metered `peak` (`None` when it could not be metered) means audio is playing.
+fn audible(peak: Option<f32>) -> bool {
+    peak.is_some_and(|level| level >= AUDIBLE_PEAK)
+}
+
+/// Whether a device may be handed an activity input at `now`: its container has an active
+/// audio session (`active`), its endpoints play something ([`audible`] `peak`) and the
+/// scheduler would grant it (`ready_at` reached; `None` while it refuses any, the device
+/// being asleep or pushing its battery).
+fn activity_due(ready_at: Option<Ms>, now: Ms, active: bool, peak: Option<f32>) -> bool {
+    active && audible(peak) && ready_at.is_some_and(|at| now >= at)
+}
+
 /// What to do with a group whose read just failed.
 #[derive(Debug, PartialEq, Eq)]
 enum AfterFailure {
-    /// Re-enumerate; the group is reopened if still present.
+    /// Re-enumerate; the group is reopened if still present and admitted.
     Reopen,
-    /// Leave the group closed until the guard is cleared.
+    /// Leave the group closed until the next arrival, resume or refresh; the reopen cap
+    /// may hold it back longer.
     StayClosed,
 }
 
-/// Counts back-to-back read failures per group, keyed by path set.
+/// Whether a rescan may open a group now.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Open,
+    /// Closed for failing until the next arrival, resume or refresh.
+    Closed,
+    /// Held back by the reopen cap until this time, or until a resume or refresh.
+    HeldUntil(Ms),
+}
+
+/// The most times [`ReadFailureGuard`] lets one group be reopened within [`REOPEN_WINDOW`].
+const REOPEN_LIMIT: usize = 3;
+
+/// The sliding window, in milliseconds, over which [`REOPEN_LIMIT`] applies.
+const REOPEN_WINDOW: Ms = 60_000;
+
+/// Whether `at` lies within the [`REOPEN_WINDOW`] ending at `now`.
+fn in_window(at: Ms, now: Ms) -> bool {
+    now.saturating_sub(at) < REOPEN_WINDOW
+}
+
+/// Decides per group, keyed by path set, whether a rescan may open a group that failed.
 ///
-/// A failure reopens the group unless the previous failure of the same group was not
-/// followed by a report from it; then the group stays closed until [`clear`]. That way a
-/// read that keeps failing does not reopen the device in a loop.
+/// - A read failure reopens the group unless the previous failure of the same group was
+///   not followed by a report from it, or the group was already reopened [`REOPEN_LIMIT`]
+///   times within the last [`REOPEN_WINDOW`]; then the group stays closed until the next
+///   arrival ([`on_arrival`]), resume or refresh ([`clear`]).
+/// - Removing an open group counts as a failure for the window, though not towards the
+///   back-to-back rule, so the cap does not depend on whether a device's removal or its
+///   read failure is handled first.
+/// - Every open of a group that failed or was removed within the window counts as a
+///   reopen ([`on_open`]), whatever caused it. While the window holds [`REOPEN_LIMIT`]
+///   reopens, the group is held back ([`admission`]) until the oldest of them leaves the
+///   window, when the device thread rescans once, or until a resume or refresh. An arrival
+///   does not lift this, so a device that re-enumerates after each failure is not reopened
+///   in a loop, and one replugged more than [`REOPEN_LIMIT`] times a minute waits for the
+///   window.
+/// - A group with no failure or removal in the window is always opened.
 ///
+/// [`on_arrival`]: ReadFailureGuard::on_arrival
 /// [`clear`]: ReadFailureGuard::clear
+/// [`on_open`]: ReadFailureGuard::on_open
+/// [`admission`]: ReadFailureGuard::admission
 #[derive(Default)]
 struct ReadFailureGuard {
-    /// Groups that failed and reported nothing since.
-    failed: HashSet<PathSet>,
-    /// Groups that failed twice in a row.
-    closed: HashSet<PathSet>,
+    groups: HashMap<PathSet, Failures>,
+}
+
+/// One group's failures and reopens since the guard was last cleared.
+#[derive(Default)]
+struct Failures {
+    /// When its read last failed or it was last removed while open.
+    failed_at: Ms,
+    /// Its read failed and it reported nothing since.
+    pending: bool,
+    /// Kept closed until the next arrival, resume or refresh.
+    closed: bool,
+    /// When it was reopened, oldest first; those outside the window are pruned lazily.
+    reopens: Vec<Ms>,
+}
+
+impl Failures {
+    /// The reopens within the window ending at `now`.
+    fn recent_reopens(&self, now: Ms) -> &[Ms] {
+        let start = self
+            .reopens
+            .iter()
+            .position(|&at| in_window(at, now))
+            .unwrap_or(self.reopens.len());
+        &self.reopens[start..]
+    }
 }
 
 impl ReadFailureGuard {
     /// The group read normally: its next failure counts as the first again.
     fn on_report(&mut self, paths: &PathSet) {
-        self.failed.remove(paths);
-    }
-
-    fn on_failure(&mut self, paths: &PathSet) -> AfterFailure {
-        if self.failed.insert(paths.clone()) {
-            AfterFailure::Reopen
-        } else {
-            self.closed.insert(paths.clone());
-            AfterFailure::StayClosed
+        if let Some(failures) = self.groups.get_mut(paths) {
+            failures.pending = false;
         }
     }
 
-    /// Forgets every failure: closed groups may be reopened.
-    fn clear(&mut self) {
-        self.failed.clear();
-        self.closed.clear();
+    fn on_failure(&mut self, paths: PathSet, now: Ms) -> AfterFailure {
+        let failures = self.groups.entry(paths).or_default();
+        failures.failed_at = now;
+        let back_to_back = std::mem::replace(&mut failures.pending, true);
+        if back_to_back || failures.recent_reopens(now).len() >= REOPEN_LIMIT {
+            failures.closed = true;
+            AfterFailure::StayClosed
+        } else {
+            AfterFailure::Reopen
+        }
     }
 
-    fn is_closed(&self, paths: &PathSet) -> bool {
-        self.closed.contains(paths)
+    /// An open group was removed.
+    fn on_removed(&mut self, paths: PathSet, now: Ms) {
+        self.groups.entry(paths).or_default().failed_at = now;
+    }
+
+    fn admission(&self, paths: &PathSet, now: Ms) -> Admission {
+        let Some(failures) = self.groups.get(paths) else {
+            return Admission::Open;
+        };
+        if failures.closed {
+            return Admission::Closed;
+        }
+        let recent = failures.recent_reopens(now);
+        match recent.len().checked_sub(REOPEN_LIMIT) {
+            Some(index) => Admission::HeldUntil(recent[index] + REOPEN_WINDOW),
+            None => Admission::Open,
+        }
+    }
+
+    /// The group was opened: a reopen if it failed or was removed within the window.
+    fn on_open(&mut self, paths: &PathSet, now: Ms) {
+        if let Some(failures) = self.groups.get_mut(paths)
+            && in_window(failures.failed_at, now)
+        {
+            failures.reopens.retain(|&at| in_window(at, now));
+            failures.reopens.push(now);
+        }
+    }
+
+    /// An interface arrived: groups closed for failing may be opened again, except those
+    /// the reopen cap holds back. Forgets groups with nothing left in the window.
+    fn on_arrival(&mut self, now: Ms) {
+        self.groups.retain(|_, failures| {
+            failures.pending = false;
+            failures.closed = false;
+            in_window(failures.failed_at, now)
+                || failures
+                    .reopens
+                    .last()
+                    .is_some_and(|&at| in_window(at, now))
+        });
+    }
+
+    /// Forgets every failure and reopen: every group may be opened.
+    fn clear(&mut self) {
+        self.groups.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use batterysight_core::engine::{Action, Engine};
     use batterysight_core::hid::Collection;
+    use batterysight_core::model::{DeviceUpdate, Presence, Source};
+    use batterysight_core::scheduler::{Capabilities, Grant, Trigger};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 
     use crate::reactor::tests::Server;
@@ -498,14 +863,29 @@ mod tests {
         assert!(unmatched(&[], &[&a]).is_empty());
     }
 
+    /// A rescan opens `group` at `at`.
+    fn reopen(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) {
+        assert_eq!(
+            guard.admission(group, at),
+            Admission::Open,
+            "refused at {at}"
+        );
+        guard.on_open(group, at);
+    }
+
+    /// A read of `group` fails at `at`, the rescan reopens it and it reads normally again.
+    fn fail_and_reopen(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) {
+        assert_eq!(guard.on_failure(group.clone(), at), AfterFailure::Reopen);
+        reopen(guard, group, at);
+        guard.on_report(group);
+    }
+
     #[test]
     fn failures_separated_by_a_report_reopen() {
         let group = set(&["a"]);
         let mut guard = ReadFailureGuard::default();
-        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
-        guard.on_report(&group);
-        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
-        assert!(!guard.is_closed(&group));
+        fail_and_reopen(&mut guard, &group, 0);
+        fail_and_reopen(&mut guard, &group, 1);
     }
 
     #[test]
@@ -513,22 +893,391 @@ mod tests {
         let group = set(&["a"]);
         let other = set(&["b"]);
         let mut guard = ReadFailureGuard::default();
-        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
+        assert_eq!(guard.on_failure(group.clone(), 0), AfterFailure::Reopen);
         guard.on_report(&other);
-        assert_eq!(guard.on_failure(&group), AfterFailure::StayClosed);
-        assert!(guard.is_closed(&group));
-        assert!(!guard.is_closed(&other));
+        assert_eq!(guard.on_failure(group.clone(), 1), AfterFailure::StayClosed);
+        assert_eq!(guard.admission(&group, 1), Admission::Closed);
+        assert_eq!(guard.admission(&other, 1), Admission::Open);
     }
 
     #[test]
     fn clear_allows_reopening() {
         let group = set(&["a"]);
         let mut guard = ReadFailureGuard::default();
-        guard.on_failure(&group);
-        guard.on_failure(&group);
+        guard.on_failure(group.clone(), 0);
+        guard.on_failure(group.clone(), 1);
         guard.clear();
-        assert!(!guard.is_closed(&group));
-        assert_eq!(guard.on_failure(&group), AfterFailure::Reopen);
+        fail_and_reopen(&mut guard, &group, 2);
+    }
+
+    #[test]
+    fn reopens_capped_per_minute() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            fail_and_reopen(&mut guard, &group, at);
+        }
+        assert_eq!(
+            guard.on_failure(group.clone(), 6_000),
+            AfterFailure::StayClosed
+        );
+        assert_eq!(guard.admission(&group, 6_000), Admission::Closed);
+        guard.clear();
+        fail_and_reopen(&mut guard, &group, 61_000);
+    }
+
+    #[test]
+    fn reopens_spread_over_more_than_a_minute_are_not_capped() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 20_000, 40_000, 60_000, 80_000] {
+            fail_and_reopen(&mut guard, &group, at);
+        }
+    }
+
+    #[test]
+    fn clear_resets_the_window() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            fail_and_reopen(&mut guard, &group, at);
+        }
+        guard.clear();
+        for at in [7_000, 8_000, 9_000] {
+            fail_and_reopen(&mut guard, &group, at);
+        }
+        assert_eq!(
+            guard.on_failure(group.clone(), 10_000),
+            AfterFailure::StayClosed
+        );
+    }
+
+    #[test]
+    fn cap_is_per_path_set() {
+        let capped = set(&["a"]);
+        let other = set(&["b"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 1_000, 2_000] {
+            fail_and_reopen(&mut guard, &capped, at);
+        }
+        assert_eq!(
+            guard.on_failure(capped.clone(), 3_000),
+            AfterFailure::StayClosed
+        );
+        for at in [4_000, 5_000, 6_000] {
+            fail_and_reopen(&mut guard, &other, at);
+        }
+    }
+
+    #[test]
+    fn checking_spends_no_reopen() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        assert_eq!(guard.on_failure(group.clone(), 0), AfterFailure::Reopen);
+        for at in 0..5 {
+            assert_eq!(guard.admission(&group, at), Admission::Open);
+        }
+        guard.on_report(&group);
+        for at in [1_000, 2_000, 3_000] {
+            fail_and_reopen(&mut guard, &group, at);
+        }
+    }
+
+    /// A device that re-enumerates after each failure: the failure's rescan finds it gone,
+    /// then its arrival a second later opens it if admitted.
+    fn fail_and_rearrive(guard: &mut ReadFailureGuard, group: &PathSet, at: Ms) -> Admission {
+        guard.on_failure(group.clone(), at);
+        guard.on_arrival(at + 1_000);
+        let admission = guard.admission(group, at + 1_000);
+        if admission == Admission::Open {
+            guard.on_open(group, at + 1_000);
+        }
+        admission
+    }
+
+    #[test]
+    fn reopens_by_rearrival_are_capped() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            let admission = fail_and_rearrive(&mut guard, &group, at);
+            assert_eq!(admission, Admission::Open, "refused at {at}");
+        }
+        // Held back until the reopen at 1 s leaves the window.
+        let held = Admission::HeldUntil(61_000);
+        assert_eq!(fail_and_rearrive(&mut guard, &group, 6_000), held);
+        guard.on_arrival(59_000);
+        assert_eq!(guard.admission(&group, 59_000), held);
+        assert_eq!(guard.admission(&group, 61_000), Admission::Open);
+    }
+
+    #[test]
+    fn resume_lifts_the_rearrival_cap_at_once() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            assert_eq!(fail_and_rearrive(&mut guard, &group, at), Admission::Open);
+        }
+        assert_ne!(
+            fail_and_rearrive(&mut guard, &group, 6_000),
+            Admission::Open
+        );
+        guard.clear();
+        assert_eq!(guard.admission(&group, 8_000), Admission::Open);
+    }
+
+    #[test]
+    fn removal_then_arrival_is_capped() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            guard.on_removed(group.clone(), at);
+            guard.on_arrival(at + 1_000);
+            reopen(&mut guard, &group, at + 1_000);
+        }
+        guard.on_removed(group.clone(), 6_000);
+        guard.on_arrival(7_000);
+        assert_eq!(guard.admission(&group, 7_000), Admission::HeldUntil(61_000));
+    }
+
+    #[test]
+    fn arrivals_without_failures_are_never_capped() {
+        let fresh = set(&["fresh"]);
+        let capped = set(&["capped"]);
+        let mut guard = ReadFailureGuard::default();
+        for at in [0, 2_000, 4_000] {
+            assert_eq!(fail_and_rearrive(&mut guard, &capped, at), Admission::Open);
+        }
+        for at in 0..10 {
+            guard.on_arrival(at);
+            reopen(&mut guard, &fresh, at);
+        }
+    }
+
+    #[test]
+    fn arrivals_after_an_old_failure_are_not_counted() {
+        let group = set(&["a"]);
+        let mut guard = ReadFailureGuard::default();
+        fail_and_reopen(&mut guard, &group, 0);
+        for at in [60_000, 61_000, 62_000, 63_000] {
+            guard.on_arrival(at);
+            reopen(&mut guard, &group, at);
+        }
+    }
+
+    #[test]
+    fn arrival_forgets_groups_outside_the_window() {
+        let mut guard = ReadFailureGuard::default();
+        guard.on_removed(set(&["a"]), 0);
+        guard.on_arrival(59_999);
+        assert_eq!(guard.groups.len(), 1);
+        guard.on_arrival(60_000);
+        assert!(guard.groups.is_empty());
+    }
+
+    /// A device whose PRO X Wireless dongle collection is served by a fresh pipe, with its
+    /// product string cached so that nothing but the open touches the single-instance pipe.
+    fn dongle_device() -> (Device, Server, HidInterface, PathSet) {
+        let (server, pipe) = Server::new(PIPE_ACCESS_DUPLEX);
+        let hidpp = dongle_member(pipe, 0xFF43, 0x0202, 20);
+        let paths: PathSet = [path_key(&hidpp.path)].into();
+        let mut device = device();
+        let product = "PRO X Wireless Gaming Headset".to_owned();
+        device.products.insert(path_key(&hidpp.path), product);
+        (device, server, hidpp, paths)
+    }
+
+    /// Caps `paths` with reopens at `base` + 1, 3 and 5 s and a failure at `base` + 6 s.
+    fn cap(guard: &mut ReadFailureGuard, paths: &PathSet, base: Ms) {
+        for at in [0, 2_000, 4_000] {
+            assert_eq!(fail_and_rearrive(guard, paths, base + at), Admission::Open);
+        }
+        guard.on_failure(paths.clone(), base + 6_000);
+    }
+
+    #[test]
+    fn arrival_keeps_a_capped_group_closed() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+
+        assert!(device.on_event(OsEvent::InterfaceArrived));
+        device.apply_scan(Some(vec![hidpp]), base + 7_000);
+        assert!(device.groups.is_empty());
+    }
+
+    #[test]
+    fn held_back_group_opens_when_its_window_frees() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        let release = base + 61_000;
+
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 7_000);
+        assert!(device.groups.is_empty());
+        assert_eq!(device.deadline(), Some(release));
+        assert!(!device.release_due(release - 1));
+        assert!(device.release_due(release));
+        assert_eq!(device.deadline(), None, "release is one-shot");
+
+        device.apply_scan(Some(vec![hidpp]), release);
+        assert_eq!(device.groups.len(), 1);
+    }
+
+    /// A trace appending to a fresh file of its own, and that file's path.
+    fn temp_trace(name: &str) -> (Trace, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "batterysight-test-{name}-{}.log",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        (Trace::to_file(file), path)
+    }
+
+    #[test]
+    fn held_back_group_is_traced_until_released() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let (trace, log) = temp_trace("held");
+        device.trace = Some(trace);
+        let path = paths.first().unwrap().clone();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 7_000);
+        // Still held at the next scan: no second line.
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 8_000);
+        let release = base + 61_000;
+        assert!(device.release_due(release));
+        device.apply_scan(Some(vec![hidpp]), release);
+        assert_eq!(device.groups.len(), 1);
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        // The reopened group's arrival ping is traced too: only the cap's lines matter here.
+        let words: Vec<Vec<&str>> = text
+            .lines()
+            .map(|line| line.split(' ').skip(1).collect::<Vec<_>>())
+            .filter(|words| matches!(words.first(), Some(&("held" | "released"))))
+            .collect();
+        assert_eq!(words.len(), 2, "{text}");
+        assert_eq!(words[0][..3], ["held", path.as_str(), "until"], "{text}");
+        let held_at: u64 = text.split(' ').next().unwrap().parse().unwrap();
+        let until: u64 = words[0][3].parse().unwrap();
+        assert_eq!(until - held_at, 54_000, "{text}");
+        assert_eq!(words[1], ["released", path.as_str()], "{text}");
+    }
+
+    #[test]
+    fn held_back_group_that_fails_to_open_is_traced_but_not_released() {
+        let (mut device, server, hidpp, paths) = dongle_device();
+        let (trace, log) = temp_trace("open-failed");
+        device.trace = Some(trace);
+        let path = paths.first().unwrap().clone();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 7_000);
+
+        drop(server);
+        device.apply_scan(Some(vec![hidpp]), base + 61_000);
+        assert!(device.groups.is_empty());
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let words: Vec<Vec<&str>> = text
+            .lines()
+            .map(|line| line.split(' ').skip(1).collect())
+            .collect();
+        assert_eq!(words.len(), 2, "{text}");
+        assert_eq!(words[0][..2], ["held", path.as_str()], "{text}");
+        assert_eq!(words[1], ["open", "failed", path.as_str()], "{text}");
+    }
+
+    #[test]
+    fn failed_discovery_is_traced() {
+        let mut device = device();
+        let (trace, log) = temp_trace("discovery");
+        device.trace = Some(trace);
+        let group = HidGroup {
+            id: GroupId(9),
+            collections: vec![Collection {
+                id: CollectionId(u32::MAX),
+                vid: 0x046D,
+                pid: 0x0ABA,
+                usage_page: 0xFF43,
+                usage: 0x0202,
+                input_len: 20,
+                output_len: 20,
+                feature_len: 0,
+                product: "PRO X Wireless Gaming Headset".into(),
+            }],
+        };
+
+        // The ping (to a collection that is not open) goes unanswered.
+        device.feed(HubInput::GroupArrived(group), 0);
+        device.feed(HubInput::Tick, 4_000);
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let words: Vec<&str> = text.trim_end().split(' ').collect();
+        assert_eq!(
+            words[1..5],
+            ["discovery", "logi-group:0ABA:9", "failed,", "retry"],
+            "{text}"
+        );
+        let at: u64 = words[0].parse().unwrap();
+        let retry_at: u64 = words[6].parse().unwrap();
+        assert_eq!(retry_at - at, 2_000, "{text}");
+    }
+
+    #[test]
+    fn absent_held_back_group_sets_no_deadline() {
+        let (mut device, _server, hidpp, paths) = dongle_device();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        device.apply_scan(Some(vec![hidpp]), base + 7_000);
+        assert!(device.deadline().is_some());
+
+        device.apply_scan(Some(Vec::new()), base + 8_000);
+        assert_eq!(device.deadline(), None);
+    }
+
+    #[test]
+    fn failed_open_spends_no_reopen() {
+        let (mut device, server, hidpp, paths) = dongle_device();
+        drop(server);
+        let base = now_ms();
+        assert_eq!(
+            device.guard.on_failure(paths.clone(), base),
+            AfterFailure::Reopen
+        );
+        for at in 1..=4 {
+            device.apply_scan(Some(vec![hidpp.clone()]), base + at);
+            assert!(device.groups.is_empty());
+        }
+        assert_eq!(device.guard.admission(&paths, base + 5), Admission::Open);
+    }
+
+    #[test]
+    fn removing_an_opened_group_records_a_failure() {
+        let mut device = device();
+        for path in ["a", "b"] {
+            device.groups.push(Opened {
+                id: GroupId(u32::MAX),
+                paths: set(&[path]),
+                collections: Vec::new(),
+                container: None,
+            });
+        }
+
+        assert!(device.on_event(OsEvent::InterfaceRemoved { path: wide("A") }));
+        device.apply_scan(Some(Vec::new()), now_ms());
+
+        assert!(device.guard.groups.contains_key(&set(&["a"])));
+        assert!(device.guard.groups.contains_key(&set(&["b"])));
     }
 
     fn device() -> Device {
@@ -538,6 +1287,9 @@ mod tests {
             groups: Vec::new(),
             products: HashMap::new(),
             guard: ReadFailureGuard::default(),
+            release_at: None,
+            held: BTreeMap::new(),
+            audio: AudioActivity::default(),
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),
             on_change: Box::new(|| {}),
@@ -559,6 +1311,7 @@ mod tests {
                 feature_len: 0,
                 product: String::new(),
             },
+            container: None,
         }
     }
 
@@ -576,7 +1329,7 @@ mod tests {
             device.products.insert(path_key(&member.path), product);
         }
 
-        device.apply_scan(Some(vec![consumer, hidpp]));
+        device.apply_scan(Some(vec![consumer, hidpp]), now_ms());
 
         assert_eq!(device.groups.len(), 1);
         assert_eq!(device.groups[0].collections, [hidpp_id]);
@@ -593,12 +1346,13 @@ mod tests {
             id: GroupId(u32::MAX),
             paths: set(&["a"]),
             collections: Vec::new(),
+            container: None,
         });
 
-        device.apply_scan(None);
+        device.apply_scan(None, now_ms());
         assert_eq!(device.groups.len(), 1);
 
-        device.apply_scan(Some(Vec::new()));
+        device.apply_scan(Some(Vec::new()), now_ms());
         assert!(device.groups.is_empty());
     }
 
@@ -615,5 +1369,222 @@ mod tests {
             cached_product(&mut products, key(), || panic!("read again")),
             "USB Receiver"
         );
+    }
+
+    #[test]
+    fn activity_due_needs_audible_audio_and_a_ready_device() {
+        assert!(!activity_due(Some(0), 0, false, Some(0.2)), "inactive");
+        assert!(!activity_due(Some(0), 0, true, Some(0.0)), "silent");
+        // Owner session: a paused player left the headset endpoint at ~1.6e-6 (-115 dBFS).
+        assert!(
+            !activity_due(Some(0), 0, true, Some(1.6e-6)),
+            "near-silence"
+        );
+        assert!(activity_due(Some(0), 0, true, Some(0.001)), "-60 dBFS");
+        assert!(!activity_due(Some(0), 0, true, None), "no meter");
+        assert!(
+            !activity_due(None, 0, true, Some(0.2)),
+            "refused: asleep or pushes"
+        );
+        assert!(activity_due(Some(0), 0, true, Some(0.2)));
+        assert!(!activity_due(Some(300_000), 299_999, true, Some(0.2)));
+        assert!(activity_due(Some(300_000), 300_000, true, Some(0.2)));
+    }
+
+    /// The activity gap the fake headset registers with.
+    const GAP: Ms = 300_000;
+
+    /// Registers `key` with `caps` and `presence` on its arrival grant and records every
+    /// grant's trigger.
+    struct Registering {
+        key: DeviceKey,
+        caps: Capabilities,
+        presence: Option<Presence>,
+        grants: Rc<RefCell<Vec<Trigger>>>,
+    }
+
+    impl Engine for Registering {
+        fn group_key(&self) -> DeviceKey {
+            DeviceKey(format!("group:{}", self.key.0))
+        }
+
+        fn on_grant(&mut self, grant: &Grant, _now: Ms) -> Vec<Action> {
+            self.grants.borrow_mut().push(grant.trigger);
+            if grant.trigger != Trigger::Arrival {
+                return Vec::new();
+            }
+            vec![Action::Register {
+                key: self.key.clone(),
+                caps: self.caps,
+                initial: DeviceUpdate {
+                    key: self.key.clone(),
+                    name: None,
+                    kind: None,
+                    via: None,
+                    level: None,
+                    millivolts: None,
+                    charge: None,
+                    presence: self.presence,
+                    source: Source::Query,
+                },
+                wpid: None,
+            }]
+        }
+
+        fn on_report(&mut self, _: CollectionId, _: &[u8], _: Ms) -> Vec<Action> {
+            Vec::new()
+        }
+
+        fn on_tick(&mut self, _: Ms) -> Vec<Action> {
+            Vec::new()
+        }
+
+        fn next_deadline(&self) -> Option<Ms> {
+            None
+        }
+    }
+
+    const HEADSET: ContainerId = [1; 16];
+    const MOUSE: ContainerId = [2; 16];
+
+    type Grants = Rc<RefCell<Vec<Trigger>>>;
+
+    /// A device with a headset (group 1, read on activity, registered with
+    /// `headset_presence`) and a mouse that pushes its battery (group 2), each in its own
+    /// container, both registered at 0 with audio playing to both; and their grant logs.
+    fn audio_device(headset_presence: Option<Presence>) -> (Device, Grants, Grants) {
+        let headset_grants: Grants = Rc::default();
+        let mouse_grants: Grants = Rc::default();
+        let (h, m) = (Rc::clone(&headset_grants), Rc::clone(&mouse_grants));
+        let mut device = device();
+        device.hub = Hub::new(Catalog::builtin(), Policy::default()).with_engine_factory(Box::new(
+            move |group, _| {
+                let headset = group.id == GroupId(1);
+                let caps = Capabilities {
+                    pushes_battery: !headset,
+                    query_wakes: false,
+                    min_query_gap_ms: if headset { GAP } else { 0 },
+                };
+                Some(Box::new(Registering {
+                    key: DeviceKey(if headset { "headset" } else { "mouse" }.into()),
+                    caps,
+                    presence: if headset { headset_presence } else { None },
+                    grants: Rc::clone(if headset { &h } else { &m }),
+                }) as Box<dyn Engine>)
+            },
+        ));
+        for (id, container) in [(1, HEADSET), (2, MOUSE)] {
+            device.groups.push(Opened {
+                id: GroupId(id),
+                paths: set(&[&id.to_string()]),
+                collections: Vec::new(),
+                container: Some(container),
+            });
+            let group = HidGroup {
+                id: GroupId(id),
+                collections: Vec::new(),
+            };
+            device.feed(HubInput::GroupArrived(group), 0);
+        }
+        assert_eq!(device.deadline(), None, "silence sets no deadline");
+        for container in [HEADSET, MOUSE] {
+            let active = OsEvent::AudioActive {
+                container,
+                active: true,
+            };
+            assert!(!device.on_event(active));
+        }
+        (device, headset_grants, mouse_grants)
+    }
+
+    /// A peak meter for the headset's container only: the mouse is never a candidate.
+    fn headset_peak(level: f32) -> impl Fn(&ContainerId) -> Option<f32> {
+        move |container| {
+            assert_eq!(
+                *container, HEADSET,
+                "metered a container no read can follow"
+            );
+            Some(level)
+        }
+    }
+
+    #[test]
+    fn audio_activity_reads_audible_devices_that_do_not_push() {
+        let (mut device, headset_grants, mouse_grants) = audio_device(None);
+        // Registration read the battery: audio already playing waits the gap.
+        assert_eq!(device.deadline(), Some(GAP));
+        device.check_activity(GAP - 1, |_| panic!("checked before the gap"));
+
+        // Silent: looked at again after 15 s, doubling up to 5 min.
+        let mut at = GAP;
+        for wait in [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000] {
+            device.check_activity(at, headset_peak(0.0));
+            at += wait;
+            assert_eq!(device.deadline(), Some(at), "after a silent check");
+        }
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
+
+        device.check_activity(at, headset_peak(0.4));
+        assert_eq!(
+            *headset_grants.borrow(),
+            [Trigger::Arrival, Trigger::Activity]
+        );
+        assert_eq!(*mouse_grants.borrow(), [Trigger::Arrival]);
+        assert_eq!(device.deadline(), Some(at + GAP));
+
+        // An audible check reset the back-off.
+        device.check_activity(at + GAP, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(at + GAP + 15_000));
+
+        // Audio stops: nothing wakes the device thread any more.
+        for container in [HEADSET, MOUSE] {
+            let idle = OsEvent::AudioActive {
+                container,
+                active: false,
+            };
+            assert!(!device.on_event(idle));
+        }
+        assert_eq!(device.deadline(), None);
+    }
+
+    #[test]
+    fn going_idle_resets_the_silence_back_off() {
+        let (mut device, _, _) = audio_device(None);
+        device.check_activity(GAP, headset_peak(0.0));
+        device.check_activity(GAP + 15_000, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(GAP + 45_000));
+        for active in [false, true] {
+            let event = OsEvent::AudioActive {
+                container: HEADSET,
+                active,
+            };
+            device.on_event(event);
+        }
+        device.check_activity(GAP + 50_000, headset_peak(0.0));
+        assert_eq!(device.deadline(), Some(GAP + 65_000));
+    }
+
+    #[test]
+    fn near_silence_backs_off_and_reads_nothing() {
+        let (mut device, headset_grants, _) = audio_device(None);
+        // Owner session: a paused player kept a stream open at ~1.6e-6 (-115 dBFS).
+        device.check_activity(GAP, headset_peak(1.6e-6));
+        device.check_activity(GAP + 15_000, headset_peak(1.6e-6));
+        assert_eq!(device.deadline(), Some(GAP + 45_000), "silent back-off");
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
+
+        device.check_activity(GAP + 45_000, headset_peak(0.001));
+        assert_eq!(
+            *headset_grants.borrow(),
+            [Trigger::Arrival, Trigger::Activity]
+        );
+    }
+
+    #[test]
+    fn asleep_device_sets_no_activity_deadline() {
+        let (mut device, headset_grants, _) = audio_device(Some(Presence::Asleep));
+        assert_eq!(device.deadline(), None);
+        device.check_activity(10 * GAP, |_| panic!("metered for an asleep device"));
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
     }
 }

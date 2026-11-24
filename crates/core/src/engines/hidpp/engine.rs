@@ -14,6 +14,11 @@
 //! Every device index has at most one request in flight; a request
 //! unanswered within its timeout (1 s for the receiver itself, 4 s for a
 //! device) counts as no answer.
+//!
+//! A direct group whose discovery is cut short (silence, an unreachable error, a spent
+//! grant) asks for a rediscovery grant 2 s, 10 s and 60 s after its first, second and
+//! third failure, then waits for the next arrival, resume or refresh. One the device
+//! completes without anything to register (no battery feature) is not walked again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
@@ -22,7 +27,7 @@ use crate::catalog::Catalog;
 use crate::engine::{Action, Engine};
 use crate::hid::{Collection, CollectionId, HidGroup};
 use crate::model::{DeviceKey, DeviceKind, DeviceUpdate, Presence, Source, Via};
-use crate::scheduler::{Capabilities, Grant, GrantId, Trigger};
+use crate::scheduler::{Capabilities, Grant, GrantId, REDISCOVERIES, Trigger};
 use crate::time::Ms;
 
 use super::battery::{self, Reading};
@@ -40,6 +45,16 @@ const RECEIVER_TIMEOUT_MS: u32 = 1_000;
 /// may take over a second to wake (owner trace 2026-11-23: 443 to 1 288 ms).
 /// Source: Solaar `base.py` `_DEVICE_REQUEST_TIMEOUT` / `_PING_TIMEOUT` (4 s).
 pub const DEVICE_TIMEOUT_MS: u32 = 4_000;
+/// Least time between two activity reads of a device whose catalog entry has
+/// `no_in_use_push`: a headset's level moves about a point in 8 minutes of use (owner
+/// observation: ~5 points in 43 min), so 5 minutes keeps it current with few requests.
+pub const ACTIVITY_GAP_MS: Ms = 300_000;
+/// How long a direct group whose discovery registered nothing waits before it is discovered
+/// again, after its first, second and third failure; after the fourth it waits for the next
+/// arrival, resume or refresh. A freshly plugged PRO X Wireless dongle answered our ping but
+/// not the 0x0005 lookup that followed, while another HID++ client set it up, and broadcast
+/// its battery 1 to 13 s later (owner capture 2026-11-24).
+const REDISCOVERY_DELAYS_MS: [Ms; REDISCOVERIES as usize] = [2_000, 10_000, 60_000];
 /// HID++ 1.0 sub ids from 0x80 up are register access and errors, never a feature reply.
 const FIRST_REGISTER_SUB_ID: u8 = 0x80;
 
@@ -135,6 +150,8 @@ pub struct HidppEngine {
     fallback_kind: DeviceKind,
     curve: VoltageCurve,
     query_wakes: bool,
+    /// The catalog entry's `no_in_use_push`: the device is read on activity instead.
+    no_in_use_push: bool,
     devices: BTreeMap<u8, Device>,
     in_flight: BTreeMap<u8, InFlight>,
     /// Indices whose link came up while unknown: discovered on the next group grant.
@@ -145,6 +162,18 @@ pub struct HidppEngine {
     /// Wireless product id per receiver slot, from the slot's last 0x41.
     wpids: BTreeMap<u8, u16>,
     budgets: HashMap<GrantId, Budget>,
+    /// A direct group's discovery is running under an arrival or rediscovery grant.
+    discovering: bool,
+    /// The running direct discovery was cut short by silence, an unreachable error or a
+    /// spent grant, rather than completed by the device.
+    unanswered: bool,
+    /// A direct discovery completed without a device to register (no battery feature):
+    /// the group is not walked again.
+    settled: bool,
+    /// Direct discoveries cut short since the last arrival grant.
+    failures: usize,
+    /// When to ask for the next rediscovery: one-shot, set by a failed discovery.
+    retry_at: Option<Ms>,
 }
 
 fn is_short(c: &Collection) -> bool {
@@ -229,12 +258,18 @@ impl HidppEngine {
             fallback_kind,
             curve,
             query_wakes: quirks.is_some_and(|q| q.query_wakes),
+            no_in_use_push: quirks.is_some_and(|q| q.no_in_use_push),
             devices: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             pending: BTreeSet::new(),
             late_used: BTreeSet::new(),
             wpids: BTreeMap::new(),
             budgets: HashMap::new(),
+            discovering: false,
+            unanswered: false,
+            settled: false,
+            failures: 0,
+            retry_at: None,
         }
     }
 
@@ -245,6 +280,20 @@ impl HidppEngine {
         } else {
             DeviceKey(format!("logi:{:04X}:{index}", self.pid))
         }
+    }
+
+    /// Whether `key` is one [`HidppEngine::device_key`] builds without a unit id
+    /// (`logi:<PID>:<index>`): identical devices present at once share it.
+    pub fn is_fallback_key(key: &DeviceKey) -> bool {
+        key.0
+            .strip_prefix("logi:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(pid, index)| {
+                pid.len() == 4
+                    && pid.bytes().all(|b| b.is_ascii_hexdigit())
+                    && !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+            })
     }
 
     /// How long a request to `index` may stay unanswered.
@@ -282,6 +331,9 @@ impl HidppEngine {
             return;
         };
         if !self.spend(c.grant, now) {
+            if self.discovering && index == DIRECT {
+                self.unanswered = true;
+            }
             return;
         }
         actions.push(Action::Send {
@@ -313,6 +365,51 @@ impl HidppEngine {
                 self.issue(index, Conversation::new(grant, Step::Ping), now, actions);
             }
         }
+    }
+
+    /// The group's own discovery under an arrival or rediscovery grant: the receiver
+    /// conversation, or a direct device's ping unless an earlier walk found nothing to show.
+    fn start_discovery(&mut self, grant: GrantId, now: Ms, actions: &mut Vec<Action>) {
+        if self.in_flight.contains_key(&DIRECT) {
+            return;
+        }
+        if self.receiver {
+            let c = Conversation::new(grant, Step::GetNotifications);
+            self.issue(DIRECT, c, now, actions);
+        } else if !self.settled {
+            self.unanswered = false;
+            self.discover([DIRECT], grant, now, actions);
+            self.discovering = self.in_flight.contains_key(&DIRECT);
+        }
+    }
+
+    /// Ends a direct group's discovery once nothing is in flight. A walk the device
+    /// completed without a device to register settles the group: it is not walked again.
+    /// One cut short by silence, an unreachable error or a spent grant is retried after the
+    /// next of [`REDISCOVERY_DELAYS_MS`] (reported as [`Action::Rediscover`] by `on_tick`),
+    /// or given up once those are used, or at once when a query wakes the device.
+    fn settle_discovery(&mut self, now: Ms, actions: &mut Vec<Action>) {
+        if !self.discovering || self.in_flight.contains_key(&DIRECT) {
+            return;
+        }
+        self.discovering = false;
+        if !self.devices.is_empty() {
+            return;
+        }
+        if !self.unanswered {
+            self.settled = true;
+            return;
+        }
+        let retry_at = if self.query_wakes {
+            None
+        } else {
+            REDISCOVERY_DELAYS_MS
+                .get(self.failures)
+                .map(|delay| now.saturating_add(*delay))
+        };
+        self.failures += 1;
+        self.retry_at = retry_at;
+        actions.push(Action::DiscoveryFailed { retry_at });
     }
 
     fn interpret(&self, decoder: Decoder, p: &[u8]) -> Outcome {
@@ -347,6 +444,15 @@ impl HidppEngine {
         if c.step == Step::Read {
             self.read_reply(index, reply, actions);
             return;
+        }
+        if self.discovering
+            && index == DIRECT
+            && matches!(
+                reply,
+                Reply::Err10(ERR_CONNECT_FAIL | ERR_UNKNOWN_DEVICE | ERR_RESOURCE_ERROR)
+            )
+        {
+            self.unanswered = true;
         }
         match discovery::advance(c.step, &mut c.found, reply) {
             // A known device re-enabled its notifications: read with what we know.
@@ -437,9 +543,13 @@ impl HidppEngine {
         actions.push(Action::Register {
             key,
             caps: Capabilities {
-                pushes_battery: true,
+                pushes_battery: !self.no_in_use_push,
                 query_wakes: self.query_wakes,
-                min_query_gap_ms: 0,
+                min_query_gap_ms: if self.no_in_use_push {
+                    ACTIVITY_GAP_MS
+                } else {
+                    0
+                },
             },
             initial,
             wpid: self.wpids.get(&index).copied(),
@@ -613,16 +723,20 @@ impl Engine for HidppEngine {
         );
         let mut actions = Vec::new();
         if grant.subject == self.group_key {
-            if grant.trigger == Trigger::Arrival {
-                if self.receiver {
-                    let c = Conversation::new(grant.id, Step::GetNotifications);
-                    self.issue(DIRECT, c, now, &mut actions);
-                } else {
-                    self.discover([DIRECT], grant.id, now, &mut actions);
+            match grant.trigger {
+                Trigger::Arrival | Trigger::Rediscovery => {
+                    // An arrival grant (also a resume's or refresh's for a group that
+                    // registered nothing) starts the retries over.
+                    if grant.trigger == Trigger::Arrival {
+                        self.failures = 0;
+                        self.retry_at = None;
+                    }
+                    self.start_discovery(grant.id, now, &mut actions);
                 }
-            } else {
-                let pending = std::mem::take(&mut self.pending);
-                self.discover(pending, grant.id, now, &mut actions);
+                _ => {
+                    let pending = std::mem::take(&mut self.pending);
+                    self.discover(pending, grant.id, now, &mut actions);
+                }
             }
         } else if let Some((&index, d)) = self.devices.iter().find(|(_, d)| d.key == grant.subject)
             && !self.in_flight.contains_key(&index)
@@ -662,6 +776,7 @@ impl Engine for HidppEngine {
             }
             None => self.on_event(bytes, &mut actions),
         }
+        self.settle_discovery(now, &mut actions);
         actions
     }
 
@@ -677,6 +792,9 @@ impl Engine for HidppEngine {
             let Some(f) = self.in_flight.remove(&index) else {
                 continue;
             };
+            if self.discovering && index == DIRECT {
+                self.unanswered = true;
+            }
             match f.conversation.step {
                 // The receiver did not answer: still ask it to report its slots.
                 Step::GetNotifications | Step::SetNotifications(_) => {
@@ -715,15 +833,25 @@ impl Engine for HidppEngine {
                 Step::Battery if self.is_direct(index) => {
                     self.discovered(index, f.conversation.found, None, &mut actions);
                 }
-                // Discovery: absent or asleep; its next link notification brings it back.
+                // Discovery: absent or asleep. A receiver slot's next link notification
+                // brings it back; a direct group is retried by `settle_discovery`.
                 _ => {}
             }
+        }
+        self.settle_discovery(now, &mut actions);
+        if self.retry_at.is_some_and(|at| now >= at) {
+            self.retry_at = None;
+            actions.push(Action::Rediscover);
         }
         actions
     }
 
     fn next_deadline(&self) -> Option<Ms> {
-        self.in_flight.values().map(|f| f.deadline).min()
+        self.in_flight
+            .values()
+            .map(|f| f.deadline)
+            .chain(self.retry_at)
+            .min()
     }
 }
 
@@ -757,7 +885,7 @@ source = "test"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 "#;
 
-    const FIXTURES: [&str; 10] = [
+    const FIXTURES: [&str; 11] = [
         include_str!("../../../tests/fixtures/hidpp/receiver_mouse_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/headset_long_only_discovery.txt"),
         include_str!("../../../tests/fixtures/hidpp/receiver_hidpp10_discovery.txt"),
@@ -768,6 +896,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         include_str!("../../../tests/fixtures/hidpp/0aba-headset-arrival.txt"),
         include_str!("../../../tests/fixtures/hidpp/c547-superlight-resume.txt"),
         include_str!("../../../tests/fixtures/hidpp/0aba-headset-resume.txt"),
+        include_str!("../../../tests/fixtures/hidpp/0aba-headset-stalled-discovery.txt"),
     ];
 
     fn catalog() -> Catalog {
@@ -840,6 +969,14 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             trigger,
             expires_ms: 10_000,
             max_requests: 96,
+        }
+    }
+
+    /// [`grant`] handed out at `now`, valid for the discovery policy's 10 s.
+    fn grant_at(id: u32, subject: &DeviceKey, trigger: Trigger, now: Ms) -> Grant {
+        Grant {
+            expires_ms: now + 10_000,
+            ..grant(id, subject, trigger)
         }
     }
 
@@ -1063,6 +1200,25 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     }
 
     #[test]
+    fn only_keys_without_unit_id_are_fallback_keys() {
+        let e = HidppEngine::new(&headset_group(), &catalog());
+        assert!(HidppEngine::is_fallback_key(&e.device_key(255, u32::MAX)));
+        assert!(HidppEngine::is_fallback_key(&e.device_key(1, 0)));
+        assert!(!HidppEngine::is_fallback_key(&e.device_key(1, 0x1A2B_3C4D)));
+        for other in [
+            "logi-group:0ABA:8",
+            "logi:0ABA:255#2",
+            "logi:0ABA:",
+            "x:0ABA:1",
+        ] {
+            assert!(
+                !HidppEngine::is_fallback_key(&DeviceKey(other.into())),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
     fn receiver_arrival_enables_wireless_notifications_or_only() {
         for (flags, write) in [
             ([0x00, 0x00, 0x00], Some([0x00, 0x01, 0x00])),
@@ -1281,6 +1437,34 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 ..pushing()
             }
         );
+    }
+
+    #[test]
+    fn no_in_use_push_device_accepts_activity() {
+        let (mut e, a) = headset_with(&Catalog::builtin());
+        let [Action::Register { caps, .. }] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(
+            *caps,
+            Capabilities {
+                pushes_battery: false,
+                query_wakes: false,
+                min_query_gap_ms: 300_000,
+            }
+        );
+
+        // An activity grant reads the battery once, like a refresh.
+        let a = e.on_grant(&grant(6, &headset_key(), Trigger::Activity), 100);
+        assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x08, 0x0B])]);
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 110);
+        let [Action::Update(update)] = a.as_slice() else {
+            panic!("{a:?}");
+        };
+        assert_eq!(update.presence, Some(Presence::Online));
+        assert_eq!(update.source, Source::Query);
+        assert_eq!(update.millivolts, Some(3_828));
+        assert_eq!(e.next_deadline(), None);
     }
 
     #[test]
@@ -1540,6 +1724,158 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 "{code:#04x}: {a:?}"
             );
         }
+    }
+
+    /// The direct headset's ping.
+    fn headset_ping() -> Vec<u8> {
+        l(&[0x11, 0xFF, 0x00, 0x1B, 0x00, 0x00, 0x5A])
+    }
+
+    /// A freshly plugged PRO X dongle (owner capture 2026-11-24): it answered the arrival
+    /// ping at t = 1, but the 0x0005 lookup sent then stays unanswered until 4 001.
+    fn headset_stalled() -> HidppEngine {
+        let mut e = HidppEngine::new(&headset_group(), &catalog());
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+        let (ping_reply, lookup) = headset_script().remove(0);
+        let a = e.on_report(LONG_C, &ping_reply, 1);
+        assert_eq!(sent(&a), vec![lookup]);
+        e
+    }
+
+    #[test]
+    fn direct_discovery_timeout_retries_after_2_s() {
+        let mut e = headset_stalled();
+        // Another client's ping and getFeature replies and a battery broadcast answer nothing.
+        for f in [
+            l(&[0x11, 0xFF, 0x00, 0x1F, 0x04, 0x02, 0xD9]),
+            l(&[0x11, 0xFF, 0x00, 0x0F]),
+            l(&[0x11, 0xFF, 0x06, 0x00, 0x0E, 0xB2, 0x01]),
+        ] {
+            assert!(e.on_report(LONG_C, &f, 2).is_empty());
+        }
+        assert_eq!(e.next_deadline(), Some(4_001));
+
+        let a = e.on_tick(4_001);
+        assert_eq!(
+            a,
+            vec![Action::DiscoveryFailed {
+                retry_at: Some(6_001)
+            }]
+        );
+        assert_eq!(e.next_deadline(), Some(6_001));
+        assert!(e.on_tick(6_000).is_empty());
+        assert_eq!(e.on_tick(6_001), vec![Action::Rediscover]);
+        assert_eq!(e.next_deadline(), None, "one-shot");
+
+        let gk = e.group_key();
+        let a = e.on_grant(&grant_at(6, &gk, Trigger::Rediscovery, 6_002), 6_002);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+    }
+
+    #[test]
+    fn rediscovery_that_succeeds_registers() {
+        let mut e = headset_stalled();
+        e.on_tick(4_001);
+        e.on_tick(6_001);
+        let gk = e.group_key();
+        let a = e.on_grant(&grant_at(6, &gk, Trigger::Rediscovery, 6_001), 6_001);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+
+        run(&mut e, &headset_script(), 6_002);
+        let a = e.on_report(
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]),
+            6_003,
+        );
+        assert!(matches!(a.as_slice(), [Action::Register { .. }]), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn direct_discovery_gives_up_after_three_retries_until_an_arrival_grant() {
+        let mut e = headset_stalled();
+        let gk = e.group_key();
+        let mut now = 4_001;
+        for (id, delay) in (6..).zip([2_000, 10_000, 60_000]) {
+            let retry_at = Some(now + delay);
+            assert_eq!(e.on_tick(now), vec![Action::DiscoveryFailed { retry_at }]);
+            now += delay;
+            assert_eq!(e.on_tick(now), vec![Action::Rediscover]);
+            let a = e.on_grant(&grant_at(id, &gk, Trigger::Rediscovery, now), now);
+            assert_eq!(sent(&a), vec![headset_ping()]);
+            // The ping goes unanswered.
+            now += Ms::from(DEVICE_TIMEOUT_MS);
+        }
+        assert_eq!(
+            e.on_tick(now),
+            vec![Action::DiscoveryFailed { retry_at: None }]
+        );
+        assert_eq!(e.next_deadline(), None);
+        assert!(e.on_tick(now + 1_000_000).is_empty());
+
+        // A resume or refresh hands the group an arrival grant again: retries start over.
+        let a = e.on_grant(&grant_at(9, &gk, Trigger::Arrival, now), now);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+        now += Ms::from(DEVICE_TIMEOUT_MS);
+        assert_eq!(
+            e.on_tick(now),
+            vec![Action::DiscoveryFailed {
+                retry_at: Some(now + 2_000)
+            }]
+        );
+    }
+
+    #[test]
+    fn direct_device_without_battery_feature_settles() {
+        let mut e = HidppEngine::new(&headset_group(), &catalog());
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+        // Every lookup answers "absent", 0x1F20 included: nothing to show.
+        let mut script = headset_script();
+        script.truncate(6);
+        run(&mut e, &script, 1);
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x0B, 0x00]), 2);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+
+        // A resume's or refresh's arrival grant does not walk it again.
+        let a = e.on_grant(&grant(6, &gk, Trigger::Arrival), 3);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn unreachable_error_ends_direct_discovery_with_a_retry() {
+        let mut e = headset_stalled();
+        // HID++ 1.0 error 0x08 (unknown device) to the 0x0005 lookup.
+        let a = e.on_report(LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x00, 0x0B, 0x08]), 2);
+        assert_eq!(
+            a,
+            vec![Action::DiscoveryFailed {
+                retry_at: Some(2_002)
+            }]
+        );
+        assert_eq!(e.next_deadline(), Some(2_002));
+    }
+
+    #[test]
+    fn query_wakes_direct_device_is_not_retried() {
+        let wakes = Catalog::parse(&CATALOG.replace(
+            "quirks = { voltage_curve = \"pro-x-wireless-ghub\" }",
+            "quirks = { query_wakes = true }",
+        ))
+        .unwrap();
+        let mut e = HidppEngine::new(&headset_group(), &wakes);
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+
+        let a = e.on_tick(4_000);
+        assert_eq!(a, vec![Action::DiscoveryFailed { retry_at: None }]);
+        assert_eq!(e.next_deadline(), None);
     }
 
     #[test]
