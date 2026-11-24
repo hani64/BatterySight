@@ -139,8 +139,7 @@ fn watch() {
         thread::sleep(Duration::from_millis(Ms::from(INTERVAL_MS)));
         // Observed even while disarmed, so arming starts from an up-to-date state.
         let stale = staleness.observe(now_ms(), HEARTBEAT.load(Ordering::Relaxed));
-        if ARMED.load(Ordering::Relaxed)
-            && WATCHDOG.check(stale, explorer_answers) == Verdict::Trip
+        if ARMED.load(Ordering::Relaxed) && WATCHDOG.check(stale, explorer_answers) == Verdict::Trip
         {
             trip();
         }
@@ -234,7 +233,10 @@ mod tests {
 
     /// The staleness seen by checks at each of `checks` while the beat stays at `beat`.
     fn run(staleness: &mut Staleness, checks: &[Ms], beat: Ms) -> Vec<Ms> {
-        checks.iter().map(|&now| staleness.observe(now, beat)).collect()
+        checks
+            .iter()
+            .map(|&now| staleness.observe(now, beat))
+            .collect()
     }
 
     #[test]
