@@ -19,7 +19,7 @@ pids = [0x0ABA]
 kind = "headset"
 engine = "hidpp"
 status = "hardware-tested"
-source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live); owner hardware test 2026-11-23: discovery, power on/off broadcasts, resume, Refresh now, G HUB comparison 77/77 and 76/77"
+source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live); owner hardware test 2026-11-23: discovery, power on/off broadcasts, Refresh now, G HUB comparison 77/77 and 76/77"
 quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
 [[device]]
@@ -39,7 +39,7 @@ wpids = [0x4093]
 kind = "mouse"
 engine = "hidpp"
 status = "hardware-tested"
-source = "G HUB core/data/devices/devices_0001.json (pro_x_wireless_mouse: displayName PRO X SUPERLIGHT, interfaces 046d_4093 and 046d_c094); its own HID++ name is PRO X Wireless (Solaar lib/logitech_receiver/descriptors.py, wpid 4093, usbid C094); owner hardware test 2026-11-23 on a C547 receiver: discovery on link-up, link-lost and resume, Refresh now, G HUB comparison 79/79 twice"
+source = "G HUB core/data/devices/devices_0001.json (pro_x_wireless_mouse: displayName PRO X SUPERLIGHT, interfaces 046d_4093 and 046d_c094); its own HID++ name is PRO X Wireless (Solaar lib/logitech_receiver/descriptors.py, wpid 4093, usbid C094); owner hardware test 2026-11-23 on a C547 receiver: discovery on link-up, asleep on link-lost, Refresh now, G HUB comparison 79/79 twice"
 
 [[device]]
 name = "PRO X Superlight"
