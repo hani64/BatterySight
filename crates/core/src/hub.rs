@@ -339,8 +339,10 @@ impl Hub {
     /// ([`engines::shared_key`]) held by another live group becomes the first `key#n`,
     /// n ≥ 2, no other live group holds; any other key is kept as is, so one device served
     /// by several groups stays one entry. Recomputed on every registration: a device that
-    /// got `#2` keeps it until it registers again. The device `gid` served under an
-    /// earlier hub key for `key` loses that registrant.
+    /// got `#2` keeps it until it registers again. A device `gid` alone served under an
+    /// earlier hub key for `key` moves to the new key with its last values, replacing what
+    /// another device left there in grace; one shared with other groups loses `gid` as a
+    /// registrant instead.
     fn claim(&mut self, gid: GroupId, key: DeviceKey, now: Ms, pass: &mut Pass) -> DeviceKey {
         if !engines::shared_key(&key) {
             return key;
@@ -358,7 +360,25 @@ impl Hub {
         }
         let previous = self.hub_key(gid, key.clone());
         if previous != claimed {
-            self.drop_registrant(&previous, gid, now, pass);
+            if self
+                .owners
+                .get(&previous)
+                .is_some_and(|groups| groups.as_slice() == [gid])
+            {
+                self.owners.remove(&previous);
+                self.grace.remove(&previous);
+                self.scheduler.unregister(&previous);
+                if self.grace.remove(&claimed).is_some() {
+                    self.scheduler.unregister(&claimed);
+                }
+                if let Some(mut state) = self.states.remove(&previous) {
+                    state.key = claimed.clone();
+                    self.states.insert(claimed.clone(), state);
+                }
+                pass.changed = true;
+            } else {
+                self.drop_registrant(&previous, gid, now, pass);
+            }
         }
         if let Some(slot) = self.engines.get_mut(&gid) {
             if claimed == key {
@@ -1604,7 +1624,11 @@ source = "test"
         let k = dev("logi:0ABA:255");
         let (k2, k3) = (dev("logi:0ABA:255#2"), dev("logi:0ABA:255#3"));
         let (first, second, third) = (fake(), fake(), fake());
-        for f in [&first, &second, &third] {
+        first
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, Some(Level::Percent(90)))]);
+        for f in [&second, &third] {
             f.borrow_mut().on_grant.push_back(vec![register(&k, None)]);
         }
         second
@@ -1615,10 +1639,26 @@ source = "test"
             .borrow_mut()
             .on_report
             .push_back(vec![level_update(&k, 39)]);
+        // Registers again without a reading (e.g. the device is asleep).
+        let Action::Register {
+            caps,
+            mut initial,
+            wpid,
+            ..
+        } = register(&k, None)
+        else {
+            unreachable!()
+        };
+        initial.presence = Some(Presence::Asleep);
         second
             .borrow_mut()
             .on_report
-            .push_back(vec![register(&k, None)]);
+            .push_back(vec![Action::Register {
+                key: k.clone(),
+                caps,
+                initial,
+                wpid,
+            }]);
         third
             .borrow_mut()
             .on_report
@@ -1635,7 +1675,7 @@ source = "test"
         // The engine keeps speaking its own key; the hub maps it both ways.
         hub.handle(report(2), 10);
         assert_eq!(state(&hub, &k2).unwrap().level, Some(Level::Percent(40)));
-        assert_eq!(state(&hub, &k).unwrap().level, None);
+        assert_eq!(state(&hub, &k).unwrap().level, Some(Level::Percent(90)));
         hub.handle(HubInput::RefreshNow, 20);
         assert_eq!(
             grants(&second).last(),
@@ -1655,8 +1695,15 @@ source = "test"
         assert_eq!(state(&hub, &k).unwrap().presence, Presence::Offline);
         hub.handle(report(2), 60);
         assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&k));
-        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Online);
-        assert_eq!(state(&hub, &k2).unwrap().presence, Presence::Offline);
+        // It takes its own last values along, not those the first device left behind.
+        let s = state(&hub, &k).unwrap();
+        assert_eq!(s.level, Some(Level::Percent(39)));
+        assert_eq!(s.presence, Presence::Asleep);
+        let keys: Vec<DeviceKey> = hub.snapshot().into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, [k.clone(), k3.clone()], "no `#2` entry left behind");
+        // The first device's grace no longer applies to the key.
+        hub.handle(HubInput::Tick, 40 + REMOVAL_GRACE_MS);
+        assert!(state(&hub, &k).is_some());
     }
 
     #[test]

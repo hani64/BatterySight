@@ -5,8 +5,9 @@
 //! is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
 //! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread, which also
 //! adds `"<unix ms> audio <container hex> active|idle"` when a device's audio sessions start
-//! or stop (`"<unix ms> audio unavailable <stage>"` when they cannot be watched), and the UI
-//! adds `"<unix ms> ui <text>"` lines ([`ui_line`]). Tracing only
+//! or stop (`"<unix ms> audio unavailable <stage>"` when they cannot be watched), the UI
+//! adds `"<unix ms> ui <text>"` lines ([`ui_line`]) and the settings and history store
+//! `"<unix ms> store <text>"` lines when a file cannot be read or written. Tracing only
 //! records what the runtime already does, so it adds no device traffic, and it never fails
 //! the app: an unwritable file just means no trace.
 
@@ -77,6 +78,16 @@ pub fn ui_line(text: &str) {
     }
 }
 
+/// Appends `"<unix ms> store <text>"` like [`ui_line`]; called from the store's writer
+/// thread, and at startup before any window exists.
+pub(crate) fn store_line(text: &str) {
+    if let Some(mut trace) = Trace::from_env() {
+        let mut text = store_text(unix_ms(), text);
+        text.push('\n');
+        let _ = trace.0.write_all(text.as_bytes());
+    }
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -109,6 +120,11 @@ fn line(unix_ms: u64, direction: Direction, collection: CollectionId, bytes: &[u
 /// `"<unix ms> ui <text>"`.
 fn ui_text(unix_ms: u64, text: &str) -> String {
     format!("{unix_ms} ui {text}")
+}
+
+/// `"<unix ms> store <text>"`.
+fn store_text(unix_ms: u64, text: &str) -> String {
+    format!("{unix_ms} store {text}")
 }
 
 /// `"<unix ms> audio <container hex> active|idle"`.
@@ -157,6 +173,14 @@ mod tests {
         assert_eq!(
             ui_text(1_763_900_000_123, "fallback NoAnchor"),
             "1763900000123 ui fallback NoAnchor"
+        );
+    }
+
+    #[test]
+    fn store_line_has_time_and_text() {
+        assert_eq!(
+            store_text(12, "save failed: denied"),
+            "12 store save failed: denied"
         );
     }
 
