@@ -6,8 +6,8 @@
 # drivers/hid/hid-logitech-hidpp.c (long 0x11 reports, 0x1F20 ADC measurement
 # event `hidpp20_adc_measurement_event_1f20`) and Solaar
 # lib/logitech_receiver (base.py ping accepting index 0x00 for 0xFF,
-# hidpp20.py feature calls). Feature indexes are made up. Replace with a real
-# capture in Task 14.
+# hidpp20.py feature calls). Feature indexes are made up. The real capture
+# of this headset is 0aba-headset-arrival.txt.
 #
 # Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
 # reads; frames shorter than their role (7 / 20 bytes) are zero-padded. The
