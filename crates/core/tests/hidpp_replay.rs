@@ -138,6 +138,7 @@ struct Expect {
     level: Level,
     millivolts: Option<u16>,
     charge: Charge,
+    presence: Presence,
 }
 
 /// Replays `text` and returns the hub for state checks.
@@ -194,7 +195,16 @@ fn check(hub: &Hub, name: &str, want: &Expect) {
     assert_eq!(s.level, Some(want.level), "{name}");
     assert_eq!(s.millivolts, want.millivolts, "{name}");
     assert_eq!(s.charge, want.charge, "{name}");
-    assert_eq!(s.presence, Presence::Online, "{name}");
+    assert_eq!(s.presence, want.presence, "{name}");
+}
+
+/// The lines of `text` up to and including the first one containing `marker`.
+fn until(text: &str, marker: &str) -> String {
+    let end = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("no {marker:?} in fixture"));
+    let end = text[end..].find('\n').map_or(text.len(), |n| end + n + 1);
+    text[..end].to_owned()
 }
 
 #[test]
@@ -216,6 +226,7 @@ fn receiver_mouse_discovery() {
             level: Level::Percent(78),
             millivolts: None,
             charge: Charge::Discharging,
+            presence: Presence::Online,
         },
     );
 }
@@ -239,6 +250,7 @@ fn headset_long_only_discovery() {
             level: Level::Percent(87),
             millivolts: Some(3971),
             charge: Charge::Charging,
+            presence: Presence::Online,
         },
     );
 }
@@ -262,6 +274,7 @@ fn receiver_hidpp10_discovery() {
             level: Level::Coarse(CoarseLevel::Low),
             millivolts: None,
             charge: Charge::Discharging,
+            presence: Presence::Online,
         },
     );
 }
@@ -286,6 +299,7 @@ fn headset_off_at_start() {
             level: Level::Percent(68),
             millivolts: Some(3828),
             charge: Charge::Discharging,
+            presence: Presence::Online,
         },
     );
 }
@@ -300,6 +314,7 @@ fn c547_mouse() -> Expect {
         level: Level::Percent(80),
         millivolts: None,
         charge: Charge::Discharging,
+        presence: Presence::Online,
     }
 }
 
@@ -336,11 +351,12 @@ fn superlight(level: u8) -> Expect {
         level: Level::Percent(level),
         millivolts: None,
         charge: Charge::Discharging,
+        presence: Presence::Online,
     }
 }
 
 /// The PRO X Wireless headset of the owner captures at `millivolts`, discharging.
-fn pro_x_headset(level: u8, millivolts: u16) -> Expect {
+fn pro_x_headset(level: u8, millivolts: u16, presence: Presence) -> Expect {
     Expect {
         key: "logi:0ABA:255",
         name: "PRO X Wireless Gaming Headset",
@@ -349,6 +365,7 @@ fn pro_x_headset(level: u8, millivolts: u16) -> Expect {
         level: Level::Percent(level),
         millivolts: Some(millivolts),
         charge: Charge::Discharging,
+        presence,
     }
 }
 
@@ -377,13 +394,14 @@ fn c547_superlight_resume() {
 #[test]
 fn headset_arrival() {
     let name = "0aba-headset-arrival.txt";
-    let hub = replay(
-        name,
-        include_str!("fixtures/hidpp/0aba-headset-arrival.txt"),
-        headset(),
-    );
-    // 0x0F81 = 3969 mV on the PRO X curve: 85 + 5 * (3969 - 3950) / (3993 - 3950), truncated.
-    check(&hub, name, &pro_x_headset(87, 3969));
+    let text = include_str!("fixtures/hidpp/0aba-headset-arrival.txt");
+    // Switched on: 0x0F81 = 3969 mV on the PRO X curve: 85 + 5 * (3969 - 3950) / (3993 - 3950),
+    // truncated.
+    let hub = replay(name, &until(text, "# +45.038 s"), headset());
+    check(&hub, name, &pro_x_headset(87, 3969, Presence::Online));
+    // Last switched on at 0x0F7E = 3966 mV (86 %), then off: asleep, level kept.
+    let hub = replay(name, text, headset());
+    check(&hub, name, &pro_x_headset(86, 3966, Presence::Asleep));
 }
 
 #[test]
@@ -395,5 +413,5 @@ fn headset_resume() {
         headset(),
     );
     // 0x0F62 = 3938 mV: 80 + 5 * (3938 - 3915) / (3950 - 3915), truncated.
-    check(&hub, name, &pro_x_headset(83, 3938));
+    check(&hub, name, &pro_x_headset(83, 3938, Presence::Online));
 }

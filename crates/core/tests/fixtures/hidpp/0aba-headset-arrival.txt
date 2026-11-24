@@ -1,13 +1,12 @@
 # PRO X Wireless Gaming Headset 046D:0ABA, long-only collection FF43:0202,
 # device index 0xFF. The headset is off when BatterySight starts (its USB
-# dongle is plugged in) and switched on 45 s later.
+# dongle is plugged in), switched on 45 s later, then off, on and off again.
 #
-# Real capture: owner capture 2026-11-23, G HUB closed. The
-# trace also held the C547 receiver; only this group's frames are kept,
-# verbatim (the dongle reports the placeholder unit id FFFFFFFF, so there is
-# no unit id to replace). The capture's later frames of this group are in
-# 0aba-headset-resume.txt. The trailing `# +<s>` is the frame's time in the
-# capture, counted from app start.
+# Real capture: owner capture 2026-11-23, G HUB closed. The trace also held
+# the C547 receiver; only this group's frames up to the end of the first
+# recorded session are kept, verbatim (the dongle reports the placeholder unit
+# id FFFFFFFF, so there is no unit id to replace). The trailing `# +<s>` is the
+# frame's time in the capture, counted from app start.
 #
 # Format: `out <short|long> <hex>` is a frame BatterySight writes, `in` one it
 # reads, `@t+<ms>` lets time pass and ticks the hub. Each `in` advances the
@@ -53,3 +52,11 @@ in  long  11 FF FF 06 0B 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00  # +0.065 
 # (discharging) -> 87 % on the PRO X curve, online, no write.
 @t+45024
 in  long  11 FF 06 00 0F 81 01 00 00 00 00 00 00 00 00 00 00 00 00 00  # +45.038 s
+# Switched off: the dongle broadcasts 0 mV with flags 0x00 -> asleep, level
+# kept. On: 0x0F7E = 3966 mV -> 86 %. Off again: asleep at 86 %. No writes.
+@t+34431
+in  long  11 FF 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  # +79.470 s
+@t+4535
+in  long  11 FF 06 00 0F 7E 01 00 00 00 00 00 00 00 00 00 00 00 00 00  # +84.006 s
+@t+3048
+in  long  11 FF 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  # +87.055 s
