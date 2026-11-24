@@ -708,11 +708,13 @@ source = "test"
         })
     }
 
+    /// A device that pushes its battery. Its gap would allow activity reads, so only the
+    /// pushing rule refuses them.
     fn pushing() -> Capabilities {
         Capabilities {
             pushes_battery: true,
             query_wakes: false,
-            min_query_gap_ms: 0,
+            min_query_gap_ms: 300_000,
         }
     }
 

@@ -296,7 +296,8 @@ mod tests {
 
     #[test]
     fn pushing_device_ignores_activity() {
-        let mut s = scheduler_with(caps(true, false, 0));
+        // A gap of its own, so only the pushing rule refuses.
+        let mut s = scheduler_with(caps(true, false, 300_000));
         for t in [0, 1, 300_000, 86_400_000, Ms::MAX] {
             assert_eq!(s.request(&key(), Trigger::Activity, t), None, "t = {t}");
         }
@@ -392,7 +393,7 @@ mod tests {
 
         s.mark_asleep(&key());
         assert_eq!(s.activity_ready_at(&key()), None, "asleep");
-        let pushing = scheduler_with(caps(true, false, 0));
+        let pushing = scheduler_with(caps(true, false, 300_000));
         assert_eq!(pushing.activity_ready_at(&key()), None, "pushes");
         let empty = Scheduler::new(Policy::default());
         assert_eq!(empty.activity_ready_at(&key()), None, "unknown");
