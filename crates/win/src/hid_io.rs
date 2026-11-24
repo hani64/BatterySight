@@ -12,15 +12,21 @@ use std::ptr::NonNull;
 use std::slice;
 
 use batterysight_core::hid::CollectionId;
+use windows::Wdk::System::IO::NtDeviceIoControlFile;
 use windows::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE,
-    HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    RtlNtStatusToDosError, STATUS_PENDING, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
     WriteFile,
 };
-use windows::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+#[cfg(test)]
+use windows::Win32::{
+    Foundation::NTSTATUS,
+    System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE},
+};
 use windows::core::PCWSTR;
 
 use crate::hid_enum::OwnedHandle;
@@ -32,17 +38,19 @@ const IOCTL_HID_GET_FEATURE: u32 = (0x0B << 16) | (100 << 2) | 2; // METHOD_OUT_
 #[cfg(test)]
 pub(crate) type FeatureControl = unsafe fn(
     HANDLE,
+    Option<HANDLE>,
+    PIO_APC_ROUTINE,
+    Option<*const c_void>,
+    *mut IO_STATUS_BLOCK,
     u32,
     Option<*const c_void>,
     u32,
     Option<*mut c_void>,
     u32,
-    Option<*mut u32>,
-    Option<*mut OVERLAPPED>,
-) -> windows::core::Result<()>;
+) -> NTSTATUS;
 
 #[cfg(test)]
-pub(crate) const FEATURE_CONTROL: FeatureControl = DeviceIoControl;
+pub(crate) const FEATURE_CONTROL: FeatureControl = NtDeviceIoControlFile;
 
 /// Whether Windows holds the collection exclusively: mouse (0x01/0x02) and keyboard
 /// (0x01/0x06) collections of the generic desktop page. HID++ uses the vendor collections.
@@ -119,7 +127,7 @@ impl Op {
     pub(crate) fn start(self: Box<Self>, handle: HANDLE) -> bool {
         self.submit(|kind, buffer, len, overlapped| {
             // SAFETY: `submit` gives Windows the buffer and OVERLAPPED until dequeue.
-            unsafe {
+            let result = unsafe {
                 match kind {
                     Kind::Read => ReadFile(
                         handle,
@@ -135,6 +143,11 @@ impl Op {
                     ),
                     _ => unreachable!("feature controls use start_feature"),
                 }
+            };
+            if queues_completion(&result) {
+                Ok(())
+            } else {
+                result
             }
         })
         .is_ok()
@@ -147,7 +160,7 @@ impl Op {
         #[cfg(test)] control: FeatureControl,
     ) -> windows::core::Result<NonNull<OVERLAPPED>> {
         #[cfg(not(test))]
-        let control = DeviceIoControl;
+        let control = NtDeviceIoControlFile;
         self.submit(|kind, buffer, len, overlapped| {
             let len = len as u32; // HID report widths come from the u16 descriptor lengths.
             let (code, input, input_len, output, output_len) = match kind {
@@ -163,24 +176,38 @@ impl Op {
                 }
                 _ => unreachable!("read and write use start"),
             };
-            // SAFETY: `submit` gives Windows the buffer and OVERLAPPED until dequeue.
-            unsafe {
+            // SAFETY: the IO_STATUS_BLOCK is the two pointer-sized fields at the start
+            // of OVERLAPPED. Use the same address as the IOCP completion context.
+            // `submit` keeps this storage and the buffers alive until dequeue.
+            let status = unsafe {
+                (*overlapped).Internal = STATUS_PENDING.0 as usize;
                 control(
                     handle,
+                    None,
+                    None,
+                    Some(overlapped.cast_const().cast()),
+                    overlapped.cast(),
                     code,
                     input,
                     input_len,
                     output,
                     output_len,
-                    None,
-                    Some(overlapped),
                 )
+            };
+            // NT_ERROR tests the two severity bits. A synchronous warning still queues
+            // a packet; Win32's last error can lose that distinction.
+            if status.0.cast_unsigned() >> 30 == 3 {
+                // SAFETY: this translates a status value and takes no pointers.
+                let error = unsafe { RtlNtStatusToDosError(status) };
+                Err(WIN32_ERROR(error).into())
+            } else {
+                Ok(())
             }
         })
     }
 
-    /// Hands off this allocation until dequeue, or reclaims it if submission fails with
-    /// an error status and therefore will not produce an IOCP packet.
+    /// `issue` returns `Ok` when a packet is expected. An immediate error returns ownership
+    /// here without a packet; otherwise the allocation stays alive until dequeue.
     fn submit(
         mut self: Box<Self>,
         issue: impl FnOnce(Kind, *mut u8, usize, *mut OVERLAPPED) -> windows::core::Result<()>,
@@ -192,12 +219,14 @@ impl Op {
         // afterward the kernel owns it while a completion packet is expected.
         let result =
             unsafe { issue((*op).kind, (*op).buffer.as_mut_ptr(), (*op).buffer.len(), overlapped) };
-        if queues_completion(&result) {
-            return Ok(NonNull::new(overlapped).expect("Box yields a non-null pointer"));
+        match result {
+            Ok(()) => Ok(NonNull::new(overlapped).expect("Box yields a non-null pointer")),
+            Err(error) => {
+                // SAFETY: without a packet, the kernel kept no references to the allocation.
+                drop(unsafe { Box::from_raw(op) });
+                Err(error)
+            }
         }
-        // SAFETY: the request failed without queueing a packet; the kernel kept no reference.
-        drop(unsafe { Box::from_raw(op) });
-        Err(result.expect_err("a successful overlapped request queues a completion"))
     }
 
     /// Takes back an `Op` whose completion packet was dequeued.
@@ -221,11 +250,8 @@ impl Op {
     }
 }
 
-/// Whether a just-issued overlapped request will queue a completion packet.
-///
-/// The I/O manager queues one unless the request failed with an error status. Success,
-/// pending, and a warning status all queue one; for example, `STATUS_BUFFER_OVERFLOW`
-/// surfaces as `ERROR_MORE_DATA`.
+/// Whether a just-issued Win32 `ReadFile` or `WriteFile` queues a completion packet.
+/// `ERROR_MORE_DATA` is the buffer overflow warning on this path.
 fn queues_completion(result: &windows::core::Result<()>) -> bool {
     match result {
         Ok(()) => true,

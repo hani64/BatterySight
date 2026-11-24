@@ -485,18 +485,24 @@ impl Reactor {
             match (op.kind, op.result(handle)) {
                 (_, Err(error)) => Err(FeatureFailure::Completion(error.code())),
                 (Kind::SetFeature, Ok(_)) => Ok(()),
-                (Kind::GetFeature { report_id }, Ok(read))
-                    if (1..=op.buffer.len()).contains(&read) && op.buffer[0] == report_id =>
-                {
-                    op.buffer.truncate(read);
-                    out.push(OsEvent::FeatureReply {
-                        collection,
-                        bytes: mem::take(&mut op.buffer),
-                        deadline,
-                    });
-                    Ok(())
+                (Kind::GetFeature { report_id }, Ok(read)) => {
+                    // For unnumbered reports the transfer count excludes Windows' ID byte.
+                    let prefix = usize::from(report_id == 0);
+                    if read == 0
+                        || read > op.buffer.len().saturating_sub(prefix)
+                        || op.buffer.first() != Some(&report_id)
+                    {
+                        Err(FeatureFailure::InvalidReply)
+                    } else {
+                        op.buffer.truncate(read + prefix);
+                        out.push(OsEvent::FeatureReply {
+                            collection,
+                            bytes: mem::take(&mut op.buffer),
+                            deadline,
+                        });
+                        Ok(())
+                    }
                 }
-                (Kind::GetFeature { .. }, Ok(_)) => Err(FeatureFailure::InvalidReply),
                 _ => unreachable!("read and write completions are handled separately"),
             }
         };
@@ -587,12 +593,14 @@ pub(crate) mod tests {
     use batterysight_core::engines::hidpp::frame::fap;
     use batterysight_core::hid::Collection;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
-        ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_LISTENING, HANDLE, STATUS_CANCELLED,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_LISTENING, HANDLE, NTSTATUS,
+        STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_DEVICE_BUSY, STATUS_PENDING,
     };
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
     };
+    use windows::Win32::System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE};
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
         PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState,
@@ -720,26 +728,32 @@ pub(crate) mod tests {
         static FEATURE_CANCELS: RefCell<Vec<(HANDLE, Option<*const OVERLAPPED>)>> =
             const { RefCell::new(Vec::new()) };
         static FEATURE_NOW: Cell<Option<Ms>> = const { Cell::new(None) };
-        static FEATURE_REJECT: Cell<bool> = const { Cell::new(false) };
+        static FEATURE_STATUS: Cell<NTSTATUS> = const { Cell::new(STATUS_PENDING) };
     }
 
     // Substitute only the Windows calls that would need a HID driver. The operation,
     // buffer, packet dequeue and GetOverlappedResult are the production path.
-    #[allow(clippy::too_many_arguments)] // Mirrors DeviceIoControl.
+    #[allow(clippy::too_many_arguments)] // Mirrors NtDeviceIoControlFile.
     unsafe fn feature_control(
         _: HANDLE,
+        event: Option<HANDLE>,
+        apc: PIO_APC_ROUTINE,
+        context: Option<*const c_void>,
+        iosb: *mut IO_STATUS_BLOCK,
         code: u32,
         input: Option<*const c_void>,
         input_len: u32,
         output: Option<*mut c_void>,
         output_len: u32,
-        transferred: Option<*mut u32>,
-        overlapped: Option<*mut OVERLAPPED>,
-    ) -> windows::core::Result<()> {
-        assert!(transferred.is_none());
-        let overlapped = overlapped.expect("feature must be overlapped");
-        if FEATURE_REJECT.get() {
-            return Err(ERROR_ACCESS_DENIED.into());
+    ) -> NTSTATUS {
+        assert!(event.is_none() && apc.is_none());
+        assert_eq!(context, Some(iosb.cast_const().cast()));
+        let overlapped = iosb.cast::<OVERLAPPED>();
+        // SAFETY: submission still owns this initialized OVERLAPPED.
+        assert_eq!(unsafe { (*overlapped).Internal }, STATUS_PENDING.0 as usize);
+        let status = FEATURE_STATUS.get();
+        if status == STATUS_ACCESS_DENIED {
+            return status;
         }
         assert!(
             FEATURE_CALL
@@ -753,7 +767,7 @@ pub(crate) mod tests {
                 }))
                 .is_none()
         );
-        Err(ERROR_IO_PENDING.into())
+        status
     }
 
     unsafe fn feature_cancel(
@@ -840,7 +854,7 @@ pub(crate) mod tests {
 
     fn feature_reactor(now: Option<Ms>) -> Reactor {
         FEATURE_NOW.set(now);
-        FEATURE_REJECT.set(false);
+        FEATURE_STATUS.set(STATUS_PENDING);
         FEATURE_CALL.set(None);
         FEATURE_CANCELS.with_borrow_mut(Vec::clear);
         let mut reactor = Reactor::new().unwrap();
@@ -893,7 +907,10 @@ pub(crate) mod tests {
             assert!(reactor.wait(Some(0), 0).is_empty());
         }
 
-        for report_id in [0x07, 0x00] {
+        for (report_id, expected) in [
+            (0x07, &[0x07, 0xAB, 0xCD][..]),
+            (0x00, &[0x00, 0xAB, 0xCD, 0xEF][..]),
+        ] {
             assert!(reactor.feature(id, ReportKind::GetFeature, &[report_id], 50));
             let pending = PendingCall::take(&reactor, id);
             let call = pending.call();
@@ -903,7 +920,7 @@ pub(crate) mod tests {
             pending.reply(&[report_id, 0xAB, 0xCD, 0xEF], 3);
             assert_eq!(
                 reactor.wait(Some(0), 0),
-                [feature_reply(id, &[report_id, 0xAB, 0xCD], 50)]
+                [feature_reply(id, expected, 50)]
             );
         }
     }
@@ -936,7 +953,7 @@ pub(crate) mod tests {
             );
         }
 
-        FEATURE_REJECT.set(true);
+        FEATURE_STATUS.set(STATUS_ACCESS_DENIED);
         assert!(!reactor.feature(id, ReportKind::SetFeature, &[3], 50));
         assert_eq!(
             reactor.wait(Some(0), 0),
@@ -946,10 +963,17 @@ pub(crate) mod tests {
                 FeatureFailure::Start(ERROR_ACCESS_DENIED.to_hresult())
             )]
         );
-        FEATURE_REJECT.set(false);
+        FEATURE_STATUS.set(STATUS_PENDING);
 
-        for (reply_id, transferred) in [(4, 4), (3, 0), (3, 5)] {
-            assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50));
+        for (requested_id, reply_id, transferred) in [
+            (3, 4, 4),
+            (3, 3, 0),
+            (3, 3, 5),
+            (0, 0, 0),
+            (0, 0, 4),
+            (0, 1, 3),
+        ] {
+            assert!(reactor.feature(id, ReportKind::GetFeature, &[requested_id], 50));
             PendingCall::take(&reactor, id).reply(&[reply_id], transferred);
             assert_eq!(
                 reactor.wait(Some(0), 0),
@@ -967,6 +991,38 @@ pub(crate) mod tests {
                 FeatureFailure::Completion(ERROR_OPERATION_ABORTED.to_hresult())
             )]
         );
+    }
+
+    #[test]
+    fn feature_submission_warning_is_retained_until_dequeue() {
+        let (_server, pipe) = feature_pipe();
+        let id = pipe.collection.id;
+        let mut reactor = feature_reactor(Some(10));
+        reactor.open(GroupId(1), &pipe, false, true).unwrap();
+        FEATURE_STATUS.set(STATUS_DEVICE_BUSY);
+
+        // Do not post or touch the captured pointer until the reactor confirms it
+        // retained the operation. The pre-fix false result means the allocation is gone.
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50));
+        let mut pending = PendingCall::take(&reactor, id);
+        pending.complete(STATUS_DEVICE_BUSY.0 as usize, 0);
+        assert_eq!(
+            reactor.wait(Some(0), 0),
+            [feature_failed(
+                id,
+                ReportKind::GetFeature,
+                FeatureFailure::Completion(ERROR_BUSY.to_hresult())
+            )]
+        );
+        assert_eq!(reactor.pending, 0);
+    }
+
+    #[test]
+    fn feature_submission_on_invalid_handle_fails_immediately() {
+        let error = Op::new(CollectionId(fresh_id()), Kind::SetFeature, vec![3])
+            .start_feature(HANDLE::default(), hid_io::FEATURE_CONTROL)
+            .unwrap_err();
+        assert_eq!(error.code(), ERROR_INVALID_HANDLE.to_hresult());
     }
 
     #[test]
