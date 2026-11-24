@@ -258,7 +258,8 @@ fn headset_long_only_discovery() {
             name: "PRO X Wireless Gaming Headset",
             kind: DeviceKind::Headset,
             via: Via::Usb,
-            level: Level::Percent(87),
+            // Charging: the PRO X charging curve's ascending branch, 3.971 V -> 14.71 %.
+            level: Level::Percent(14),
             millivolts: Some(3971),
             charge: Charge::Charging,
             presence: Presence::Online,
