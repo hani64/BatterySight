@@ -23,6 +23,8 @@ pub const FUTURE_SLACK_MS: u64 = 24 * 60 * 60 * 1000;
 const MIN_SPAN_MS: u64 = 2 * 60 * 60 * 1000;
 /// …with at least this many samples.
 const MIN_POINTS: usize = 3;
+/// A wake reading followed this soon by a reading in use gives way to it ([`provisional`]).
+const PROVISIONAL_MS: u64 = 10 * 60 * 1000;
 /// Times from 2286 on are rejected: a torn line's leftover digits run on into the next
 /// line's 13-digit time and make it at least 14 digits long.
 const MAX_UNIX_MS: u64 = 9_999_999_999_999;
@@ -342,13 +344,18 @@ pub fn add(
 /// latest level, at the rate it fell over its most recent qualifying discharge span: a
 /// run of awake, discharging samples with a percentage that does not rise, lasting at
 /// least 2 h with at least 3 samples. A sleeping or offline sample, a session break, a
-/// charge, or a rise ends a span. The latest level is the latest sample's, session breaks
-/// after it left out (a device that has not reported since the PC woke keeps its
-/// estimate). `None` without such a span, without a drop over it, or when the latest
-/// sample is on power or has no percentage. Samples after `now_unix_ms` are left out.
+/// charge, or a rise ends a span; [`provisional`] wake readings are left out. The latest
+/// level is the latest sample's, session breaks after it left out (a device that has not
+/// reported since the PC woke keeps its estimate). `None` without such a span, without a
+/// drop over it, or when the latest sample is on power or has no percentage. Samples
+/// after `now_unix_ms` are left out.
 pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
     let samples = &samples[..samples.partition_point(|s| s.at_unix_ms <= now_unix_ms)];
     let samples = &samples[..samples.iter().rposition(|s| !s.is_break())? + 1];
+    let samples: Vec<&Sample> = (0..samples.len())
+        .filter(|&i| !provisional(samples, i))
+        .map(|i| &samples[i])
+        .collect();
     let latest = samples.last()?;
     let Some(Level::Percent(level)) = latest.level else {
         return None;
@@ -370,14 +377,14 @@ pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
     // Walk back from the latest sample, span by span.
     let mut end = samples.len();
     while end > 0 {
-        let Some(last) = percent(&samples[end - 1]) else {
+        let Some(last) = percent(samples[end - 1]) else {
             end -= 1;
             continue;
         };
         let mut start = end - 1;
         let mut first = last;
         while start > 0 {
-            match percent(&samples[start - 1]) {
+            match percent(samples[start - 1]) {
                 Some(p) if p >= first => {
                     first = p;
                     start -= 1;
@@ -393,6 +400,35 @@ pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
         end = start;
     }
     None
+}
+
+/// Whether `samples[i]` (in time order) is a wake reading that gives way to a later one: a
+/// level from the voltage (with millivolts) that the device pushed as it woke (the sample
+/// before it is not awake, or a session break, or there is none), followed within
+/// [`PROVISIONAL_MS`] by an awake reading with a level that is not one too. A battery that
+/// has rested reads several points higher than in use minutes later; the reading in use
+/// stands for it, in the chart and in [`time_left`]. A wake reading with nothing soon
+/// after (the latest, say) stands.
+pub fn provisional(samples: &[Sample], i: usize) -> bool {
+    let woke = |i: usize| {
+        let s = &samples[i];
+        s.presence == Presence::Online
+            && s.source == Source::Push
+            && s.millivolts.is_some()
+            && s.level.is_some()
+            && i.checked_sub(1)
+                .is_none_or(|p| samples[p].presence != Presence::Online || samples[p].is_break())
+    };
+    if !woke(i) {
+        return false;
+    }
+    let at = samples[i].at_unix_ms;
+    samples
+        .iter()
+        .enumerate()
+        .skip(i + 1)
+        .take_while(|(_, s)| s.at_unix_ms.abs_diff(at) <= PROVISIONAL_MS)
+        .any(|(j, s)| s.presence == Presence::Online && s.level.is_some() && !woke(j))
 }
 
 /// "Time left: about N h" (to the nearest hour), "Time left: less than 1 h" or "Time
@@ -927,5 +963,31 @@ mod tests {
         let later = T0 + KEEP_MS + 1;
         add(&mut history, [], later);
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn time_left_ignores_provisional_wake_readings() {
+        let asleep = Sample {
+            presence: Presence::Asleep,
+            ..sample(T0, 61)
+        };
+        // The voltage-based push as the device wakes reads 64 % on a rested battery; a
+        // minute later it reads 61 % in use, then falls to 59 % over 2 h.
+        let wake = Sample {
+            millivolts: Some(3_805),
+            source: Source::Push,
+            ..sample(T0 + 10 * MIN, 64)
+        };
+        let mut s = vec![asleep, wake];
+        s.push(sample(T0 + 11 * MIN, 61));
+        s.push(sample(T0 + 71 * MIN, 60));
+        s.push(sample(T0 + 131 * MIN, 59));
+        // 61 → 59 % over 2 h, not 64 → 59 % over 2 h 1 min.
+        assert_eq!(
+            time_left(&s, T0 + 131 * MIN),
+            Some(Duration::from_millis(59 * 120 * MIN / 2))
+        );
+        assert!(provisional(&s, 1));
+        assert!(!provisional(&s, 2));
     }
 }
