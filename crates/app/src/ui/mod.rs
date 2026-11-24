@@ -3,14 +3,15 @@
 //! # Threads
 //!
 //! The UI thread (the main thread) owns a hidden host window, the widget windows (children
-//! of Explorer's taskbars, so Explorer's taskbar thread shares this thread's input queue)
-//! and, in tray mode, the tray icons. It only paints, positions and handles menu and mouse
-//! input; its calls to Explorer are the ones `widget` and `tray` list. The device runtime's
-//! `on_change` runs on the device thread and only posts [`WM_APP_CHANGED`] here; the menu
-//! reads the snapshot, the in-memory settings and the monitor list, and sends no device
-//! traffic. Settings are loaded before the UI starts; changes are saved, and the Run value
-//! written, by the store's writer thread ([`Store`]). UI Automation runs on its own
-//! windowless thread (`widget`), and the [`watchdog`] on another.
+//! of Explorer's taskbars, so Explorer's taskbar thread shares this thread's input queue),
+//! the tray icons in tray mode and a low-battery notification's temporary icon. It only
+//! paints, positions, shows notifications and handles menu and mouse input; its calls to
+//! Explorer are the ones `widget` and `tray` list. The device runtime's `on_change` runs on
+//! the device thread and only posts [`WM_APP_CHANGED`] here; the menu reads the snapshot,
+//! the in-memory settings and the monitor list, and sends no device traffic. Settings are
+//! loaded before the UI starts; changes are saved, and the Run value written, by the
+//! store's writer thread ([`Store`]). UI Automation runs on its own windowless thread
+//! (`widget`), and the [`watchdog`] on another.
 //!
 //! # Re-entrancy
 //!
@@ -22,8 +23,8 @@
 //! - Messages from outside (`TaskbarCreated`, `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`,
 //!   `WM_CLOSE`, WinEvent callbacks, `WM_DPICHANGED_AFTERPARENT`, clicks and tray callbacks)
 //!   never touch the state where they arrive: they post one of our `WM_APP_*` messages.
-//!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`] or
-//!   [`WM_APP_SELF_RETRY`].
+//!   `WM_TIMER` only beats the watchdog or posts [`WM_APP_CHECK_WIDGET`],
+//!   [`WM_APP_SELF_RETRY`] or [`WM_APP_NOTIFY_DONE`].
 //! - Only `WM_APP_*` handlers borrow the state. One that arrives while the state is borrowed
 //!   (a nested dispatch) is re-posted and handled after the current handler returns.
 //! - No borrow is held across a modal loop: the menu is built from a snapshot read, then
@@ -31,6 +32,7 @@
 
 pub mod fallback;
 mod menu;
+mod notify;
 pub mod render;
 mod tray;
 pub mod watchdog;
@@ -65,8 +67,11 @@ use windows::core::{PCWSTR, w};
 
 use fallback::{TrayReason, should_retry_widget};
 use menu::{MenuCommand, Model};
+use notify::Notifier;
 use tray::Tray;
 use widget::Widgets;
+
+use crate::alerts::Alerts;
 
 /// A tray icon chosen with the keyboard (not defined by the `windows` crate).
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
@@ -161,6 +166,8 @@ const WM_APP_MENU: u32 = WM_APP + 9;
 const WM_APP_TRAY: u32 = WM_APP + 10;
 /// Try the widget again on the self-retry schedule (posted by [`SELF_RETRY_TIMER`]).
 const WM_APP_SELF_RETRY: u32 = WM_APP + 11;
+/// Remove the notification's temporary icon (posted by [`NOTIFY_TIMER`]).
+const WM_APP_NOTIFY_DONE: u32 = WM_APP + 12;
 
 /// Beats the watchdog while widgets exist, also inside the menu's modal loop.
 const HEARTBEAT_TIMER: usize = 1;
@@ -172,6 +179,9 @@ const WIDGET_CHECK_MS: u32 = 5_000;
 /// One-shot: in tray mode after a failure that may pass, the next self-retry of the widget
 /// ([`fallback::next_self_retry`]).
 const SELF_RETRY_TIMER: usize = 3;
+/// One-shot: removes the notification's temporary icon ([`notify::TEMP_ICON_MS`] after the
+/// last notification), through [`WM_APP_NOTIFY_DONE`].
+const NOTIFY_TIMER: usize = 4;
 
 /// Sleep of the widget thread after the first click with `--debug-stall-widget`.
 const DEBUG_STALL: Duration = Duration::from_secs(10);
@@ -255,6 +265,8 @@ pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
         surface,
         tray_reason,
         self_retry: None,
+        alerts: Alerts::default(),
+        notifier: Notifier::new(host),
     };
     ui.schedule_self_retry();
     UI.with(|cell| *cell.borrow_mut() = Some(ui));
@@ -273,6 +285,7 @@ pub fn run(options: &Options, store: Store, settings: Settings) -> i32 {
         let _ = KillTimer(Some(host), HEARTBEAT_TIMER);
         let _ = KillTimer(Some(host), WIDGET_CHECK_TIMER);
         let _ = KillTimer(Some(host), SELF_RETRY_TIMER);
+        let _ = KillTimer(Some(host), NOTIFY_TIMER);
         let _ = DestroyWindow(host);
     }
     // Already done by "Exit"; this covers a message loop that ended otherwise.
@@ -305,6 +318,9 @@ struct Ui {
     /// passes, so a widget that falls back again right after a retry continues the schedule
     /// instead of starting it anew.
     self_retry: Option<SelfRetry>,
+    /// Which devices may raise a low-battery notification; in memory only.
+    alerts: Alerts,
+    notifier: Notifier,
 }
 
 /// When the widget fell back, and how many self-retries have run since.
@@ -316,7 +332,7 @@ struct SelfRetry {
 impl Ui {
     fn handle(&mut self, msg: u32, wp: WPARAM) {
         match msg {
-            WM_APP_CHANGED => self.update_views(),
+            WM_APP_CHANGED => self.changed(),
             WM_APP_LAYOUT => self.show(),
             WM_APP_CLOCKS => {
                 if let Surface::Widgets(w) = &mut self.surface {
@@ -325,6 +341,8 @@ impl Ui {
                 self.show();
             }
             WM_APP_TASKBAR_CREATED => {
+                // The old Explorer took the temporary icon with it.
+                self.notifier.remove();
                 if self.retry_widget(true) {
                     return;
                 }
@@ -385,13 +403,32 @@ impl Ui {
                     self.schedule_self_retry();
                 }
             }
+            WM_APP_NOTIFY_DONE => self.notifier.remove(),
             _ => {}
         }
     }
 
-    /// Reads the snapshot again and shows the views if they changed.
-    fn update_views(&mut self) {
-        let views = views(&read_snapshot(&self.runtime), &self.settings);
+    /// A new snapshot: shows it, and notifies the devices whose fresh readings reached
+    /// their low-battery threshold ([`Alerts::check`]).
+    fn changed(&mut self) {
+        let states = read_snapshot(&self.runtime);
+        self.update_views(&states);
+        let alerts = self.alerts.check(&states, &self.settings);
+        let Some(first) = alerts.first() else {
+            return;
+        };
+        // In tray mode the device's own icon carries the notification.
+        let on = match &self.surface {
+            Surface::Tray(t) => t.icon_id(&first.key),
+            Surface::Widgets(_) => None,
+        };
+        let view = self.views.iter().find(|v| v.key == first.key);
+        self.notifier.show(&alerts, on, view, self.light);
+    }
+
+    /// Shows the views of `states` if they changed.
+    fn update_views(&mut self, states: &[DeviceState]) {
+        let views = views(states, &self.settings);
         if views != self.views {
             self.views = views;
             if let Surface::Widgets(w) = &mut self.surface {
@@ -399,6 +436,13 @@ impl Ui {
             }
             self.show();
         }
+    }
+
+    /// Replaces what shows the devices; dropping the old surface removes its windows or
+    /// icons. A notification's temporary icon goes too: it belongs to the old surface.
+    fn set_surface(&mut self, surface: Surface) {
+        self.notifier.remove();
+        self.surface = surface;
     }
 
     /// Shows the current views and lays the widgets out.
@@ -428,7 +472,7 @@ impl Ui {
         let mut tray = Tray::new(self.host);
         tray.show(&self.views, self.light);
         // Dropping the widgets destroys their windows and hooks.
-        self.surface = Surface::Tray(tray);
+        self.set_surface(Surface::Tray(tray));
         // Only now: the widgets no longer share Explorer's input queue.
         fallback::trace(reason);
         self.schedule_self_retry();
@@ -484,7 +528,7 @@ impl Ui {
         start_widget_checks(self.host);
         self.tray_reason = None;
         // Dropping the tray removes its icons.
-        self.surface = Surface::Widgets(widgets);
+        self.set_surface(Surface::Widgets(widgets));
         true
     }
 
@@ -503,7 +547,7 @@ impl Ui {
                 start_widget_checks(self.host);
                 self.tray_reason = None;
                 // Dropping the tray removes its icons.
-                self.surface = Surface::Widgets(widgets);
+                self.set_surface(Surface::Widgets(widgets));
             }
             Err(_) => {
                 self.tray_reason = Some(TrayReason::CreateFailed);
@@ -558,7 +602,7 @@ impl Ui {
             MenuCommand::ToggleShown(_)
             | MenuCommand::MoveLeft(_)
             | MenuCommand::MoveRight(_)
-            | MenuCommand::Threshold(..) => self.update_views(),
+            | MenuCommand::Threshold(..) => self.update_views(&read_snapshot(&self.runtime)),
             MenuCommand::ShowOn(_) => {
                 if matches!(self.surface, Surface::Widgets(_)) {
                     self.show();
@@ -595,11 +639,13 @@ impl Ui {
         with_store(|store| store.save_settings(settings));
     }
 
-    /// Removes the widgets or tray icons, finishes the queued writes (at most 1 s), then
-    /// stops the runtime (bounded by its 2 s limit) and ends the message loop.
+    /// Removes the widgets or tray icons and a notification's temporary icon, finishes the
+    /// queued writes (at most 1 s), then stops the runtime (bounded by its 2 s limit) and
+    /// ends the message loop.
     fn exit(self) {
         watchdog::arm(false);
         drop(self.surface);
+        drop(self.notifier);
         stop_store();
         self.runtime.stop();
         // SAFETY: no pointers involved.
@@ -794,6 +840,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let _ = unsafe { KillTimer(Some(hwnd), SELF_RETRY_TIMER) };
             post(WM_APP_SELF_RETRY);
         }
+        WM_TIMER if wp.0 == NOTIFY_TIMER => {
+            // SAFETY: our own window and timer; the icon is removed once.
+            let _ = unsafe { KillTimer(Some(hwnd), NOTIFY_TIMER) };
+            post(WM_APP_NOTIFY_DONE);
+        }
         WM_TIMER => watchdog::beat(),
         // Never handled where they arrive (see the module doc); WM_SETTINGCHANGE's string
         // is not needed, every change is re-read.
@@ -809,7 +860,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 post(WM_APP_MENU);
             }
         }
-        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET | WM_APP_SELF_RETRY => {
+        WM_APP_CHANGED..=WM_APP_CHECK_WIDGET | WM_APP_SELF_RETRY | WM_APP_NOTIFY_DONE => {
             if ui_busy() {
                 // SAFETY: no pointers involved.
                 let _ = unsafe { PostMessageW(Some(hwnd), msg, wp, lp) };
