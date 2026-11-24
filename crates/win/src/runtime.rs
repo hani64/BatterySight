@@ -493,14 +493,7 @@ impl Device {
                 continue;
             }
             match self.guard.admission(&paths, now) {
-                Admission::Open => {
-                    if self.held.contains_key(&paths)
-                        && let Some(trace) = &mut self.trace
-                    {
-                        trace.released(&paths);
-                    }
-                    self.arrive(group, members, paths, now);
-                }
+                Admission::Open => self.arrive(group, members, paths, now),
                 Admission::Closed => {}
                 Admission::HeldUntil(at) => {
                     if self.held.get(&paths) != Some(&at)
@@ -518,7 +511,8 @@ impl Device {
 
     /// Fills in the product strings of the collections an engine reads, opens those and
     /// hands them to the hub. The group's other collections (such as a headset's consumer
-    /// control) are never opened, so their reports never reach the process.
+    /// control) are never opened, so their reports never reach the process. Traces an open
+    /// that failed, and the release of a group the last scan held back.
     fn arrive(&mut self, mut group: HidGroup, members: Vec<HidInterface>, paths: PathSet, now: Ms) {
         let container = members.iter().find_map(|member| member.container);
         let mut opened = Vec::new();
@@ -538,7 +532,15 @@ impl Device {
         if !engines::wants(&group) {
             // None of its HID++ collections opened; the next rescan tries again.
             self.reactor.close_group(group.id);
+            if let Some(trace) = &mut self.trace {
+                trace.open_failed(&paths);
+            }
             return;
+        }
+        if self.held.contains_key(&paths)
+            && let Some(trace) = &mut self.trace
+        {
+            trace.released(&paths);
         }
         self.guard.on_open(&paths, now);
         self.groups.push(Opened {
@@ -1165,6 +1167,32 @@ mod tests {
         let until: u64 = words[0][3].parse().unwrap();
         assert_eq!(until - held_at, 54_000, "{text}");
         assert_eq!(words[1], ["released", path.as_str()], "{text}");
+    }
+
+    #[test]
+    fn held_back_group_that_fails_to_open_is_traced_but_not_released() {
+        let (mut device, server, hidpp, paths) = dongle_device();
+        let (trace, log) = temp_trace("open-failed");
+        device.trace = Some(trace);
+        let path = paths.first().unwrap().clone();
+        let base = now_ms();
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        device.apply_scan(Some(vec![hidpp.clone()]), base + 7_000);
+
+        drop(server);
+        device.apply_scan(Some(vec![hidpp]), base + 61_000);
+        assert!(device.groups.is_empty());
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let words: Vec<Vec<&str>> = text
+            .lines()
+            .map(|line| line.split(' ').skip(1).collect())
+            .collect();
+        assert_eq!(words.len(), 2, "{text}");
+        assert_eq!(words[0][..2], ["held", path.as_str()], "{text}");
+        assert_eq!(words[1], ["open", "failed", path.as_str()], "{text}");
     }
 
     #[test]

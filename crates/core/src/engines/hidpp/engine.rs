@@ -15,9 +15,10 @@
 //! unanswered within its timeout (1 s for the receiver itself, 4 s for a
 //! device) counts as no answer.
 //!
-//! A direct group whose discovery ends without registering its device asks for
-//! a rediscovery grant 2 s, 10 s and 60 s after its first, second and third
-//! failure, then waits for the next arrival, resume or refresh.
+//! A direct group whose discovery is cut short (silence, an unreachable error, a spent
+//! grant) asks for a rediscovery grant 2 s, 10 s and 60 s after its first, second and
+//! third failure, then waits for the next arrival, resume or refresh. One the device
+//! completes without anything to register (no battery feature) is not walked again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
@@ -163,7 +164,13 @@ pub struct HidppEngine {
     budgets: HashMap<GrantId, Budget>,
     /// A direct group's discovery is running under an arrival or rediscovery grant.
     discovering: bool,
-    /// Direct discoveries that ended without registering since the last arrival grant.
+    /// The running direct discovery was cut short by silence, an unreachable error or a
+    /// spent grant, rather than completed by the device.
+    unanswered: bool,
+    /// A direct discovery completed without a device to register (no battery feature):
+    /// the group is not walked again.
+    settled: bool,
+    /// Direct discoveries cut short since the last arrival grant.
     failures: usize,
     /// When to ask for the next rediscovery: one-shot, set by a failed discovery.
     retry_at: Option<Ms>,
@@ -259,6 +266,8 @@ impl HidppEngine {
             wpids: BTreeMap::new(),
             budgets: HashMap::new(),
             discovering: false,
+            unanswered: false,
+            settled: false,
             failures: 0,
             retry_at: None,
         }
@@ -322,6 +331,9 @@ impl HidppEngine {
             return;
         };
         if !self.spend(c.grant, now) {
+            if self.discovering && index == DIRECT {
+                self.unanswered = true;
+            }
             return;
         }
         actions.push(Action::Send {
@@ -356,7 +368,7 @@ impl HidppEngine {
     }
 
     /// The group's own discovery under an arrival or rediscovery grant: the receiver
-    /// conversation, or a direct device's ping.
+    /// conversation, or a direct device's ping unless an earlier walk found nothing to show.
     fn start_discovery(&mut self, grant: GrantId, now: Ms, actions: &mut Vec<Action>) {
         if self.in_flight.contains_key(&DIRECT) {
             return;
@@ -364,15 +376,18 @@ impl HidppEngine {
         if self.receiver {
             let c = Conversation::new(grant, Step::GetNotifications);
             self.issue(DIRECT, c, now, actions);
-        } else {
+        } else if !self.settled {
+            self.unanswered = false;
             self.discover([DIRECT], grant, now, actions);
             self.discovering = self.in_flight.contains_key(&DIRECT);
         }
     }
 
-    /// Ends a direct group's discovery once nothing is in flight. Without a registered
-    /// device it is retried after the next of [`REDISCOVERY_DELAYS_MS`] (reported as
-    /// [`Action::Rediscover`] by `on_tick`), or given up once those are used.
+    /// Ends a direct group's discovery once nothing is in flight. A walk the device
+    /// completed without a device to register settles the group: it is not walked again.
+    /// One cut short by silence, an unreachable error or a spent grant is retried after the
+    /// next of [`REDISCOVERY_DELAYS_MS`] (reported as [`Action::Rediscover`] by `on_tick`),
+    /// or given up once those are used, or at once when a query wakes the device.
     fn settle_discovery(&mut self, now: Ms, actions: &mut Vec<Action>) {
         if !self.discovering || self.in_flight.contains_key(&DIRECT) {
             return;
@@ -381,9 +396,17 @@ impl HidppEngine {
         if !self.devices.is_empty() {
             return;
         }
-        let retry_at = REDISCOVERY_DELAYS_MS
-            .get(self.failures)
-            .map(|delay| now.saturating_add(*delay));
+        if !self.unanswered {
+            self.settled = true;
+            return;
+        }
+        let retry_at = if self.query_wakes {
+            None
+        } else {
+            REDISCOVERY_DELAYS_MS
+                .get(self.failures)
+                .map(|delay| now.saturating_add(*delay))
+        };
         self.failures += 1;
         self.retry_at = retry_at;
         actions.push(Action::DiscoveryFailed { retry_at });
@@ -421,6 +444,15 @@ impl HidppEngine {
         if c.step == Step::Read {
             self.read_reply(index, reply, actions);
             return;
+        }
+        if self.discovering
+            && index == DIRECT
+            && matches!(
+                reply,
+                Reply::Err10(ERR_CONNECT_FAIL | ERR_UNKNOWN_DEVICE | ERR_RESOURCE_ERROR)
+            )
+        {
+            self.unanswered = true;
         }
         match discovery::advance(c.step, &mut c.found, reply) {
             // A known device re-enabled its notifications: read with what we know.
@@ -760,6 +792,9 @@ impl Engine for HidppEngine {
             let Some(f) = self.in_flight.remove(&index) else {
                 continue;
             };
+            if self.discovering && index == DIRECT {
+                self.unanswered = true;
+            }
             match f.conversation.step {
                 // The receiver did not answer: still ask it to report its slots.
                 Step::GetNotifications | Step::SetNotifications(_) => {
@@ -1790,6 +1825,57 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 retry_at: Some(now + 2_000)
             }]
         );
+    }
+
+    #[test]
+    fn direct_device_without_battery_feature_settles() {
+        let mut e = HidppEngine::new(&headset_group(), &catalog());
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+        // Every lookup answers "absent", 0x1F20 included: nothing to show.
+        let mut script = headset_script();
+        script.truncate(6);
+        run(&mut e, &script, 1);
+        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x0B, 0x00]), 2);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+
+        // A resume's or refresh's arrival grant does not walk it again.
+        let a = e.on_grant(&grant(6, &gk, Trigger::Arrival), 3);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(e.next_deadline(), None);
+    }
+
+    #[test]
+    fn unreachable_error_ends_direct_discovery_with_a_retry() {
+        let mut e = headset_stalled();
+        // HID++ 1.0 error 0x08 (unknown device) to the 0x0005 lookup.
+        let a = e.on_report(LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x00, 0x0B, 0x08]), 2);
+        assert_eq!(
+            a,
+            vec![Action::DiscoveryFailed {
+                retry_at: Some(2_002)
+            }]
+        );
+        assert_eq!(e.next_deadline(), Some(2_002));
+    }
+
+    #[test]
+    fn query_wakes_direct_device_is_not_retried() {
+        let wakes = Catalog::parse(&CATALOG.replace(
+            "quirks = { voltage_curve = \"pro-x-wireless-ghub\" }",
+            "quirks = { query_wakes = true }",
+        ))
+        .unwrap();
+        let mut e = HidppEngine::new(&headset_group(), &wakes);
+        let gk = e.group_key();
+        let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
+        assert_eq!(sent(&a), vec![headset_ping()]);
+
+        let a = e.on_tick(4_000);
+        assert_eq!(a, vec![Action::DiscoveryFailed { retry_at: None }]);
+        assert_eq!(e.next_deadline(), None);
     }
 
     #[test]

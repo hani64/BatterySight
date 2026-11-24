@@ -7,9 +7,10 @@
 //! adds `"<unix ms> audio <container hex> active|idle"` when a device's audio sessions start
 //! or stop (`"<unix ms> audio unavailable <stage>"` when they cannot be watched),
 //! `"<unix ms> held <paths> until <unix ms>"` when the reopen cap holds back the group with
-//! those comma-separated interface paths and `"<unix ms> released <paths>"` when it opens
-//! again, and `"<unix ms> discovery <group key> failed, retry at <unix ms>"` or
-//! `"<unix ms> discovery <group key> gave up"` when a group's discovery registered nothing.
+//! those comma-separated interface paths, `"<unix ms> released <paths>"` when it opens
+//! again and `"<unix ms> open failed <paths>"` when none of a group's HID++ collections
+//! open, and `"<unix ms> discovery <group key> failed, retry at <unix ms>"` or
+//! `"<unix ms> discovery <group key> gave up"` when a group's discovery was cut short.
 //! The UI adds `"<unix ms> ui <text>"` lines ([`ui_line`]) and the settings and history
 //! store `"<unix ms> store <text>"` lines when a file cannot be read or written or is set
 //! aside. Tracing only records what the runtime already does, so it adds no device
@@ -84,6 +85,14 @@ impl Trace {
     /// errors are ignored.
     pub(crate) fn released(&mut self, paths: &BTreeSet<String>) {
         let mut text = released_text(unix_ms(), paths);
+        text.push('\n');
+        let _ = self.0.write_all(text.as_bytes());
+    }
+
+    /// Appends that none of the HID++ collections of the group with interface `paths`
+    /// opened; write errors are ignored.
+    pub(crate) fn open_failed(&mut self, paths: &BTreeSet<String>) {
+        let mut text = open_failed_text(unix_ms(), paths);
         text.push('\n');
         let _ = self.0.write_all(text.as_bytes());
     }
@@ -187,6 +196,11 @@ fn released_text(unix_ms: u64, paths: &BTreeSet<String>) -> String {
     format!("{unix_ms} released {}", joined(paths))
 }
 
+/// `"<unix ms> open failed <paths>"`, the paths separated by commas.
+fn open_failed_text(unix_ms: u64, paths: &BTreeSet<String>) -> String {
+    format!("{unix_ms} open failed {}", joined(paths))
+}
+
 /// `"<unix ms> discovery <group key> failed, retry at <unix ms>"`, or
 /// `"<unix ms> discovery <group key> gave up"` without a retry.
 fn discovery_text(unix_ms: u64, group: &DeviceKey, retry_at: Option<u64>) -> String {
@@ -278,6 +292,7 @@ mod tests {
         let paths: BTreeSet<String> = ["b".to_owned(), "a".to_owned()].into();
         assert_eq!(held_text(1, &paths, 61), "1 held a,b until 61");
         assert_eq!(released_text(62, &paths), "62 released a,b");
+        assert_eq!(open_failed_text(63, &paths), "63 open failed a,b");
     }
 
     #[test]
