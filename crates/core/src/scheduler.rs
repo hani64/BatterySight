@@ -22,7 +22,9 @@ pub enum Trigger {
     Resume,
     /// Explicit "Refresh now" command.
     RefreshNow,
-    /// User or audio activity observed on the device.
+    /// User or audio activity observed on the device. Refused while the device is asleep
+    /// and never wakes it: a headset's dongle plays audio with the headset off, so activity
+    /// proves nothing about the device itself.
     Activity,
 }
 
@@ -33,7 +35,8 @@ pub struct Capabilities {
     pub pushes_battery: bool,
     /// A query wakes the device: only observed activity may justify one.
     pub query_wakes: bool,
-    /// Minimum time between two granted requests for this device.
+    /// Minimum time since the last granted request (any trigger) before an `Activity`
+    /// grant; the other triggers ignore it.
     pub min_query_gap_ms: Ms,
 }
 
@@ -135,23 +138,25 @@ impl Scheduler {
             Trigger::Arrival => !caps.query_wakes && !slot.arrival_used,
             Trigger::Connected => !caps.query_wakes,
             Trigger::Resume | Trigger::RefreshNow => !caps.query_wakes && !slot.asleep,
-            Trigger::Activity => !caps.pushes_battery,
+            Trigger::Activity => !caps.pushes_battery && !slot.asleep,
         };
         if !allowed {
             return None;
         }
         // A clock that went backwards counts as no time passed.
-        if let Some(last) = slot.last_grant_ms
+        if trigger == Trigger::Activity
+            && let Some(last) = slot.last_grant_ms
             && now.saturating_sub(last) < caps.min_query_gap_ms
         {
             return None;
         }
 
         slot.last_grant_ms = Some(now);
+        // Only a push, a link-up or a successful read wakes an asleep device.
         match trigger {
             Trigger::Arrival => slot.arrival_used = true,
-            Trigger::Connected | Trigger::Activity => slot.asleep = false,
-            Trigger::Resume | Trigger::RefreshNow => {}
+            Trigger::Connected => slot.asleep = false,
+            Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => {}
         }
 
         let (max_requests, duration) = match trigger {
@@ -313,10 +318,42 @@ mod tests {
 
         assert!(s.request(&key(), Trigger::Connected, 0).is_some());
         assert!(!s.is_asleep(&key()));
+    }
 
-        s.mark_asleep(&key());
+    #[test]
+    fn activity_gap_does_not_block_refresh() {
+        let mut s = scheduler_with(caps(false, false, 300_000));
         assert!(s.request(&key(), Trigger::Activity, 0).is_some());
-        assert!(!s.is_asleep(&key()));
+        assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
+    }
+
+    #[test]
+    fn activity_respects_gap() {
+        let mut s = scheduler_with(caps(false, false, 300_000));
+        assert!(s.request(&key(), Trigger::Activity, 0).is_some());
+        assert_eq!(s.request(&key(), Trigger::Activity, 299_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 300_000).is_some());
+    }
+
+    #[test]
+    fn asleep_device_gets_no_activity_grant() {
+        let mut s = scheduler_with(caps(false, false, 300_000));
+        s.mark_asleep(&key());
+        assert_eq!(s.request(&key(), Trigger::Activity, 0), None);
+        assert!(s.is_asleep(&key()));
+    }
+
+    #[test]
+    fn activity_grant_does_not_clear_asleep_state() {
+        for asleep in [false, true] {
+            let mut s = scheduler_with(caps(false, false, 0));
+            if asleep {
+                s.mark_asleep(&key());
+            }
+            let granted = s.request(&key(), Trigger::Activity, 0).is_some();
+            assert_eq!(granted, !asleep, "asleep = {asleep}");
+            assert_eq!(s.is_asleep(&key()), asleep);
+        }
     }
 
     #[test]

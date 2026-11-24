@@ -159,6 +159,16 @@ impl Hub {
             .min()
     }
 
+    /// The registered devices `group`'s engine currently owns, ordered by key: those an
+    /// [`HubInput::Activity`] on the group's physical device would reach.
+    pub fn keys_of(&self, group: GroupId) -> Vec<DeviceKey> {
+        self.owners
+            .iter()
+            .filter(|(_, groups)| groups.last() == Some(&group))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     fn arrive(&mut self, group: &HidGroup, now: Ms, pass: &mut Pass) {
         // The same id again means the old handles are gone.
         self.remove_group(group.id, now, pass);
@@ -1173,45 +1183,49 @@ source = "test"
         let out = hub.handle(report(1), 2);
 
         assert_eq!(out, vec![HubOutput::StateChanged]);
-        assert_eq!(grants(&f).len(), 2, "both Connected requests are refused");
-        for key in [&a, &wakes] {
-            assert_eq!(state(&hub, key).unwrap().presence, Presence::Online);
-            assert!(!hub.scheduler.is_asleep(key));
-        }
-        hub.handle(HubInput::RefreshNow, 10_000);
+        // The min gap limits only activity; a query-waking device is never asked on a link-up.
         assert_eq!(
             grants(&f),
             vec![
                 (group_key(1), Trigger::Arrival),
                 (a.clone(), Trigger::RefreshNow),
-                (a, Trigger::RefreshNow),
+                (a.clone(), Trigger::Connected),
             ]
         );
+        for key in [&a, &wakes] {
+            assert_eq!(state(&hub, key).unwrap().presence, Presence::Online);
+            assert!(!hub.scheduler.is_asleep(key));
+        }
+    }
+
+    /// A device that is read on activity, at most every 100 s.
+    fn activity_gap() -> Capabilities {
+        Capabilities {
+            pushes_battery: false,
+            min_query_gap_ms: 100_000,
+            ..pushing()
+        }
     }
 
     #[test]
     fn reregister_within_grace_keeps_scheduler_history() {
         let a = dev("dev-a");
-        let gap = Capabilities {
-            min_query_gap_ms: 100_000,
-            ..pushing()
-        };
         let (first, second) = (fake(), fake());
         first
             .borrow_mut()
             .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
         second
             .borrow_mut()
             .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
         let mut hub = hub(&[(1, &first), (2, &second)]);
         hub.handle(logi(1), 0);
         hub.handle(HubInput::RefreshNow, 0);
         hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
         hub.handle(logi(2), 2_000);
 
-        hub.handle(HubInput::RefreshNow, 3_000);
+        hub.handle(HubInput::Activity(a), 3_000);
 
         assert_eq!(grants(&second), vec![(group_key(2), Trigger::Arrival)]);
     }
@@ -1219,19 +1233,15 @@ source = "test"
     #[test]
     fn grace_expiry_forgets_scheduler_history() {
         let a = dev("dev-a");
-        let gap = Capabilities {
-            min_query_gap_ms: 100_000,
-            ..pushing()
-        };
         let (first, second) = (fake(), fake());
         first
             .borrow_mut()
             .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
         second
             .borrow_mut()
             .on_grant
-            .push_back(vec![register_with(&a, gap, None)]);
+            .push_back(vec![register_with(&a, activity_gap(), None)]);
         let mut hub = hub(&[(1, &first), (2, &second)]);
         hub.handle(logi(1), 0);
         hub.handle(HubInput::RefreshNow, 0);
@@ -1239,9 +1249,9 @@ source = "test"
         hub.handle(HubInput::Tick, 61_000);
         hub.handle(logi(2), 62_000);
 
-        hub.handle(HubInput::RefreshNow, 63_000);
+        hub.handle(HubInput::Activity(a.clone()), 63_000);
 
-        assert_eq!(grants(&second).last(), Some(&(a, Trigger::RefreshNow)));
+        assert_eq!(grants(&second).last(), Some(&(a, Trigger::Activity)));
     }
 
     #[test]
@@ -1284,6 +1294,27 @@ source = "test"
             grants(&f),
             vec![(group_key(1), Trigger::Arrival), (poll, Trigger::Activity)]
         );
+    }
+
+    #[test]
+    fn keys_of_lists_devices_the_group_owns() {
+        let (f1, f2) = (fake(), fake());
+        let (a, b) = (dev("a"), dev("b"));
+        f1.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&a, None), register(&b, None)]);
+        f2.borrow_mut().on_grant.push_back(vec![register(&b, None)]);
+        let mut hub = hub(&[(1, &f1), (2, &f2)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+
+        // `b` moved to group 2; group keys are not devices.
+        assert_eq!(hub.keys_of(GroupId(1)), std::slice::from_ref(&a));
+        assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&b));
+        assert!(hub.keys_of(GroupId(3)).is_empty());
+
+        hub.handle(HubInput::GroupRemoved(GroupId(2)), 1);
+        assert_eq!(hub.keys_of(GroupId(1)), [a, b]);
     }
 
     #[test]

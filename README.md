@@ -20,19 +20,20 @@ It sends a battery query only when:
 - the app starts or a device is plugged in,
 - a device reconnects (for example a mouse waking up and linking to its receiver again),
 - the PC resumes from sleep,
-- you click "Refresh now".
+- you click "Refresh now",
+- audio is playing to a headset that does not report its battery while in use (the PRO X Wireless): at most once every 5 minutes, only while sound is actually playing, and never while the headset is known to be off or asleep.
 
-Otherwise it only listens. Opening the menu never queries; it shows the last known values. A device known to be asleep is not asked until it reports again.
+Otherwise it only listens. Opening the menu never queries; it shows the last known values. A device known to be asleep is not asked until it reports again. Audio is matched to a device through the container id Windows gives both a headset's audio endpoint and its HID interfaces; BatterySight only watches which audio sessions are active and reads the endpoint's peak meter, it never records or plays audio.
 
 ### Known limitations
 
-- The PRO X Wireless headset does not report its battery while it is in use. Its level updates when the headset is switched on, when the PC resumes and on "Refresh now", so it can lag behind during a long session until audio-gated updates land.
+- The PRO X Wireless headset does not report its battery while it is in use. Its level updates when the headset is switched on, when the PC resumes, on "Refresh now" and every 5 minutes while audio plays to it; during a long silent stretch (for example a muted call) it can lag behind.
 
 ## Privacy
 
 BatterySight collects no telemetry. Its only network call is the update check (arriving in milestone 4).
 
-For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it write every HID++ frame it sends and receives to `%LOCALAPPDATA%\BatterySight\sends.log`, along with why it switched to tray icons (`ui fallback` lines). Tracing is off by default. The frames include device unit ids and other serial-like values, so review the file before sharing it.
+For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it write every HID++ frame it sends and receives to `%LOCALAPPDATA%\BatterySight\sends.log`, along with when audio starts and stops on a device (`audio` lines) and why it switched to tray icons (`ui fallback` lines). Tracing is off by default. The frames include device unit ids and other serial-like values, so review the file before sharing it.
 
 ## Usage
 

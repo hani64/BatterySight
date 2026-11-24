@@ -5,6 +5,9 @@
 # receiver is matched only by the wireless id the receiver reports for its slot, never by the
 # receiver's own USB id; without a wireless id it gets the family entry. Every entry needs at
 # least one id. The entry's `name` replaces the name the device reports.
+#
+# `no_in_use_push = true` marks a device that reports its battery only when it powers on or
+# off: it is read while audio plays to it, at most every 5 minutes.
 
 [[family]]
 engine = "hidpp"
@@ -19,8 +22,8 @@ pids = [0x0ABA]
 kind = "headset"
 engine = "hidpp"
 status = "hardware-tested"
-source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live); owner hardware test 2026-11-23: discovery, power on/off broadcasts, Refresh now, G HUB comparison 77/77 and 76/77"
-quirks = { voltage_curve = "pro-x-wireless-ghub" }
+source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live); owner hardware test 2026-11-23: discovery, power on/off broadcasts, Refresh now, G HUB comparison 77/77 and 76/77; owner hardware finding: battery reported only at power on/off, never in use (level ~5 points stale after 43 min of use)"
+quirks = { voltage_curve = "pro-x-wireless-ghub", no_in_use_push = true }
 
 [[device]]
 name = "PRO X Wireless Gaming Headset"
@@ -30,7 +33,7 @@ kind = "headset"
 engine = "hidpp"
 status = "source-verified"
 source = "G HUB pro_headset/pro_x_wireless_headset_battery.xml discharge curve (owner capture 2026-11-19, matched G HUB 2026.7 live)"
-quirks = { voltage_curve = "pro-x-wireless-ghub" }
+quirks = { voltage_curve = "pro-x-wireless-ghub", no_in_use_push = true }
 
 [[device]]
 name = "PRO X Superlight"
