@@ -2,9 +2,11 @@
 //! `Shell_SecondaryTrayWnd`, drawn with `UpdateLayeredWindow` (technique and measurements:
 //! docs/spike/taskbar-results.md).
 //!
-//! Positioning is event-driven. A WinEvent hook on Explorer's process reports when a taskbar
-//! or its notification area (`TrayNotifyWnd`) moves, resizes or appears, and the UI thread
-//! lays the widgets out again. Auto-hide needs nothing: a child moves with its parent. A
+//! Positioning is event-driven. WinEvent hooks on the taskbars' threads only (not the rest of
+//! Explorer) report when a taskbar or its notification area (`TrayNotifyWnd`) moves or
+//! resizes, when a taskbar's direct child appears, and when a taskbar's children change
+//! z-order (which can cover the widget); the UI thread then lays the widgets out again, which
+//! also raises a covered widget. Auto-hide needs nothing: a child moves with its parent. A
 //! secondary taskbar has no window for its clock, so its position comes from UI Automation
 //! on a windowless MTA thread ([`uia_thread`]), queried again only on `TaskbarCreated`,
 //! `WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`, a new secondary taskbar or one that changed width.
@@ -29,13 +31,14 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_STYLE, GetClassNameW,
-    GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP,
-    IsWindow, IsWindowVisible, MA_NOACTIVATE, OBJID_WINDOW, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA,
-    UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU,
-    WM_DPICHANGED_AFTERPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
+    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GA_PARENT, GW_HWNDPREV,
+    GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, HWND_TOP, IsWindow, IsWindowVisible, MA_NOACTIVATE, OBJID_WINDOW,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_CONTEXTMENU, WM_DPICHANGED_AFTERPARENT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -56,6 +59,8 @@ pub struct Widgets {
     /// (secondary taskbar, its clock's left edge minus the taskbar's left edge), from UIA.
     clocks: Vec<(isize, i32)>,
     hooks: Vec<HWINEVENTHOOK>,
+    /// (process, thread) of the taskbars the hooks watch.
+    hooked: Vec<(u32, u32)>,
     uia: Option<Uia>,
 }
 
@@ -92,9 +97,9 @@ impl Widgets {
             widgets: Vec::new(),
             clocks: Vec::new(),
             hooks: Vec::new(),
+            hooked: Vec::new(),
             uia: None,
         };
-        widgets.hook_explorer();
         widgets.layout(views, light)?;
         Ok(widgets)
     }
@@ -109,6 +114,7 @@ impl Widgets {
     /// Creates widgets on new taskbars, drops those whose taskbar is gone, repaints those
     /// whose DPI, height, theme or views changed, and moves them next to their anchor.
     pub fn layout(&mut self, views: &[DeviceView], light: bool) -> Result<(), CreateFailed> {
+        self.hook_taskbars();
         self.widgets.retain(|w| {
             // SAFETY: plain handle checks.
             let alive =
@@ -163,7 +169,7 @@ impl Widgets {
     ) -> Result<(), CreateFailed> {
         self.destroy_windows();
         self.clocks.clear();
-        self.hook_explorer();
+        self.unhook(); // the taskbars run on new threads; `layout` hooks them
         self.layout(views, light)?;
         self.ask_clocks();
         Ok(())
@@ -222,39 +228,51 @@ impl Widgets {
         }
     }
 
-    /// Watches Explorer's windows for moves, resizes and showing (see [`on_win_event`]).
-    fn hook_explorer(&mut self) {
-        self.unhook();
-        // SAFETY: literal class name; plain handle query.
-        let pid = unsafe {
-            let Ok(bar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
-                return;
-            };
-            let mut pid = 0;
-            GetWindowThreadProcessId(bar, Some(&mut pid));
-            pid
-        };
-        if pid == 0 {
+    /// Watches the taskbars' threads (only those) for windows that move, resize, appear or
+    /// change z-order (see [`on_win_event`]). Re-hooks only when those threads changed, as
+    /// after an Explorer restart.
+    fn hook_taskbars(&mut self) {
+        let mut threads: Vec<(u32, u32)> = taskbars()
+            .into_iter()
+            .map(|(bar, _)| {
+                let mut pid = 0;
+                // SAFETY: plain handle query; `pid` outlives the call.
+                let tid = unsafe { GetWindowThreadProcessId(bar, Some(&mut pid)) };
+                (pid, tid)
+            })
+            .filter(|&(pid, tid)| pid != 0 && tid != 0)
+            .collect();
+        threads.sort_unstable();
+        threads.dedup();
+        if threads == self.hooked {
             return;
         }
-        for event in [EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW] {
-            // SAFETY: `on_win_event` matches WINEVENTPROC; out-of-context, so it runs on this
-            // thread while it retrieves messages.
-            let hook = unsafe {
-                SetWinEventHook(
-                    event,
-                    event,
-                    None,
-                    Some(on_win_event),
-                    pid,
-                    0,
-                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-                )
-            };
-            if !hook.is_invalid() {
-                self.hooks.push(hook);
+        self.unhook();
+        for &(pid, tid) in &threads {
+            for event in [
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_REORDER,
+            ] {
+                // SAFETY: `on_win_event` matches WINEVENTPROC; out-of-context, so it runs on
+                // this thread while it retrieves messages.
+                let hook = unsafe {
+                    SetWinEventHook(
+                        event,
+                        event,
+                        None,
+                        Some(on_win_event),
+                        pid,
+                        tid,
+                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                    )
+                };
+                if !hook.is_invalid() {
+                    self.hooks.push(hook);
+                }
             }
         }
+        self.hooked = threads;
     }
 
     fn unhook(&mut self) {
@@ -262,6 +280,7 @@ impl Widgets {
             // SAFETY: the hook was installed by this thread.
             let _ = unsafe { UnhookWinEvent(hook) };
         }
+        self.hooked.clear();
     }
 }
 
@@ -271,31 +290,62 @@ impl Drop for Widgets {
     }
 }
 
-/// A taskbar or its notification area moved, resized or appeared: lay out again (posted, so
-/// it never runs inside whatever call this event interrupted).
+/// Lays out again (posted, so it never runs inside whatever call this event interrupted)
+/// when, on a taskbar's thread, a taskbar or its notification area moves or resizes, a
+/// taskbar's direct child appears, or a taskbar's children change z-order: either can cover
+/// the widget, and a layout raises it again.
 unsafe extern "system" fn on_win_event(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     object: i32,
     child: i32,
     _thread: u32,
     _time: u32,
 ) {
-    if object != OBJID_WINDOW.0 || child != CHILDID_SELF as i32 || hwnd.is_invalid() {
+    if hwnd.is_invalid() {
         return;
+    }
+    let window = object == OBJID_WINDOW.0 && child == CHILDID_SELF as i32;
+    let relevant = match event {
+        EVENT_OBJECT_LOCATIONCHANGE => {
+            window
+                && class_is(
+                    hwnd,
+                    &["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "TrayNotifyWnd"],
+                )
+        }
+        EVENT_OBJECT_SHOW => {
+            window && {
+                // SAFETY: plain handle query.
+                let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+                class_is(hwnd, &["TrayNotifyWnd"]) || is_taskbar(parent)
+            }
+        }
+        EVENT_OBJECT_REORDER => is_taskbar(hwnd),
+        _ => false,
+    };
+    if relevant {
+        super::schedule_layout();
+    }
+}
+
+fn is_taskbar(hwnd: HWND) -> bool {
+    class_is(hwnd, &["Shell_TrayWnd", "Shell_SecondaryTrayWnd"])
+}
+
+/// Whether `hwnd`'s window class is one of `names` (a local lookup, no message).
+fn class_is(hwnd: HWND, names: &[&str]) -> bool {
+    if hwnd.is_invalid() {
+        return false;
     }
     let mut buf = [0u16; 32];
     // SAFETY: `buf` outlives the call.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     let class = &buf[..usize::try_from(n).unwrap_or(0)];
-    let watched = ["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "TrayNotifyWnd"];
-    if watched
+    names
         .iter()
         .any(|name| name.encode_utf16().eq(class.iter().copied()))
-    {
-        super::schedule_layout();
-    }
 }
 
 /// The window procedure of the widget. Clicks open the menu on the host window; nothing

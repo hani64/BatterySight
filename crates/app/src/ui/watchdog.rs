@@ -6,8 +6,9 @@
 //! widget thread stores a heartbeat ([`beat`]) on every message-loop iteration and on a
 //! 500 ms timer, and a thread that owns no windows checks it every 500 ms. When the beat is
 //! older than 1.5 s while Explorer's taskbar thread still answers (a busy Explorer is not our
-//! stall), it starts `--tray-only --takeover` and ends this process with `ExitProcess`,
-//! which destroys the widget windows and releases Explorer.
+//! stall), or older than 5 s whatever Explorer does (its taskbar thread may itself be waiting
+//! on our stalled thread), it starts `--tray-only --takeover` and ends this process with
+//! `ExitProcess`, which destroys the widget windows and releases Explorer.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,7 +31,10 @@ const EXPLORER_ANSWER_MS: u32 = 200;
 /// Exit code of a process the watchdog ended.
 const TRIPPED_EXIT_CODE: u32 = 3;
 
-const WATCHDOG: Watchdog = Watchdog { limit_ms: 1_500 };
+const WATCHDOG: Watchdog = Watchdog {
+    limit_ms: 1_500,
+    hard_limit_ms: 5_000,
+};
 
 /// Last heartbeat of the widget thread, in [`now_ms`] milliseconds.
 static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
@@ -46,11 +50,20 @@ pub enum Verdict {
 
 pub struct Watchdog {
     pub limit_ms: Ms,
+    pub hard_limit_ms: Ms,
 }
 
 impl Watchdog {
-    pub fn check(&self, now: Ms, last_beat: Ms) -> Verdict {
-        if now.saturating_sub(last_beat) > self.limit_ms {
+    /// `Trip` when the beat is older than `hard_limit_ms`, or older than `limit_ms` while
+    /// `explorer_responsive` says Explorer's taskbar thread answers (asked only then).
+    pub fn check(
+        &self,
+        now: Ms,
+        last_beat: Ms,
+        explorer_responsive: impl FnOnce() -> bool,
+    ) -> Verdict {
+        let age = now.saturating_sub(last_beat);
+        if age > self.hard_limit_ms || (age > self.limit_ms && explorer_responsive()) {
             Verdict::Trip
         } else {
             Verdict::Ok
@@ -95,8 +108,7 @@ fn watch() {
         if resumed || !ARMED.load(Ordering::Relaxed) {
             continue;
         }
-        if WATCHDOG.check(now, HEARTBEAT.load(Ordering::Relaxed)) == Verdict::Trip
-            && explorer_answers()
+        if WATCHDOG.check(now, HEARTBEAT.load(Ordering::Relaxed), explorer_answers) == Verdict::Trip
         {
             trip();
         }
@@ -141,21 +153,50 @@ fn trip() -> ! {
 mod tests {
     use super::*;
 
-    const DOG: Watchdog = Watchdog { limit_ms: 1_500 };
+    const DOG: Watchdog = Watchdog {
+        limit_ms: 1_500,
+        hard_limit_ms: 5_000,
+    };
+
+    fn responsive() -> bool {
+        true
+    }
+
+    fn unresponsive() -> bool {
+        false
+    }
 
     #[test]
     fn no_trip_within_limit() {
-        assert_eq!(DOG.check(2_000, 600), Verdict::Ok);
-        assert_eq!(DOG.check(2_100, 600), Verdict::Ok);
+        assert_eq!(DOG.check(2_000, 600, responsive), Verdict::Ok);
+        assert_eq!(DOG.check(2_100, 600, responsive), Verdict::Ok);
     }
 
     #[test]
     fn trips_after_limit() {
-        assert_eq!(DOG.check(2_101, 600), Verdict::Trip);
+        assert_eq!(DOG.check(2_101, 600, responsive), Verdict::Trip);
+    }
+
+    #[test]
+    fn stale_but_explorer_unresponsive_is_ok() {
+        assert_eq!(DOG.check(2_101, 600, unresponsive), Verdict::Ok);
+        assert_eq!(DOG.check(5_600, 600, unresponsive), Verdict::Ok);
+    }
+
+    #[test]
+    fn trips_after_hard_limit_whatever_explorer_does() {
+        assert_eq!(DOG.check(5_601, 600, unresponsive), Verdict::Trip);
+    }
+
+    #[test]
+    fn explorer_is_asked_only_when_stale() {
+        let ask = || -> bool { panic!("asked Explorer while the beat is fresh") };
+        assert_eq!(DOG.check(2_100, 600, ask), Verdict::Ok);
+        assert_eq!(DOG.check(5_601, 600, ask), Verdict::Trip);
     }
 
     #[test]
     fn beat_after_now_is_ok() {
-        assert_eq!(DOG.check(600, 2_000), Verdict::Ok);
+        assert_eq!(DOG.check(600, 2_000, responsive), Verdict::Ok);
     }
 }
