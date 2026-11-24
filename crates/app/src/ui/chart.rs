@@ -272,8 +272,8 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration) {
         for line in &columns.lines {
             let points: Vec<POINT> = line.iter().map(|&(x, p)| POINT { x, y: y(p) }).collect();
             if let [dot] = points[..] {
-                // A reading alone: a dot about as wide as the line is thick, so it does not
-                // stand out from the lines around it.
+                // A reading alone: a filled dot of diameter 2 × the line's thickness + 1,
+                // in the line's colour.
                 let r = thick;
                 let _ = Ellipse(dc, dot.x - r, dot.y - r, dot.x + r + 1, dot.y + r + 1);
             } else {

@@ -352,10 +352,6 @@ pub fn add(
 pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
     let samples = &samples[..samples.partition_point(|s| s.at_unix_ms <= now_unix_ms)];
     let samples = &samples[..samples.iter().rposition(|s| !s.is_break())? + 1];
-    let samples: Vec<&Sample> = (0..samples.len())
-        .filter(|&i| !provisional(samples, i))
-        .map(|i| &samples[i])
-        .collect();
     let latest = samples.last()?;
     let Some(Level::Percent(level)) = latest.level else {
         return None;
@@ -366,25 +362,32 @@ pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
     ) {
         return None;
     }
-    let percent = |s: &Sample| match s.level {
-        Some(Level::Percent(p))
-            if s.presence == Presence::Online && s.charge == Charge::Discharging =>
-        {
-            Some(p)
+    // A provisional wake reading counts as no reading: the sample before it is not awake,
+    // so it would end the span there anyway, and the latest is never one.
+    let percent = |i: usize| {
+        let s = &samples[i];
+        match s.level {
+            Some(Level::Percent(p))
+                if s.presence == Presence::Online
+                    && s.charge == Charge::Discharging
+                    && !provisional(samples, i) =>
+            {
+                Some(p)
+            }
+            _ => None,
         }
-        _ => None,
     };
     // Walk back from the latest sample, span by span.
     let mut end = samples.len();
     while end > 0 {
-        let Some(last) = percent(samples[end - 1]) else {
+        let Some(last) = percent(end - 1) else {
             end -= 1;
             continue;
         };
         let mut start = end - 1;
         let mut first = last;
         while start > 0 {
-            match percent(samples[start - 1]) {
+            match percent(start - 1) {
                 Some(p) if p >= first => {
                     first = p;
                     start -= 1;
@@ -404,11 +407,11 @@ pub fn time_left(samples: &[Sample], now_unix_ms: u64) -> Option<Duration> {
 
 /// Whether `samples[i]` (in time order) is a wake reading that gives way to a later one: a
 /// level from the voltage (with millivolts) that the device pushed as it woke (the sample
-/// before it is not awake, or a session break, or there is none), followed within
-/// [`PROVISIONAL_MS`] by an awake reading with a level that is not one too. A battery that
-/// has rested reads several points higher than in use minutes later; the reading in use
-/// stands for it, in the chart and in [`time_left`]. A wake reading with nothing soon
-/// after (the latest, say) stands.
+/// before it is not awake: asleep, offline or a session break; or there is none),
+/// followed within [`PROVISIONAL_MS`] (inclusive) by an awake reading with a level that is
+/// not one too. A battery that has rested reads several points higher than in use minutes
+/// later; the reading in use stands for it, in the chart and in [`time_left`]. A wake
+/// reading with nothing soon after (the latest, say) stands.
 pub fn provisional(samples: &[Sample], i: usize) -> bool {
     let woke = |i: usize| {
         let s = &samples[i];
@@ -417,7 +420,7 @@ pub fn provisional(samples: &[Sample], i: usize) -> bool {
             && s.millivolts.is_some()
             && s.level.is_some()
             && i.checked_sub(1)
-                .is_none_or(|p| samples[p].presence != Presence::Online || samples[p].is_break())
+                .is_none_or(|p| samples[p].presence != Presence::Online)
     };
     if !woke(i) {
         return false;
@@ -989,5 +992,25 @@ mod tests {
         );
         assert!(provisional(&s, 1));
         assert!(!provisional(&s, 2));
+    }
+
+    #[test]
+    fn provisional_within_ten_minutes_inclusive() {
+        let wake_then_use = |gap_ms: u64| {
+            vec![
+                Sample {
+                    presence: Presence::Asleep,
+                    ..sample(T0, 61)
+                },
+                Sample {
+                    millivolts: Some(3_805),
+                    source: Source::Push,
+                    ..sample(T0 + MIN, 64)
+                },
+                sample(T0 + MIN + gap_ms, 61),
+            ]
+        };
+        assert!(provisional(&wake_then_use(10 * MIN), 1));
+        assert!(!provisional(&wake_then_use(10 * MIN + 1), 1));
     }
 }
