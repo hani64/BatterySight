@@ -282,17 +282,20 @@ fn copy_wide(dst: &mut [u16], s: &str) {
     }
 }
 
-/// `tip` in at most `room` UTF-16 units: a tooltip too long is cut in its first line (the
-/// device's name, ending in "…"), so its last line, the time left, stays.
+/// `tip` in at most `room` UTF-16 units: a tooltip too long has the device's name cut (it
+/// ends in "…"), so its level after the name's " · " and the line below, with the time
+/// left, stay.
 fn fit_tip(tip: &str, room: usize) -> String {
     if tip.encode_utf16().count() <= room {
         return tip.to_owned();
     }
-    let Some((name, rest)) = tip.split_once('\n') else {
+    let first = tip.find('\n').unwrap_or(tip.len());
+    let Some(name_end) = tip[..first].rfind(" · ") else {
         return tip.to_owned();
     };
-    // The name's room: everything but the other lines, their line break and the "…".
-    let Some(name_room) = room.checked_sub(rest.encode_utf16().count() + 2) else {
+    let (name, kept) = tip.split_at(name_end);
+    // The name's room: everything but what is kept and the "…".
+    let Some(name_room) = room.checked_sub(kept.encode_utf16().count() + 1) else {
         return tip.to_owned();
     };
     let mut out = String::with_capacity(tip.len());
@@ -305,8 +308,7 @@ fn fit_tip(tip: &str, room: usize) -> String {
         out.push(c);
     }
     out.push('…');
-    out.push('\n');
-    out.push_str(rest);
+    out.push_str(kept);
     out
 }
 
@@ -517,11 +519,9 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_long_name_is_cut_to_keep_the_time_left() {
-        let tip = |name: &str| format!("{name}\nBattery: 80%\nTime left: about 9 h");
-        let rest = "\nBattery: 80%\nTime left: about 9 h"
-            .encode_utf16()
-            .count();
+    fn a_long_name_is_cut_to_keep_the_level_and_time_left() {
+        let tip = |name: &str| format!("{name} · 80%\n3 min ago · about 9 h left");
+        let rest = " · 80%\n3 min ago · about 9 h left".encode_utf16().count();
         // Fits: unchanged.
         assert_eq!(fit_tip(&tip("G305"), 127), tip("G305"));
         let long = "N".repeat(200);
@@ -532,7 +532,7 @@ pub(super) mod tests {
         let emoji = "😀".repeat(100);
         let fitted = fit_tip(&tip(&emoji), 127);
         assert!(fitted.encode_utf16().count() <= 127);
-        assert!(fitted.ends_with("Time left: about 9 h"));
         assert!(fitted.starts_with("😀"));
+        assert!(fitted.ends_with("… · 80%\n3 min ago · about 9 h left"));
     }
 }
