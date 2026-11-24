@@ -5,11 +5,11 @@
 //! [`Snapshot`] and talk to the thread through a [`RuntimeHandle`].
 //!
 //! While audio plays to a physical device (its container has an active audio session and a
-//! peak level above zero), the device thread hands the hub an activity input for each of
-//! that device's registered devices as soon as the scheduler would grant one (for the PRO X
-//! Wireless, 5 minutes after its last read). Devices the scheduler would refuse (asleep, or
-//! pushing their battery) are not metered. Without an active session it sets no deadline
-//! for this, so a silent PC never wakes the thread.
+//! peak level of at least -60 dBFS), the device thread hands the hub an activity input for
+//! each of that device's registered devices as soon as the scheduler would grant one (for
+//! the PRO X Wireless, 5 minutes after its last read). Devices the scheduler would refuse
+//! (asleep, or pushing their battery) are not metered. Without an active session it sets no
+//! deadline for this, so a silent PC never wakes the thread.
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -446,7 +446,7 @@ impl Device {
         containers.dedup();
         for container in containers {
             let level = peak(&container);
-            if level.is_some_and(|level| level > 0.0) {
+            if audible(level) {
                 self.audio.silent.remove(&container);
             } else {
                 self.audio.silent_at(container, now);
@@ -607,12 +607,23 @@ const SILENT_RECHECK_MS: Ms = 15_000;
 /// session a paused app or a voice chat keeps open: the PRO X Wireless activity gap.
 const SILENT_RECHECK_MAX_MS: Ms = 300_000;
 
+/// The lowest peak level (linear, full scale 1.0) that counts as audio playing: -60 dBFS.
+/// A paused player can keep its stream open and feed it digital near-silence; in the owner's
+/// hardware session a paused headset endpoint metered about 1.6e-6 (-115 dBFS), and `> 0.0`
+/// counted that as playing, so the headset was read every 5 minutes while paused.
+const AUDIBLE_PEAK: f32 = 0.001;
+
+/// Whether a metered `peak` (`None` when it could not be metered) means audio is playing.
+fn audible(peak: Option<f32>) -> bool {
+    peak.is_some_and(|level| level >= AUDIBLE_PEAK)
+}
+
 /// Whether a device may be handed an activity input at `now`: its container has an active
-/// audio session (`active`), its endpoints play something (`peak` above zero, `None` when
-/// they cannot be metered) and the scheduler would grant it (`ready_at` reached; `None`
-/// while it refuses any, the device being asleep or pushing its battery).
+/// audio session (`active`), its endpoints play something ([`audible`] `peak`) and the
+/// scheduler would grant it (`ready_at` reached; `None` while it refuses any, the device
+/// being asleep or pushing its battery).
 fn activity_due(ready_at: Option<Ms>, now: Ms, active: bool, peak: Option<f32>) -> bool {
-    active && peak.is_some_and(|level| level > 0.0) && ready_at.is_some_and(|at| now >= at)
+    active && audible(peak) && ready_at.is_some_and(|at| now >= at)
 }
 
 /// What to do with a group whose read just failed.
@@ -1231,6 +1242,12 @@ mod tests {
     fn activity_due_needs_audible_audio_and_a_ready_device() {
         assert!(!activity_due(Some(0), 0, false, Some(0.2)), "inactive");
         assert!(!activity_due(Some(0), 0, true, Some(0.0)), "silent");
+        // Owner session: a paused player left the headset endpoint at ~1.6e-6 (-115 dBFS).
+        assert!(
+            !activity_due(Some(0), 0, true, Some(1.6e-6)),
+            "near-silence"
+        );
+        assert!(activity_due(Some(0), 0, true, Some(0.001)), "-60 dBFS");
         assert!(!activity_due(Some(0), 0, true, None), "no meter");
         assert!(
             !activity_due(None, 0, true, Some(0.2)),
@@ -1412,6 +1429,22 @@ mod tests {
         }
         device.check_activity(GAP + 50_000, headset_peak(0.0));
         assert_eq!(device.deadline(), Some(GAP + 65_000));
+    }
+
+    #[test]
+    fn near_silence_backs_off_and_reads_nothing() {
+        let (mut device, headset_grants, _) = audio_device(None);
+        // Owner session: a paused player kept a stream open at ~1.6e-6 (-115 dBFS).
+        device.check_activity(GAP, headset_peak(1.6e-6));
+        device.check_activity(GAP + 15_000, headset_peak(1.6e-6));
+        assert_eq!(device.deadline(), Some(GAP + 45_000), "silent back-off");
+        assert_eq!(*headset_grants.borrow(), [Trigger::Arrival]);
+
+        device.check_activity(GAP + 45_000, headset_peak(0.001));
+        assert_eq!(
+            *headset_grants.borrow(),
+            [Trigger::Arrival, Trigger::Activity]
+        );
     }
 
     #[test]
