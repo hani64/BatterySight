@@ -254,6 +254,20 @@ impl HidppEngine {
         }
     }
 
+    /// Whether `key` is one [`HidppEngine::device_key`] builds without a unit id
+    /// (`logi:<PID>:<index>`): identical devices present at once share it.
+    pub fn is_fallback_key(key: &DeviceKey) -> bool {
+        key.0
+            .strip_prefix("logi:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(pid, index)| {
+                pid.len() == 4
+                    && pid.bytes().all(|b| b.is_ascii_hexdigit())
+                    && !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+            })
+    }
+
     /// How long a request to `index` may stay unanswered.
     fn timeout(&self, index: u8) -> u32 {
         if self.receiver && index == DIRECT {
@@ -1071,6 +1085,25 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert_eq!(e.group_key(), DeviceKey("logi-group:C547:7".into()));
         let e = HidppEngine::new(&headset_group(), &catalog());
         assert_eq!(e.group_key(), DeviceKey("logi-group:0ABA:8".into()));
+    }
+
+    #[test]
+    fn only_keys_without_unit_id_are_fallback_keys() {
+        let e = HidppEngine::new(&headset_group(), &catalog());
+        assert!(HidppEngine::is_fallback_key(&e.device_key(255, u32::MAX)));
+        assert!(HidppEngine::is_fallback_key(&e.device_key(1, 0)));
+        assert!(!HidppEngine::is_fallback_key(&e.device_key(1, 0x1A2B_3C4D)));
+        for other in [
+            "logi-group:0ABA:8",
+            "logi:0ABA:255#2",
+            "logi:0ABA:",
+            "x:0ABA:1",
+        ] {
+            assert!(
+                !HidppEngine::is_fallback_key(&DeviceKey(other.into())),
+                "{other}"
+            );
+        }
     }
 
     #[test]

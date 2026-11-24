@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::{Catalog, EngineKind};
 use crate::engine::{Action, Engine};
+use crate::engines;
 use crate::hid::{CollectionId, GroupId, HidGroup};
 use crate::model::{
     Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, Verification, Via,
@@ -64,6 +65,9 @@ struct Slot {
     /// HID product string, the name of a device whose engine gives none.
     product: String,
     collections: Vec<CollectionId>,
+    /// Hub keys of devices this engine registered under a shared key another live group
+    /// already held (see [`Hub::claim`]), by the engine's own key, which it keeps using.
+    aliases: BTreeMap<DeviceKey, DeviceKey>,
 }
 
 /// The fields of an [`Action::Register`].
@@ -195,6 +199,7 @@ impl Hub {
                 ids: first.map(|c| (c.vid, c.pid)),
                 product: first.map(|c| c.product.clone()).unwrap_or_default(),
                 collections,
+                aliases: BTreeMap::new(),
             },
         );
         self.scheduler.register(key.clone(), GROUP_CAPS);
@@ -289,10 +294,13 @@ impl Hub {
         if pass.depth > MAX_NESTED_GRANTS {
             return;
         }
-        let Some(grant) = self.scheduler.request(key, trigger, now) else {
+        let Some(mut grant) = self.scheduler.request(key, trigger, now) else {
             return;
         };
         if let Some(slot) = self.engines.get_mut(&gid) {
+            if let Some((own, _)) = slot.aliases.iter().find(|(_, hub)| **hub == grant.subject) {
+                grant.subject = own.clone();
+            }
             let actions = slot.engine.on_grant(&grant, now);
             pass.depth += 1;
             self.apply(gid, actions, now, pass);
@@ -316,6 +324,50 @@ impl Hub {
                 .find(|(_, slot)| slot.key == *key)
                 .map(|(&gid, _)| gid)
         })
+    }
+
+    /// The hub key of the device `gid`'s engine calls `key`.
+    fn hub_key(&self, gid: GroupId, key: DeviceKey) -> DeviceKey {
+        self.engines
+            .get(&gid)
+            .and_then(|slot| slot.aliases.get(&key))
+            .cloned()
+            .unwrap_or(key)
+    }
+
+    /// The hub key `gid`'s engine registers `key` under. A key that may be shared
+    /// ([`engines::shared_key`]) held by another live group becomes the first `key#n`,
+    /// n ≥ 2, no other live group holds; any other key is kept as is, so one device served
+    /// by several groups stays one entry. Recomputed on every registration: a device that
+    /// got `#2` keeps it until it registers again. The device `gid` served under an
+    /// earlier hub key for `key` loses that registrant.
+    fn claim(&mut self, gid: GroupId, key: DeviceKey, now: Ms, pass: &mut Pass) -> DeviceKey {
+        if !engines::shared_key(&key) {
+            return key;
+        }
+        let held_elsewhere = |k: &DeviceKey| {
+            self.owners
+                .get(k)
+                .is_some_and(|groups| groups.iter().any(|&g| g != gid))
+        };
+        let mut claimed = key.clone();
+        let mut n = 1;
+        while held_elsewhere(&claimed) {
+            n += 1;
+            claimed = DeviceKey(format!("{}#{n}", key.0));
+        }
+        let previous = self.hub_key(gid, key.clone());
+        if previous != claimed {
+            self.drop_registrant(&previous, gid, now, pass);
+        }
+        if let Some(slot) = self.engines.get_mut(&gid) {
+            if claimed == key {
+                slot.aliases.remove(&key);
+            } else {
+                slot.aliases.insert(key, claimed.clone());
+            }
+        }
+        claimed
     }
 
     /// Carries out `actions` from `gid`'s engine. Actions on devices or
@@ -349,6 +401,7 @@ impl Hub {
                     self.register(gid, registration, now, pass);
                 }
                 Action::Unregister(key) => {
+                    let key = self.hub_key(gid, key);
                     if self
                         .owners
                         .get(&key)
@@ -357,7 +410,8 @@ impl Hub {
                         self.drop_registrant(&key, gid, now, pass);
                     }
                 }
-                Action::Update(update) => {
+                Action::Update(mut update) => {
+                    update.key = self.hub_key(gid, update.key);
                     if self.device_owner(&update.key) != Some(gid) {
                         continue;
                     }
@@ -375,6 +429,7 @@ impl Hub {
                     }
                 }
                 Action::Asleep(key) => {
+                    let key = self.hub_key(gid, key);
                     if self.device_owner(&key) != Some(gid) {
                         continue;
                     }
@@ -387,6 +442,7 @@ impl Hub {
                     }
                 }
                 Action::Connected(key) => {
+                    let key = self.hub_key(gid, key);
                     if self.owner(&key) != Some(gid) {
                         continue;
                     }
@@ -415,6 +471,10 @@ impl Hub {
             initial,
             wpid,
         } = registration;
+        if !self.engines.contains_key(&gid) {
+            return;
+        }
+        let key = self.claim(gid, key, now, pass);
         let Some(slot) = self.engines.get(&gid) else {
             return;
         };
@@ -1537,5 +1597,85 @@ source = "test"
         hub.handle(logi(1), 0);
 
         assert_eq!(grants(&f).len(), 1 + MAX_NESTED_GRANTS);
+    }
+
+    #[test]
+    fn duplicate_fallback_keys_get_suffix() {
+        let k = dev("logi:0ABA:255");
+        let (k2, k3) = (dev("logi:0ABA:255#2"), dev("logi:0ABA:255#3"));
+        let (first, second, third) = (fake(), fake(), fake());
+        for f in [&first, &second, &third] {
+            f.borrow_mut().on_grant.push_back(vec![register(&k, None)]);
+        }
+        second
+            .borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&k, 40)]);
+        second
+            .borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&k, 39)]);
+        second
+            .borrow_mut()
+            .on_report
+            .push_back(vec![register(&k, None)]);
+        third
+            .borrow_mut()
+            .on_report
+            .push_back(vec![Action::Unregister(k.clone())]);
+        let mut hub = hub(&[(1, &first), (2, &second), (3, &third)]);
+        // Two identical dongles without unit ids, then a third.
+        for id in 1..=3 {
+            hub.handle(HubInput::GroupArrived(group(id, 0x046D, 0x0ABA)), 0);
+        }
+        let keys: Vec<DeviceKey> = hub.snapshot().into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, [k.clone(), k2.clone(), k3.clone()]);
+        assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&k2));
+
+        // The engine keeps speaking its own key; the hub maps it both ways.
+        hub.handle(report(2), 10);
+        assert_eq!(state(&hub, &k2).unwrap().level, Some(Level::Percent(40)));
+        assert_eq!(state(&hub, &k).unwrap().level, None);
+        hub.handle(HubInput::RefreshNow, 20);
+        assert_eq!(
+            grants(&second).last(),
+            Some(&(k.clone(), Trigger::RefreshNow))
+        );
+        assert_eq!(
+            grants(&first).last(),
+            Some(&(k.clone(), Trigger::RefreshNow))
+        );
+        hub.handle(report(3), 30);
+        assert_eq!(state(&hub, &k3).unwrap().presence, Presence::Offline);
+
+        // The first leaves: the second keeps `#2` until it registers again.
+        hub.handle(HubInput::GroupRemoved(GroupId(1)), 40);
+        hub.handle(report(2), 50);
+        assert_eq!(state(&hub, &k2).unwrap().level, Some(Level::Percent(39)));
+        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Offline);
+        hub.handle(report(2), 60);
+        assert_eq!(hub.keys_of(GroupId(2)), std::slice::from_ref(&k));
+        assert_eq!(state(&hub, &k).unwrap().presence, Presence::Online);
+        assert_eq!(state(&hub, &k2).unwrap().presence, Presence::Offline);
+    }
+
+    #[test]
+    fn unit_keys_are_never_suffixed() {
+        let k = dev("logi:unit:1A2B3C4D");
+        let (receiver, cable) = (fake(), fake());
+        receiver
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        cable
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register(&k, None)]);
+        let mut hub = hub(&[(1, &receiver), (2, &cable)]);
+        hub.handle(HubInput::GroupArrived(group(1, 0x046D, 0xC547)), 0);
+        hub.handle(HubInput::GroupArrived(group(2, 0x046D, 0xC547)), 0);
+
+        let keys: Vec<DeviceKey> = hub.snapshot().into_iter().map(|s| s.key).collect();
+        assert_eq!(keys, std::slice::from_ref(&k));
     }
 }
