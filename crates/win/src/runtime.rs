@@ -162,6 +162,7 @@ fn device_thread(
         hub: Hub::new(Catalog::builtin(), Policy::default()),
         reactor,
         groups: Vec::new(),
+        replacements: BTreeSet::new(),
         products: HashMap::new(),
         guard: ReadFailureGuard::default(),
         release_at: None,
@@ -189,8 +190,16 @@ type PathSet = BTreeSet<String>;
 struct SelectionSignature {
     kind: EngineKind,
     direct: Option<usize>,
-    /// Receive/send flags in the same sorted path order as the group's `PathSet`.
-    roles: Vec<(bool, bool)>,
+    report_id: u8,
+    /// I/O widths by selected role, in the same sorted path order as the group's `PathSet`.
+    roles: Vec<PathWidths>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PathWidths {
+    receive: Option<u16>,
+    /// Output and feature widths; present only for a command path.
+    send: Option<(u16, u16)>,
 }
 
 struct PendingArrival {
@@ -203,7 +212,6 @@ struct PendingArrival {
 struct ScannedGroup {
     paths: PathSet,
     pending: Option<PendingArrival>,
-    replacement: bool,
 }
 
 /// A group opened in the reactor and handed to the hub.
@@ -222,6 +230,8 @@ struct Device {
     hub: Hub,
     reactor: Reactor,
     groups: Vec<Opened>,
+    /// Still-present groups closed for a selection change, eligible for one replacement.
+    replacements: BTreeSet<PathSet>,
     /// Legacy HID++ display/receiver names, never used by catalog selectors.
     products: HashMap<String, String>,
     /// Keeps a group closed after back-to-back read failures until the next arrival, resume
@@ -362,6 +372,9 @@ impl Device {
             }
             OsEvent::InterfaceRemoved { path } => {
                 let path = path_key(&path);
+                let awaiting = self.replacements.len();
+                self.replacements.retain(|paths| !paths.contains(&path));
+                let cancelled = self.replacements.len() != awaiting;
                 let removed = self
                     .groups
                     .iter()
@@ -370,7 +383,7 @@ impl Device {
                     let gone = self.remove(index);
                     self.guard.on_removed(gone.paths, now_ms());
                     true
-                })
+                }) || cancelled
             }
             OsEvent::InterfaceArrived => {
                 self.guard.on_arrival(now_ms());
@@ -532,16 +545,26 @@ impl Device {
                 });
                 let mut paths: Vec<_> = members
                     .iter()
-                    .map(|member| (path_key(&member.path), member.collection.id))
+                    .enumerate()
+                    .map(|(index, member)| (path_key(&member.path), index))
                     .collect();
                 paths.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                 let pending = selection.map(|selection| {
                     let signature = SelectionSignature {
                         kind: selection.kind(),
                         direct: selection.direct(),
+                        report_id: selection.command_report_id(),
                         roles: paths
                             .iter()
-                            .map(|&(_, id)| (selection.reads(id), selection.sends(id)))
+                            .map(|&(_, index)| {
+                                let c = &group.collections[index];
+                                PathWidths {
+                                    receive: selection.reads(c.id).then_some(c.input_len),
+                                    send: selection
+                                        .sends(c.id)
+                                        .then_some((c.output_len, c.feature_len)),
+                                }
+                            })
                             .collect(),
                     };
                     PendingArrival {
@@ -554,10 +577,11 @@ impl Device {
                 ScannedGroup {
                     paths: paths.into_iter().map(|(path, _)| path).collect(),
                     pending,
-                    replacement: false,
                 }
             })
             .collect();
+        self.replacements
+            .retain(|paths| scanned.iter().any(|scan| &scan.paths == paths));
         // Close every stale route before admitting any replacement. A physically present
         // group whose selection changed (or was denied) was not disconnected.
         for index in (0..self.groups.len()).rev() {
@@ -574,21 +598,17 @@ impl Device {
             {
                 scan.pending = None;
             } else {
-                self.remove(index);
-                scan.replacement = true;
+                let gone = self.remove(index);
+                self.replacements.insert(gone.paths);
             }
         }
         self.release_at = None;
         let mut held = BTreeMap::new();
-        for ScannedGroup {
-            paths,
-            pending,
-            replacement,
-        } in scanned
-        {
+        for ScannedGroup { paths, pending } in scanned {
             let Some(pending) = pending else { continue };
-            if replacement {
-                // Already live: change routing without spending or checking the I/O cap.
+            if self.replacements.remove(&paths) {
+                // A selection change on a still-present group is not an I/O reopen.
+                // Consume the exemption before opening, so a failed attempt cannot reuse it.
                 self.arrive(pending, paths, true, now);
                 continue;
             }
@@ -1377,6 +1397,7 @@ mod tests {
             hub: Hub::new(Catalog::builtin(), Policy::default()),
             reactor: Reactor::new().unwrap(),
             groups: Vec::new(),
+            replacements: BTreeSet::new(),
             products: HashMap::new(),
             guard: ReadFailureGuard::default(),
             release_at: None,
@@ -1395,6 +1416,7 @@ mod tests {
             signature: SelectionSignature {
                 kind: EngineKind::Hidpp,
                 direct: None,
+                report_id: 0x10,
                 roles: Vec::new(),
             },
             collections: Vec::new(),
@@ -1560,6 +1582,9 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
         let old_collection = hidpp.collection.id;
         hidpp.collection.id = CollectionId(u32::MAX);
         control.collection.id = CollectionId(u32::MAX - 1);
+        control.collection.input_len = 10;
+        control.collection.output_len = 11;
+        control.collection.feature_len = 12;
         device.apply_scan(Some(vec![control, hidpp]), base + 1);
         assert_eq!(device.groups.len(), 1);
         assert_eq!(device.groups[0].id, old_id);
@@ -1605,11 +1630,7 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
         assert_eq!(device.deadline(), device.hub.next_deadline());
     }
 
-    #[test]
-    fn rescan_replaces_the_catalog_entry_when_only_cached_product_changes() {
-        let (mut device, server, mut hidpp, paths) = dongle_device();
-        hidpp.collection.pid = 0xBEEF;
-        let alpha = r#"
+    const PRODUCT_GATED_ALPHA: &str = r#"
 [[device]]
 name = "Synthetic Alpha"
 vid = 0x046D
@@ -1620,33 +1641,143 @@ status = "source-verified"
 source = "synthetic product-gate fixture"
 receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
 "#;
+
+    fn product_gated_device(catalog: &str) -> (Device, Server, HidInterface, PathSet) {
+        let (mut device, server, mut hidpp, paths) = dongle_device();
+        hidpp.collection.pid = 0xBEEF;
+        device.hub = Hub::new(Catalog::parse(catalog).unwrap(), Policy::default());
+        (device, server, hidpp, paths)
+    }
+
+    fn product_scan(device: &mut Device, hidpp: &HidInterface, name: Option<&str>, at: Ms) {
+        device.apply_scan_with(Some(vec![hidpp.clone()]), at, |_| name.map(str::to_owned));
+    }
+
+    #[test]
+    fn rescan_replaces_the_catalog_entry_when_only_cached_product_changes() {
+        let alpha = PRODUCT_GATED_ALPHA;
         let beta = alpha.replace("Alpha", "Beta");
-        let catalog = Catalog::parse(&format!("{alpha}{beta}")).unwrap();
-        device.hub = Hub::new(catalog, Policy::default());
+        let (mut device, server, mut hidpp, paths) =
+            product_gated_device(&format!("{alpha}{beta}"));
         let base = now_ms();
-        let scan = |device: &mut Device, hidpp: &HidInterface, name: Option<&str>, at| {
-            device.apply_scan_with(Some(vec![hidpp.clone()]), at, |_| name.map(str::to_owned));
-        };
-        scan(&mut device, &hidpp, Some("Cached Alpha"), base);
+        product_scan(&mut device, &hidpp, Some("Cached Alpha"), base);
         let old = device.groups[0].id;
         let old_collection = hidpp.collection.id;
         hidpp.collection.id = CollectionId(u32::MAX);
-        scan(&mut device, &hidpp, Some("Cached Alpha"), base + 1);
+        product_scan(&mut device, &hidpp, Some("Cached Alpha"), base + 1);
         assert_eq!(device.groups[0].id, old, "fresh IDs must not reopen handles");
 
         // A single-instance named pipe needs the server end reset to allow a new client.
         // Do not deliver a disconnect event to runtime: the physical scan is unchanged.
         server.listen_again();
-        scan(&mut device, &hidpp, Some("Cached Beta"), base + 2);
+        product_scan(&mut device, &hidpp, Some("Cached Beta"), base + 2);
         assert_ne!(device.groups[0].id, old);
         assert_eq!(device.groups[0].collections, [hidpp.collection.id]);
         assert!(!device.reactor.write(old_collection, &[0x11]));
         assert!(!device.guard.groups.contains_key(&paths));
 
-        scan(&mut device, &hidpp, None, base + 3);
+        product_scan(&mut device, &hidpp, None, base + 3);
         assert!(device.groups.is_empty(), "the denied route remained open");
         assert!(!device.reactor.write(hidpp.collection.id, &[0x11]));
         assert!(!device.guard.groups.contains_key(&paths));
+    }
+
+    #[test]
+    fn rescan_preserves_replacement_across_product_denials_and_failed_enumeration() {
+        let (mut device, server, mut hidpp, paths) = product_gated_device(PRODUCT_GATED_ALPHA);
+        let base = now_ms();
+        product_scan(&mut device, &hidpp, Some("Alpha"), base);
+        let old = device.groups[0].id;
+        cap(&mut device.guard, &paths, base);
+        let reopens = device.guard.groups[&paths].reopens.clone();
+
+        server.listen_again();
+        product_scan(&mut device, &hidpp, None, base + 7_000);
+        assert!(device.groups.is_empty());
+        device.apply_scan(None, base + 7_001);
+        product_scan(&mut device, &hidpp, None, base + 7_002);
+        hidpp.collection.id = CollectionId(u32::MAX);
+        product_scan(&mut device, &hidpp, Some("Alpha"), base + 7_003);
+
+        assert_eq!(device.groups.len(), 1, "the I/O cap blocked metadata restoration");
+        assert_ne!(device.groups[0].id, old);
+        assert_eq!(device.groups[0].collections, [hidpp.collection.id]);
+        assert_eq!(device.guard.groups[&paths].reopens, reopens);
+        assert_eq!(device.guard.groups[&paths].failed_at, base + 6_000);
+    }
+
+    #[test]
+    fn rescan_does_not_exempt_a_return_after_an_actual_departure() {
+        for notify_removal in [false, true] {
+            let (mut device, server, hidpp, paths) = product_gated_device(PRODUCT_GATED_ALPHA);
+            let base = now_ms();
+            product_scan(&mut device, &hidpp, Some("Alpha"), base);
+            cap(&mut device.guard, &paths, base);
+            server.listen_again();
+            product_scan(&mut device, &hidpp, None, base + 7_000);
+            assert!(device.groups.is_empty());
+            if notify_removal {
+                assert!(device.on_event(OsEvent::InterfaceRemoved {
+                    path: hidpp.path.clone(),
+                }));
+            } else {
+                device.apply_scan(Some(Vec::new()), base + 7_001);
+            }
+            device.guard.on_arrival(base + 7_002);
+            product_scan(&mut device, &hidpp, Some("Alpha"), base + 7_003);
+
+            assert!(device.groups.is_empty(), "a returning device bypassed the I/O cap");
+            assert_eq!(device.release_at, Some(base + 1_000 + REOPEN_WINDOW));
+        }
+    }
+
+    #[test]
+    fn rescan_uses_normal_admission_after_a_failed_replacement_open() {
+        let (mut device, server, hidpp, paths) = product_gated_device(PRODUCT_GATED_ALPHA);
+        let base = now_ms();
+        product_scan(&mut device, &hidpp, Some("Alpha"), base);
+        cap(&mut device.guard, &paths, base);
+        device.guard.on_arrival(base + 7_000);
+        product_scan(&mut device, &hidpp, None, base + 7_001);
+        drop(server);
+        // The one metadata replacement attempt is allowed, but its handle cannot open.
+        product_scan(&mut device, &hidpp, Some("Alpha"), base + 7_002);
+        assert!(device.groups.is_empty());
+        assert_eq!(device.release_at, None);
+        // Only real I/O admission rules apply to subsequent attempts.
+        product_scan(&mut device, &hidpp, Some("Alpha"), base + 7_003);
+        assert!(device.groups.is_empty());
+        assert_eq!(device.release_at, Some(base + 1_000 + REOPEN_WINDOW));
+    }
+
+    #[test]
+    fn rescan_replaces_framing_and_buffer_widths_on_the_same_paths() {
+        let (mut device, server, mut hidpp, _) = dongle_device();
+        hidpp.collection.usage_page = 0xFF00;
+        hidpp.collection.usage = 1;
+        hidpp.collection.input_len = 7;
+        hidpp.collection.output_len = 7;
+        let base = now_ms();
+        device.apply_scan(Some(vec![hidpp.clone()]), base);
+        let mut old = device.groups[0].id;
+        let first = server.receive();
+        assert_eq!((first[0], first.len()), (0x10, 7));
+
+        hidpp.collection.usage = 2;
+        hidpp.collection.input_len = 20;
+        hidpp.collection.output_len = 20;
+        for (scan, input, feature) in [(1, 20, 0), (2, 21, 0), (3, 21, 4)] {
+            server.listen_again();
+            hidpp.collection.id = CollectionId(u32::MAX - scan);
+            hidpp.collection.input_len = input;
+            hidpp.collection.feature_len = feature;
+            device.apply_scan(Some(vec![hidpp.clone()]), base + u64::from(scan));
+            assert_eq!(device.groups.len(), 1);
+            assert_ne!(device.groups[0].id, old, "scan {scan} kept stale framing");
+            old = device.groups[0].id;
+            let report = server.receive();
+            assert_eq!((report[0], report.len()), (0x11, 20));
+        }
     }
 
     #[test]

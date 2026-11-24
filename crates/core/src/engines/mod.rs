@@ -42,6 +42,11 @@ impl Selection {
         self.direct
     }
 
+    /// The report ID used to frame commands for this selection.
+    pub fn command_report_id(&self) -> u8 {
+        self.report_id
+    }
+
     pub(crate) fn send_role(&self, id: CollectionId) -> Option<CollectionRole> {
         if !self.sends(id) {
             return None;

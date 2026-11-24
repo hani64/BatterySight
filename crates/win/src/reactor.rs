@@ -439,7 +439,7 @@ pub(crate) mod tests {
             assert_eq!(written as usize, bytes.len());
         }
 
-        fn receive(&self) -> Vec<u8> {
+        pub(crate) fn receive(&self) -> Vec<u8> {
             let mut buffer = [0u8; 64];
             let mut read = 0;
             // SAFETY: synchronous read into a live buffer on an open handle.
