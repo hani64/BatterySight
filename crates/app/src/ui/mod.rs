@@ -461,6 +461,8 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
             return 1;
         }
     };
+    // Queued: the first check while in use after a device registers uses its minimum anyway.
+    runtime.set_intervals(settings.interval_gaps());
     // DirectWrite too, as loading it may read from disk.
     dwrite::init();
     let light = light_theme();
@@ -1051,6 +1053,8 @@ impl Ui {
                 self.alerts.rearm(&key);
                 self.update_views(&read_snapshot(&self.runtime));
             }
+            // Takes effect at the device's next check while in use.
+            MenuCommand::Interval(..) => self.runtime.set_intervals(self.settings.interval_gaps()),
             MenuCommand::ShowOn(_) => {
                 if matches!(self.surface, Surface::Widgets(_)) {
                     self.show();
@@ -1479,6 +1483,7 @@ mod tests {
             updated_ms: 0,
             source: Source::Query,
             verification: Verification::HardwareTested,
+            poll_min_ms: None,
         }
     }
 

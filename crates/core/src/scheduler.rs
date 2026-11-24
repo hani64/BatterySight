@@ -34,6 +34,10 @@ pub enum Trigger {
 /// How many [`Trigger::Rediscovery`] grants a key gets after each arrival grant.
 pub const REDISCOVERIES: u8 = 3;
 
+/// Gap between `Activity` grants of a device without a user gap: 10 minutes, or the
+/// device's `min_query_gap_ms` when that is longer.
+pub const DEFAULT_INTERVAL_MS: Ms = 600_000;
+
 /// What an engine declares about a registered device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capabilities {
@@ -41,9 +45,11 @@ pub struct Capabilities {
     pub pushes_battery: bool,
     /// A query wakes the device: only observed activity may justify one.
     pub query_wakes: bool,
-    /// Minimum time since the last granted request (any trigger) or noted read
+    /// The device's minimum time since the last granted request (any trigger) or noted read
     /// ([`Scheduler::note_read`]) before an `Activity` grant; the other triggers ignore it.
-    /// Zero means no `Activity` grant at all.
+    /// A user gap ([`Scheduler::set_user_gaps`]), or [`DEFAULT_INTERVAL_MS`] without one,
+    /// may lengthen it, never shorten it; the first grant after a wake uses it alone. Zero
+    /// means no `Activity` grant at all.
     pub min_query_gap_ms: Ms,
 }
 
@@ -90,6 +96,10 @@ struct DeviceSlot {
     /// Rediscovery grants since the last arrival grant.
     rediscoveries: u8,
     asleep: bool,
+    /// The device just registered or woke, and no grant other than a `Connected` one has
+    /// been issued since: its latest reading is a wake reading, so the next `Activity`
+    /// grant waits only the engine minimum, not the user gap.
+    woke: bool,
 }
 
 /// What is left of an issued grant.
@@ -107,6 +117,8 @@ pub struct Scheduler {
     grants: HashMap<GrantId, OpenGrant>,
     /// Id of the next grant; ids are never reused.
     next_id: u32,
+    /// User gaps between `Activity` grants, by device key; kept across registrations.
+    user_gaps: HashMap<DeviceKey, Ms>,
 }
 
 impl Scheduler {
@@ -116,11 +128,13 @@ impl Scheduler {
             devices: HashMap::new(),
             grants: HashMap::new(),
             next_id: 1,
+            user_gaps: HashMap::new(),
         }
     }
 
-    /// Starts tracking `key`. Registering a known key only updates its
-    /// capabilities; its history (arrival used, last grant, asleep) is kept.
+    /// Starts tracking `key`; a first registration counts as a wake. Registering a known
+    /// key only updates its capabilities; its history (arrival used, last grant, asleep,
+    /// wake) is kept.
     pub fn register(&mut self, key: DeviceKey, caps: Capabilities) {
         self.devices
             .entry(key)
@@ -131,6 +145,7 @@ impl Scheduler {
                 arrival_used: false,
                 rediscoveries: 0,
                 asleep: false,
+                woke: true,
             });
     }
 
@@ -147,6 +162,13 @@ impl Scheduler {
     pub fn unregister(&mut self, key: &DeviceKey) {
         self.devices.remove(key);
         self.grants.retain(|_, grant| grant.subject != *key);
+    }
+
+    /// Replaces every user gap between `Activity` grants (key → ms). A gap below the
+    /// device's `min_query_gap_ms` counts as the minimum; a key without one uses
+    /// [`DEFAULT_INTERVAL_MS`], or the minimum if that is longer.
+    pub fn set_user_gaps(&mut self, gaps: HashMap<DeviceKey, Ms>) {
+        self.user_gaps = gaps;
     }
 
     /// Grants permission to query `key` for `trigger`, or `None` if any rule refuses it.
@@ -170,6 +192,12 @@ impl Scheduler {
         }
 
         slot.last_grant_ms = Some(now);
+        // Any grant reads the device, so its latest reading is no longer the first reading
+        // after the wake, unless the grant is the link-up itself: its read is that first
+        // reading. Keeping `woke` there costs one earlier read, for consistency with a wake push.
+        if trigger != Trigger::Connected {
+            slot.woke = false;
+        }
         // Only a push, a link-up or a successful read wakes an asleep device.
         match trigger {
             Trigger::Arrival => {
@@ -177,7 +205,10 @@ impl Scheduler {
                 slot.rediscoveries = 0;
             }
             Trigger::Rediscovery => slot.rediscoveries += 1,
-            Trigger::Connected => slot.asleep = false,
+            Trigger::Connected => {
+                slot.woke |= slot.asleep;
+                slot.asleep = false;
+            }
             Trigger::Resume | Trigger::RefreshNow | Trigger::Activity => {}
         }
 
@@ -235,9 +266,10 @@ impl Scheduler {
         }
     }
 
-    /// A push or other sign of life arrived.
+    /// A push or other sign of life arrived; an asleep device counts as woken.
     pub fn mark_awake(&mut self, key: &DeviceKey) {
         if let Some(slot) = self.devices.get_mut(key) {
+            slot.woke |= slot.asleep;
             slot.asleep = false;
         }
     }
@@ -246,16 +278,29 @@ impl Scheduler {
         self.devices.get(key).is_some_and(|slot| slot.asleep)
     }
 
-    /// When `key` may next get an [`Trigger::Activity`] grant: `min_query_gap_ms` after its
-    /// last grant or read (at once without one). `None` while no activity can justify a
-    /// query: the device is unknown, pushes its battery, is asleep, or declares no gap (the
-    /// gap is the only limit on activity reads, so a device without one gets none).
+    /// When `key` may next get an [`Trigger::Activity`] grant: its gap after its last grant
+    /// or read (at once without one). The gap is the larger of `min_query_gap_ms` and the
+    /// key's user gap ([`DEFAULT_INTERVAL_MS`] without one), or just `min_query_gap_ms` while
+    /// the latest reading is a wake reading.
+    /// `None` while no activity can justify a query: the device is unknown, pushes its
+    /// battery, is asleep, or declares no gap (the gap is the only limit on activity reads,
+    /// so a device without one gets none).
     pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
         let slot = self.devices.get(key)?;
-        let gap = slot.caps.min_query_gap_ms;
-        if slot.caps.pushes_battery || slot.asleep || gap == 0 {
+        let min = slot.caps.min_query_gap_ms;
+        if slot.caps.pushes_battery || slot.asleep || min == 0 {
             return None;
         }
+        let gap = if slot.woke {
+            min
+        } else {
+            min.max(
+                self.user_gaps
+                    .get(key)
+                    .copied()
+                    .unwrap_or(DEFAULT_INTERVAL_MS),
+            )
+        };
         Some(
             slot.last_grant_ms
                 .map_or(0, |last| last.saturating_add(gap)),
@@ -350,15 +395,16 @@ mod tests {
     }
 
     #[test]
-    fn poll_only_activity_respects_min_gap() {
+    fn poll_only_activity_respects_the_default_gap() {
         let mut s = scheduler_with(caps(false, false, 300_000));
+        // The arrival grant ends the registration's wake: the default gap applies.
         assert!(s.request(&key(), Trigger::Arrival, 0).is_some());
-        assert_eq!(s.request(&key(), Trigger::Activity, 299_999), None);
-        let grant = s.request(&key(), Trigger::Activity, 300_000).unwrap();
+        assert_eq!(s.request(&key(), Trigger::Activity, 599_999), None);
+        let grant = s.request(&key(), Trigger::Activity, 600_000).unwrap();
         assert_eq!(grant.trigger, Trigger::Activity);
         // The gap restarts from the latest grant.
-        assert_eq!(s.request(&key(), Trigger::Activity, 599_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 600_000).is_some());
+        assert_eq!(s.request(&key(), Trigger::Activity, 1_199_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 1_200_000).is_some());
     }
 
     #[test]
@@ -400,9 +446,10 @@ mod tests {
     #[test]
     fn activity_respects_gap() {
         let mut s = scheduler_with(caps(false, false, 300_000));
+        // The first grant after registration; the default gap follows it.
         assert!(s.request(&key(), Trigger::Activity, 0).is_some());
-        assert_eq!(s.request(&key(), Trigger::Activity, 299_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 300_000).is_some());
+        assert_eq!(s.request(&key(), Trigger::Activity, 599_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 600_000).is_some());
     }
 
     #[test]
@@ -431,10 +478,10 @@ mod tests {
         let mut s = scheduler_with(caps(false, false, 300_000));
         assert_eq!(s.activity_ready_at(&key()), Some(0));
         assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
-        assert_eq!(s.activity_ready_at(&key()), Some(301_000));
-        assert_eq!(s.request(&key(), Trigger::Activity, 300_999), None);
-        assert!(s.request(&key(), Trigger::Activity, 301_000).is_some());
         assert_eq!(s.activity_ready_at(&key()), Some(601_000));
+        assert_eq!(s.request(&key(), Trigger::Activity, 600_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 601_000).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(1_201_000));
 
         s.mark_asleep(&key());
         assert_eq!(s.activity_ready_at(&key()), None, "asleep");
@@ -447,12 +494,13 @@ mod tests {
     #[test]
     fn a_read_outside_a_grant_restarts_the_activity_gap() {
         let mut s = scheduler_with(caps(false, false, 300_000));
+        // Registered (a wake) and read: the minimum.
         s.note_read(&key(), 1_000);
         assert_eq!(s.request(&key(), Trigger::Activity, 300_999), None);
         assert!(s.request(&key(), Trigger::Activity, 301_000).is_some());
         // An older read does not move the clock back.
         s.note_read(&key(), 5);
-        assert_eq!(s.activity_ready_at(&key()), Some(601_000));
+        assert_eq!(s.activity_ready_at(&key()), Some(901_000));
     }
 
     #[test]
@@ -488,8 +536,10 @@ mod tests {
                 read_ms: 3_000,
             }
         );
-        // A 1 ms gap lets the activity request one millisecond after the others.
+        // A 1 ms gap (minimum and user gap) lets the activity request one millisecond after
+        // the others.
         let mut s = scheduler_with(caps(false, false, 1));
+        s.set_user_gaps([(key(), 1)].into_iter().collect());
         let mut ids = Vec::new();
         for (now, trigger) in (1_000..).zip(ALL_TRIGGERS) {
             let grant = s.request(&key(), trigger, now).unwrap();
@@ -551,5 +601,157 @@ mod tests {
         assert!(!s.is_asleep(&key()));
         // Grants issued before the device went away no longer admit sends.
         assert!(!s.admit_send(open.id, 0));
+    }
+
+    /// Engine minimum of the polled device in the user-gap tests.
+    const MIN: Ms = 300_000;
+
+    fn gaps(gap: Option<Ms>) -> HashMap<DeviceKey, Ms> {
+        gap.into_iter().map(|g| (key(), g)).collect()
+    }
+
+    /// A polled device just registered (a wake), read at 0 and granted its post-wake
+    /// activity read at the minimum.
+    fn polled_after_wake_grant() -> Scheduler {
+        let mut s = scheduler_with(caps(false, false, MIN));
+        s.note_read(&key(), 0);
+        assert_eq!(s.activity_ready_at(&key()), Some(MIN));
+        assert!(s.request(&key(), Trigger::Activity, MIN).is_some());
+        s
+    }
+
+    #[test]
+    fn user_gap_lengthens_activity_gap() {
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
+        assert_eq!(s.request(&key(), Trigger::Activity, 2_099_999), None);
+        assert!(s.request(&key(), Trigger::Activity, 2_100_000).is_some());
+    }
+
+    #[test]
+    fn user_gap_never_below_minimum() {
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(60_000)));
+        assert_eq!(s.activity_ready_at(&key()), Some(600_000));
+    }
+
+    #[test]
+    fn first_activity_after_wake_uses_minimum() {
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.mark_asleep(&key());
+        s.mark_awake(&key());
+        // The wake push.
+        s.note_read(&key(), 1_000_000);
+        assert_eq!(s.activity_ready_at(&key()), Some(1_300_000));
+        assert!(s.request(&key(), Trigger::Activity, 1_300_000).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(3_100_000));
+    }
+
+    #[test]
+    fn mark_awake_on_an_awake_device_is_no_wake() {
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.mark_awake(&key());
+        s.note_read(&key(), 1_000_000);
+        assert_eq!(s.activity_ready_at(&key()), Some(2_800_000));
+    }
+
+    #[test]
+    fn user_gap_survives_re_registration() {
+        let mut s = scheduler_with(caps(false, false, MIN));
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.unregister(&key());
+        // A fresh registration counts as a wake.
+        s.register(key(), caps(false, false, MIN));
+        s.note_read(&key(), 0);
+        assert_eq!(s.activity_ready_at(&key()), Some(MIN));
+        assert!(s.request(&key(), Trigger::Activity, MIN).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
+    }
+
+    #[test]
+    fn re_registering_a_known_key_keeps_its_wake() {
+        // Registered again before its post-wake grant: still the minimum.
+        let mut s = scheduler_with(caps(false, false, MIN));
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.note_read(&key(), 0);
+        s.register(key(), caps(false, false, MIN));
+        assert_eq!(s.activity_ready_at(&key()), Some(MIN));
+
+        // Registered again after it: the user gap, a known key is no wake.
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        s.register(key(), caps(false, false, MIN));
+        s.note_read(&key(), 1_000_000);
+        assert_eq!(s.activity_ready_at(&key()), Some(2_800_000));
+    }
+
+    #[test]
+    fn changing_user_gap_applies_to_next_grant() {
+        let mut s = polled_after_wake_grant();
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
+        s.set_user_gaps(gaps(Some(1_200_000)));
+        assert_eq!(s.activity_ready_at(&key()), Some(1_500_000));
+        // None stored: the default.
+        s.set_user_gaps(gaps(None));
+        assert_eq!(s.activity_ready_at(&key()), Some(900_000));
+    }
+
+    #[test]
+    fn user_gap_ignored_for_pushing_devices() {
+        let mut s = scheduler_with(caps(true, false, MIN));
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        assert_eq!(s.activity_ready_at(&key()), None);
+    }
+
+    #[test]
+    fn default_interval_applies_without_user_gap() {
+        assert_eq!(DEFAULT_INTERVAL_MS, 600_000);
+        let mut s = polled_after_wake_grant();
+        assert_eq!(s.activity_ready_at(&key()), Some(900_000));
+        // A stored gap, even the minimum, replaces the default.
+        s.set_user_gaps(gaps(Some(MIN)));
+        assert_eq!(s.activity_ready_at(&key()), Some(600_000));
+
+        // A minimum above the default stays the gap.
+        let mut s = scheduler_with(caps(false, false, 900_000));
+        s.note_read(&key(), 0);
+        assert!(s.request(&key(), Trigger::Activity, 900_000).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(1_800_000));
+    }
+
+    #[test]
+    fn other_grants_end_the_wake() {
+        let mut s = scheduler_with(caps(false, false, MIN));
+        s.set_user_gaps(gaps(Some(1_800_000)));
+        assert!(s.request(&key(), Trigger::RefreshNow, 1_000).is_some());
+        assert_eq!(s.activity_ready_at(&key()), Some(1_801_000));
+    }
+
+    #[test]
+    fn connected_wake_keeps_the_minimum_for_the_next_activity() {
+        // A link-up flips the device awake through the grant itself, or through
+        // `mark_awake` just before it (as the hub does); either way the grant's read is
+        // the wake reading.
+        for awake_first in [false, true] {
+            let mut s = polled_after_wake_grant();
+            s.set_user_gaps(gaps(Some(1_800_000)));
+            s.mark_asleep(&key());
+            if awake_first {
+                s.mark_awake(&key());
+            }
+            assert!(s.request(&key(), Trigger::Connected, 1_000_000).is_some());
+            s.note_read(&key(), 1_000_000);
+            assert_eq!(
+                s.activity_ready_at(&key()),
+                Some(1_300_000),
+                "awake_first = {awake_first}"
+            );
+            assert!(s.request(&key(), Trigger::Activity, 1_300_000).is_some());
+            assert_eq!(s.activity_ready_at(&key()), Some(3_100_000));
+        }
     }
 }

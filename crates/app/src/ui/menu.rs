@@ -3,7 +3,11 @@
 //! made from it ([`track`]).
 
 use batterysight_core::model::{DeviceKey, DeviceState};
-use batterysight_core::settings::{DisplayMode, MonitorChoice, Settings, Threshold};
+use batterysight_core::scheduler::DEFAULT_INTERVAL_MS;
+use batterysight_core::settings::{
+    DisplayMode, INTERVAL_MAX_MIN, MonitorChoice, Settings, Threshold,
+};
+use batterysight_core::time::Ms;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_CHECKED, MF_GRAYED,
@@ -25,6 +29,10 @@ const THRESHOLDS: [Threshold; 8] = [
     Threshold::Percent(30),
     Threshold::Percent(40),
 ];
+
+/// The battery-check intervals (minutes) the menu offers, those at or above the device's
+/// minimum; a hand-edited other one is listed too.
+const INTERVALS: [u16; 5] = [5, 10, 15, 30, 60];
 
 /// A monitor that can show the widget.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +71,8 @@ pub enum MenuCommand {
     MoveLeft(DeviceKey),
     MoveRight(DeviceKey),
     Threshold(DeviceKey, Threshold),
+    /// Minutes between battery checks while the device is in use.
+    Interval(DeviceKey, u16),
     History,
     ShowOn(MonitorChoice),
     ShowAs(DisplayMode),
@@ -169,6 +179,7 @@ pub fn change(settings: &mut Settings, command: &MenuCommand, shown: &[DeviceKey
         MenuCommand::Threshold(key, threshold) if settings.threshold(key) != *threshold => {
             settings.set_threshold(key, *threshold);
         }
+        MenuCommand::Interval(key, minutes) => settings.set_interval(key, *minutes),
         MenuCommand::ShowOn(choice) => settings.monitors = choice.clone(),
         MenuCommand::ShowAs(display) => settings.display = *display,
         MenuCommand::Autostart(on) => settings.autostart = *on,
@@ -262,10 +273,50 @@ impl Builder {
             label: "Low-battery alert".into(),
             items: alerts,
         });
+        // Only for a device BatterySight asks while it is in use.
+        if let Some(min_ms) = s.poll_min_ms {
+            items.push(Item::Submenu {
+                label: "Check battery while in use".into(),
+                items: self.intervals(key, settings.interval(key), min_ms),
+            });
+        }
         Item::Submenu {
             label: super::label(s),
             items,
         }
+    }
+
+    /// "Check battery while in use": the device's minimum (`min_ms`, rounded up to whole
+    /// minutes), the presets above it, and `chosen` when it is none of them. The checked
+    /// entry is the interval in effect: `chosen`, or the default without one, but never
+    /// below the minimum.
+    fn intervals(&mut self, key: &DeviceKey, chosen: Option<u16>, min_ms: Ms) -> Vec<Item> {
+        let minutes_of = |ms: Ms| {
+            u16::try_from(ms.div_ceil(60_000))
+                .unwrap_or(u16::MAX)
+                .clamp(1, INTERVAL_MAX_MIN)
+        };
+        let min = minutes_of(min_ms);
+        let current = chosen
+            .unwrap_or_else(|| minutes_of(DEFAULT_INTERVAL_MS))
+            .max(min);
+        let mut minutes: Vec<u16> = INTERVALS.into_iter().filter(|&m| m > min).collect();
+        minutes.push(min);
+        if !minutes.contains(&current) {
+            minutes.push(current);
+        }
+        minutes.sort_unstable();
+        minutes
+            .into_iter()
+            .map(|m| {
+                self.entry(
+                    format!("Every {m} min"),
+                    MenuCommand::Interval(key.clone(), m),
+                    m == current,
+                    true,
+                )
+            })
+            .collect()
     }
 
     /// "Show on": all, main, each monitor; a chosen monitor that is not connected stays
@@ -454,6 +505,7 @@ mod tests {
             updated_ms: 0,
             source: Source::Query,
             verification: Verification::HardwareTested,
+            poll_min_ms: None,
         }
     }
 
@@ -864,6 +916,166 @@ mod tests {
         // No number in the name: the place in the enumeration.
         let m = MonitorInfo::new("WEIRD".into(), 2, 800, 600, false);
         assert_eq!(m.label, "Display 3 (800x600)");
+    }
+
+    /// The mouse and the headset, the headset asked during use with minimum `min_ms`.
+    fn polled_headset(min_ms: u64) -> Vec<DeviceState> {
+        let mut states = two_devices();
+        states[1].poll_min_ms = Some(min_ms);
+        states
+    }
+
+    /// The entries of the only "Check battery while in use" submenu.
+    fn intervals(states: &[DeviceState], settings: &Settings) -> Vec<String> {
+        let model = Model::new(states, settings, &two_monitors(), None, true);
+        let text = lines(&model.items);
+        let at = text
+            .iter()
+            .position(|l| l == "  Check battery while in use ▸")
+            .unwrap();
+        text[at + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("    "))
+            .map(|l| l.trim_start().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn interval_submenu_only_for_polled_devices() {
+        let model = Model::new(
+            &polled_headset(300_000),
+            &Settings::default(),
+            &two_monitors(),
+            None,
+            true,
+        );
+        let text = lines(&model.items);
+        let submenu = "  Check battery while in use ▸";
+        assert_eq!(text.iter().filter(|l| *l == submenu).count(), 1);
+        // The headset's, right after its low-battery alert.
+        let headset_at = text
+            .iter()
+            .position(|l| l == "PRO X Wireless Gaming Headset — 77% ▸")
+            .unwrap();
+        assert_eq!(text[headset_at + 4], "  Low-battery alert ▸");
+        assert_eq!(text[headset_at + 13], submenu);
+        // Nothing for the mouse, which reports by itself.
+        let mouse_at = text
+            .iter()
+            .position(|l| l == "PRO X Superlight — 79% ▸")
+            .unwrap();
+        assert!(mouse_at < headset_at);
+        assert!(!text[mouse_at..headset_at].contains(&submenu.to_owned()));
+    }
+
+    #[test]
+    fn interval_presets_respect_minimum() {
+        let settings = Settings::default();
+        assert_eq!(
+            intervals(&polled_headset(600_000), &settings),
+            [
+                "Every 10 min ✓",
+                "Every 15 min",
+                "Every 30 min",
+                "Every 60 min"
+            ]
+        );
+        // The 5-minute headset: 5 offered, the 10-minute default checked.
+        assert_eq!(
+            intervals(&polled_headset(300_000), &settings),
+            [
+                "Every 5 min",
+                "Every 10 min ✓",
+                "Every 15 min",
+                "Every 30 min",
+                "Every 60 min"
+            ]
+        );
+        // A minimum between presets, rounded up to whole minutes, is listed too.
+        assert_eq!(
+            intervals(&polled_headset(400_000), &settings),
+            [
+                "Every 7 min",
+                "Every 10 min ✓",
+                "Every 15 min",
+                "Every 30 min",
+                "Every 60 min"
+            ]
+        );
+        // A minimum above the default is the default.
+        assert_eq!(
+            intervals(&polled_headset(900_000), &settings),
+            ["Every 15 min ✓", "Every 30 min", "Every 60 min"]
+        );
+    }
+
+    #[test]
+    fn hand_edited_interval_is_listed() {
+        let mut settings = Settings::default();
+        settings.set_interval(&DeviceKey("headset".into()), 45);
+        assert_eq!(
+            intervals(&polled_headset(300_000), &settings),
+            [
+                "Every 5 min",
+                "Every 10 min",
+                "Every 15 min",
+                "Every 30 min",
+                "Every 45 min ✓",
+                "Every 60 min"
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_below_minimum_shows_minimum_checked() {
+        let mut settings = Settings::default();
+        settings.set_interval(&DeviceKey("headset".into()), 1);
+        assert_eq!(
+            intervals(&polled_headset(300_000), &settings),
+            [
+                "Every 5 min ✓",
+                "Every 10 min",
+                "Every 15 min",
+                "Every 30 min",
+                "Every 60 min"
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_entries_carry_their_command() {
+        let headset = DeviceKey("headset".into());
+        let model = Model::new(
+            &polled_headset(300_000),
+            &Settings::default(),
+            &two_monitors(),
+            None,
+            true,
+        );
+        let entry = entries(&model.items)
+            .into_iter()
+            .find(|e| e.label == "Every 30 min")
+            .unwrap();
+        assert_eq!(
+            model.command(entry.id),
+            Some(MenuCommand::Interval(headset, 30))
+        );
+    }
+
+    #[test]
+    fn interval_command_sets_and_reports_change() {
+        let shown = keys(&["a", "b"]);
+        let a = &shown[0];
+        let mut s = Settings::default();
+        let thirty = MenuCommand::Interval(a.clone(), 30);
+        assert!(change(&mut s, &thirty, &shown));
+        assert_eq!(s.interval(a), Some(30));
+        // The value it already has.
+        assert!(!change(&mut s, &thirty, &shown));
+        assert_eq!(s.interval(a), Some(30));
+        let ten = MenuCommand::Interval(a.clone(), 10);
+        assert!(change(&mut s, &ten, &shown));
+        assert_eq!(s.interval(a), Some(10));
     }
 
     #[test]

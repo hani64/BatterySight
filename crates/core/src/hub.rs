@@ -29,6 +29,8 @@ pub enum HubInput {
     Resume,
     RefreshNow,
     Activity(DeviceKey),
+    /// The user's gaps between activity reads, by device key; replaces all earlier ones.
+    SetIntervals(HashMap<DeviceKey, Ms>),
     Tick,
 }
 
@@ -149,6 +151,7 @@ impl Hub {
                     self.grant(gid, &key, Trigger::Activity, now, &mut pass);
                 }
             }
+            HubInput::SetIntervals(gaps) => self.scheduler.set_user_gaps(gaps),
             HubInput::Tick => self.tick(now, &mut pass),
         }
         if pass.changed {
@@ -577,8 +580,12 @@ impl Hub {
                 updated_ms: now,
                 source: initial.source,
                 verification,
+                poll_min_ms: None,
             });
         state.verification = verification;
+        // Asked during use: the activity gap is the only limit on such reads.
+        state.poll_min_ms =
+            (!caps.pushes_battery && caps.min_query_gap_ms > 0).then_some(caps.min_query_gap_ms);
         state.apply(&initial, now);
         if let Some(name) = catalog_name {
             state.name = name;
@@ -1524,9 +1531,10 @@ quirks = { query_wakes = true }
         hub.handle(HubInput::GroupRemoved(GroupId(1)), 1_000);
         hub.handle(logi(2), 2_000);
 
-        hub.handle(HubInput::Activity(a.clone()), 101_999);
+        // The refresh ended the registration's wake: the default gap, from the new read.
+        hub.handle(HubInput::Activity(a.clone()), 601_999);
         assert_eq!(grants(&second), vec![(group_key(2), Trigger::Arrival)]);
-        hub.handle(HubInput::Activity(a.clone()), 102_000);
+        hub.handle(HubInput::Activity(a.clone()), 602_000);
         assert_eq!(grants(&second).last(), Some(&(a, Trigger::Activity)));
     }
 
@@ -1615,6 +1623,127 @@ quirks = { query_wakes = true }
         assert_eq!(hub.activity_ready_at(&a), Some(150_000));
         hub.handle(report(1), 60_000);
         assert_eq!(hub.activity_ready_at(&a), Some(150_000));
+    }
+
+    /// A device asked during use, with the headset's 5-minute minimum.
+    fn polled() -> Capabilities {
+        Capabilities {
+            pushes_battery: false,
+            min_query_gap_ms: 300_000,
+            ..pushing()
+        }
+    }
+
+    fn intervals(key: &DeviceKey, gap: Ms) -> HubInput {
+        HubInput::SetIntervals([(key.clone(), gap)].into_iter().collect())
+    }
+
+    #[test]
+    fn snapshot_reports_poll_minimum() {
+        let f = fake();
+        let (poll, push, no_gap) = (dev("poll"), dev("push"), dev("no-gap"));
+        let without_gap = Capabilities {
+            min_query_gap_ms: 0,
+            ..polled()
+        };
+        f.borrow_mut().on_grant.push_back(vec![
+            register_with(&poll, polled(), None),
+            register(&push, None),
+            register_with(&no_gap, without_gap, None),
+        ]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+
+        assert_eq!(state(&hub, &poll).unwrap().poll_min_ms, Some(300_000));
+        assert_eq!(state(&hub, &push).unwrap().poll_min_ms, None);
+        assert_eq!(state(&hub, &no_gap).unwrap().poll_min_ms, None);
+    }
+
+    #[test]
+    fn set_intervals_reaches_scheduler() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, polled(), None)]);
+        let mut hub = hub(&[(1, &f)]);
+        // The registration reads the battery at 100 000; the post-wake grant follows at
+        // the minimum.
+        hub.handle(logi(1), 100_000);
+        hub.handle(HubInput::Activity(a.clone()), 400_000);
+        assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Activity)));
+
+        assert_eq!(hub.handle(intervals(&a, 1_800_000), 500_000), vec![]);
+        assert_eq!(hub.activity_ready_at(&a), Some(2_200_000));
+    }
+
+    #[test]
+    fn wake_push_then_minimum_then_user_interval() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, polled(), None)]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Asleep(a.clone())]);
+        // The headset switched on again pushes its level.
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![level_update(&a, 90)]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+        hub.handle(HubInput::Activity(a.clone()), 300_000);
+        hub.handle(intervals(&a, 1_800_000), 300_000);
+        hub.handle(report(1), 400_000);
+        assert_eq!(hub.activity_ready_at(&a), None, "asleep");
+
+        let t = 1_000_000;
+        hub.handle(report(1), t);
+        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000));
+        hub.handle(HubInput::Activity(a.clone()), t + 300_000);
+        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000 + 1_800_000));
+        assert_eq!(
+            grants(&f),
+            vec![
+                (group_key(1), Trigger::Arrival),
+                (a.clone(), Trigger::Activity),
+                (a, Trigger::Activity),
+            ]
+        );
+    }
+
+    #[test]
+    fn link_up_wake_then_minimum_then_user_interval() {
+        let f = fake();
+        let a = dev("dev-a");
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&a, polled(), None)]);
+        // The post-wake activity grant reads nothing; the link-up's grant reads the level.
+        f.borrow_mut().on_grant.push_back(vec![]);
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![level_update(&a, 90)]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Asleep(a.clone())]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Connected(a.clone())]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+        hub.handle(HubInput::Activity(a.clone()), 300_000);
+        hub.handle(intervals(&a, 1_800_000), 300_000);
+        hub.handle(report(1), 400_000);
+
+        let t = 1_000_000;
+        hub.handle(report(1), t);
+        assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Connected)));
+        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000));
+        hub.handle(HubInput::Activity(a.clone()), t + 300_000);
+        assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Activity)));
+        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000 + 1_800_000));
     }
 
     #[test]
