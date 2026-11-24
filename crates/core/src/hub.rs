@@ -165,13 +165,30 @@ impl Hub {
         self.states.values().cloned().collect()
     }
 
-    /// When the next `Tick` is due: the earliest engine deadline or grace expiry.
+    /// When the next `Tick` is due: the earliest engine deadline, grace expiry or charging
+    /// device's read ([`Hub::charging_reads`]).
     pub fn next_deadline(&self) -> Option<Ms> {
         self.engines
             .values()
             .filter_map(|slot| slot.engine.next_deadline())
             .chain(self.grace.values().copied())
+            .chain(self.charging_reads().map(|(_, at)| at))
             .min()
+    }
+
+    /// Devices asked during use that are owned, online and charging, each with when the
+    /// scheduler could next grant it an activity read: a `Tick` then reads it without any
+    /// activity, as a charging headset that sits silent never pushes its level.
+    fn charging_reads(&self) -> impl Iterator<Item = (&DeviceKey, Ms)> {
+        self.states
+            .values()
+            .filter(|state| {
+                state.poll_min_ms.is_some()
+                    && state.presence == Presence::Online
+                    && state.charge == Charge::Charging
+                    && self.device_owner(&state.key).is_some()
+            })
+            .filter_map(|state| Some((&state.key, self.scheduler.activity_ready_at(&state.key)?)))
     }
 
     /// The registered devices `group`'s engine currently owns, ordered by key: those an
@@ -268,6 +285,17 @@ impl Hub {
             if let Some(slot) = self.engines.get_mut(&gid) {
                 let actions = slot.engine.on_tick(now);
                 self.apply(gid, actions, now, pass);
+            }
+        }
+        let charging: Vec<DeviceKey> = self
+            .charging_reads()
+            .filter(|&(_, at)| now >= at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in charging {
+            // An earlier grant's actions may have moved or released the device.
+            if let Some(gid) = self.device_owner(&key) {
+                self.grant(gid, &key, Trigger::Activity, now, pass);
             }
         }
         let expired: Vec<DeviceKey> = self
@@ -1744,6 +1772,111 @@ quirks = { query_wakes = true }
         hub.handle(HubInput::Activity(a.clone()), t + 300_000);
         assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Activity)));
         assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000 + 1_800_000));
+    }
+
+    /// A reading of `key` with status `charge`.
+    fn charge_update(key: &DeviceKey, charge: Charge) -> Action {
+        Action::Update(DeviceUpdate {
+            level: Some(Level::Percent(50)),
+            charge: Some(charge),
+            presence: Some(Presence::Online),
+            ..update(key)
+        })
+    }
+
+    /// `a` registered at 0 with `caps` and pushing a reading with status `charge` at 0.
+    fn registered_with_charge(f: &Fake, a: &DeviceKey, caps: Capabilities, charge: Charge) -> Hub {
+        f.borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(a, caps, None)]);
+        f.borrow_mut()
+            .on_report
+            .push_back(vec![charge_update(a, charge)]);
+        let mut hub = hub(&[(1, f)]);
+        hub.handle(logi(1), 0);
+        hub.handle(report(1), 0);
+        hub
+    }
+
+    #[test]
+    fn charging_device_is_read_at_the_interval_without_audio() {
+        let f = fake();
+        let a = dev("dev-a");
+        let mut hub = registered_with_charge(&f, &a, polled(), Charge::Charging);
+        // Each read finds it still charging.
+        for _ in 0..2 {
+            f.borrow_mut()
+                .on_grant
+                .push_back(vec![charge_update(&a, Charge::Charging)]);
+        }
+
+        // First after the wake at the minimum, then at the default interval.
+        assert_eq!(hub.next_deadline(), Some(300_000));
+        hub.handle(HubInput::Tick, 299_999);
+        assert_eq!(grants(&f).len(), 1, "not yet");
+        hub.handle(HubInput::Tick, 300_000);
+        assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Activity)));
+        assert_eq!(hub.next_deadline(), Some(900_000));
+        hub.handle(HubInput::Tick, 900_000);
+        assert_eq!(
+            grants(&f),
+            vec![
+                (group_key(1), Trigger::Arrival),
+                (a.clone(), Trigger::Activity),
+                (a, Trigger::Activity),
+            ]
+        );
+        assert_eq!(hub.next_deadline(), Some(1_500_000));
+    }
+
+    #[test]
+    fn charging_reads_stop_once_the_device_stops_charging() {
+        for (end, what) in [
+            (
+                charge_update(&dev("dev-a"), Charge::Discharging),
+                "discharging",
+            ),
+            (charge_update(&dev("dev-a"), Charge::Full), "full"),
+            (
+                charge_update(&dev("dev-a"), Charge::NotCharging),
+                "not charging",
+            ),
+            (Action::Asleep(dev("dev-a")), "asleep"),
+        ] {
+            let f = fake();
+            let a = dev("dev-a");
+            let mut hub = registered_with_charge(&f, &a, polled(), Charge::Charging);
+            f.borrow_mut().on_grant.push_back(vec![end]);
+            hub.handle(HubInput::Tick, 300_000);
+            assert_eq!(grants(&f).len(), 2, "{what}");
+
+            assert_eq!(hub.next_deadline(), None, "{what}");
+            hub.handle(HubInput::Tick, 900_000);
+            assert_eq!(grants(&f).len(), 2, "{what}");
+            // Audio asks it again, except while asleep.
+            hub.handle(HubInput::Activity(a.clone()), 900_000);
+            assert_eq!(
+                grants(&f).len(),
+                2 + usize::from(what != "asleep"),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn devices_not_charging_or_pushing_get_no_timed_reads() {
+        for (caps, charge) in [
+            (pushing(), Charge::Charging),
+            (polled(), Charge::Discharging),
+            (polled(), Charge::Full),
+        ] {
+            let f = fake();
+            let a = dev("dev-a");
+            let mut hub = registered_with_charge(&f, &a, caps, charge);
+            assert_eq!(hub.next_deadline(), None, "{caps:?} {charge:?}");
+            hub.handle(HubInput::Tick, 10_000_000);
+            assert_eq!(grants(&f).len(), 1, "{caps:?} {charge:?}");
+        }
     }
 
     #[test]
