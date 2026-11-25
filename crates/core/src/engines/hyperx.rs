@@ -1,4 +1,4 @@
-//! HyperX HX66 and Cloud Alpha 21 BB dongles, battery and presence only.
+//! HyperX HX66, Cloud Alpha 21 BB and NGENUITY universal receivers.
 
 use crate::catalog::{CollectionSelector, DeviceEntry, EngineKind, HyperxReport};
 use crate::engine::{Action, BytePattern, Engine, WriteRule};
@@ -12,6 +12,9 @@ use crate::time::Ms;
 use super::Match;
 
 pub(super) const COMMAND_ROLE: CollectionRole = CollectionRole(1);
+
+const WAKE_GRACE_MS: Ms = 2_000;
+const UNIVERSAL_REPLY_MS: Ms = 1_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Query {
@@ -40,29 +43,41 @@ const ALPHA: [&[u8]; 3] = [
     &packet::<31>(&[0x21, 0xBB, 0x0B]),
     &packet::<31>(&[0x21, 0xBB, 0x0C]),
 ];
+const UNIVERSAL: [u8; 64] = packet(&[0x50, 0x02]);
+
+const fn output_rule(bytes: &'static [u8]) -> WriteRule {
+    WriteRule::Bytes {
+        role: COMMAND_ROLE,
+        kind: ReportKind::Output,
+        wire_len: bytes.len(),
+        pattern: BytePattern::Exact(bytes),
+    }
+}
 
 const fn rules(packets: [&'static [u8]; 3]) -> [WriteRule; 3] {
-    const fn rule(bytes: &'static [u8]) -> WriteRule {
-        WriteRule::Bytes {
-            role: COMMAND_ROLE,
-            kind: ReportKind::Output,
-            wire_len: bytes.len(),
-            pattern: BytePattern::Exact(bytes),
-        }
-    }
-    [rule(packets[0]), rule(packets[1]), rule(packets[2])]
+    [
+        output_rule(packets[0]),
+        output_rule(packets[1]),
+        output_rule(packets[2]),
+    ]
 }
 
 impl HyperxReport {
-    fn command(self, query: Query) -> &'static [u8] {
-        (match self {
-            Self::Hx66 => HX66,
-            Self::Alpha21bb => ALPHA,
-        })[query as usize]
+    fn legacy_commands(self) -> Option<&'static [&'static [u8]; 3]> {
+        match self {
+            Self::Hx66 => Some(&HX66),
+            Self::Alpha21bb => Some(&ALPHA),
+            Self::Universal => None,
+        }
+    }
+
+    fn first_output(self) -> &'static [u8] {
+        self.legacy_commands()
+            .map_or(&UNIVERSAL, |commands| commands[0])
     }
 
     fn matches(self, selector: &CollectionSelector, c: &Collection) -> bool {
-        let width = self.command(Query::Link).len();
+        let width = self.first_output().len();
         usize::from(c.input_len) == width
             && usize::from(c.output_len) == width
             && selector.matches_descriptor(c)
@@ -71,8 +86,8 @@ impl HyperxReport {
     fn caps(self) -> Capabilities {
         let alpha = self == Self::Alpha21bb;
         Capabilities {
-            pushes_battery: !alpha,
-            query_wakes: false,
+            pushes_battery: self == Self::Hx66,
+            query_wakes: self == Self::Universal,
             audio: alpha,
             awake_signal: false,
             charging: false,
@@ -80,10 +95,7 @@ impl HyperxReport {
         }
     }
 
-    fn decode(self, bytes: &[u8]) -> Option<(Option<Query>, Event)> {
-        if bytes.len() != self.command(Query::Link).len() {
-            return None;
-        }
+    fn decode_legacy(self, bytes: &[u8]) -> Option<(Option<Query>, Event)> {
         // Replies and pushes have different selectors, even on the same open handle.
         // Only documented fields are read; e.g. Alpha's 0B has opaque trailing bytes.
         use Event::{Battery, Charging, Link, Mute};
@@ -154,12 +166,25 @@ struct PendingRead {
     remaining: u16,
 }
 
+#[derive(Clone, Copy)]
+enum Wake {
+    Grace {
+        at: Ms,
+        grant: Option<(GrantId, Ms)>,
+    },
+    Reply {
+        until: Ms,
+    },
+}
+
 pub(super) struct HyperxEngine {
     group_key: DeviceKey,
     key: DeviceKey,
     report: HyperxReport,
+    kind: DeviceKind,
     command: CollectionId,
     pending: Option<PendingRead>,
+    wake: Option<Wake>,
     online: bool,
     registered: bool,
     charge: Option<Charge>,
@@ -205,7 +230,7 @@ impl HyperxEngine {
             }
         }
         command.map_or(Match::Absent, |id| {
-            Match::Unique((id, report.command(Query::Link)[0]))
+            Match::Unique((id, report.first_output()[0]))
         })
     }
 
@@ -225,8 +250,10 @@ impl HyperxEngine {
             group_key: DeviceKey(format!("hyperx-group:{}", group.0)),
             key: DeviceKey(format!("hyperx:{:04x}", command.pid)),
             report,
+            kind: entry.kind,
             command: command.id,
             pending: None,
+            wake: None,
             online: false,
             registered: false,
             charge: None,
@@ -239,14 +266,61 @@ impl HyperxEngine {
 
     fn send(&mut self, mut pending: PendingRead) -> Option<Action> {
         pending.remaining = pending.remaining.checked_sub(1)?;
+        let command = self.report.legacy_commands()?[pending.query as usize];
         self.pending = Some(pending);
         Some(Action::Send {
             grant: pending.grant,
             collection: self.command,
             kind: ReportKind::Output,
-            bytes: self.report.command(pending.query).to_vec(),
+            bytes: command.to_vec(),
             deadline: None,
         })
+    }
+
+    fn universal_input(&mut self, bytes: &[u8], now: Ms) -> Vec<Action> {
+        // Only dedicated target zero is admitted. Do not mask the routing bits.
+        // FF ACKs/NACKs are not a battery response and never advance this state.
+        match bytes {
+            [0xFB, 0x0A, state @ (0 | 1), ..] => {
+                let up = *state == 1;
+                if self.online == up {
+                    return Vec::new();
+                }
+                self.wake = up.then(|| Wake::Grace {
+                    at: now.saturating_add(WAKE_GRACE_MS),
+                    grant: None,
+                });
+                self.observe(Event::Link(up), Source::Push)
+                    .into_iter()
+                    // Obtain authority on this input edge, but only consume it at grace expiry.
+                    .chain(up.then(|| Action::Connected(self.group_key.clone())))
+                    .collect()
+            }
+            [0x51, 0x02, level @ 0..=100, charge, _, _, lo, hi, ..] => {
+                let charge = match charge {
+                    0 => Charge::NotCharging,
+                    1 => Charge::Charging,
+                    2 => Charge::Full,
+                    3 | 0xFF => Charge::Unknown,
+                    _ => return Vec::new(),
+                };
+                // Push and reply share the same frame, with no transaction ID.
+                let source = match self.wake {
+                    Some(Wake::Grace { at, .. }) if now <= at => Source::Push,
+                    Some(Wake::Reply { until }) if now <= until => Source::Query,
+                    _ => return Vec::new(),
+                };
+                self.wake = None;
+                let mv = u16::from_le_bytes([*lo, *hi]);
+                vec![self.update(
+                    Some(Level::Percent(*level)),
+                    (mv != 0).then_some(mv),
+                    Some(charge),
+                    source,
+                )]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn observe(&mut self, event: Event, source: Source) -> Option<Action> {
@@ -283,11 +357,21 @@ impl HyperxEngine {
             }
             Event::Mute => return None, // The battery model has no mute state.
         };
+        Some(self.update(level, millivolts, charge, source))
+    }
+
+    fn update(
+        &mut self,
+        level: Option<Level>,
+        millivolts: Option<u16>,
+        charge: Option<Charge>,
+        source: Source,
+    ) -> Action {
         let registering = !self.registered;
         let update = DeviceUpdate {
             key: self.key.clone(),
             name: None,
-            kind: registering.then_some(DeviceKind::Headset),
+            kind: registering.then_some(self.kind),
             via: registering.then_some(Via::Receiver),
             level,
             millivolts,
@@ -297,14 +381,14 @@ impl HyperxEngine {
         };
         if registering {
             self.registered = true;
-            Some(Action::Register {
+            Action::Register {
                 key: self.key.clone(),
                 caps: self.report.caps(),
                 initial: update,
                 wpid: None,
-            })
+            }
         } else {
-            Some(Action::Update(update))
+            Action::Update(update)
         }
     }
 }
@@ -315,10 +399,23 @@ impl Engine for HyperxEngine {
     }
 
     fn group_one_shots(&self) -> bool {
-        true
+        self.report != HyperxReport::Universal
     }
 
     fn on_grant(&mut self, grant: &Grant, now: Ms) -> Vec<Action> {
+        if self.report == HyperxReport::Universal {
+            if grant.trigger == Trigger::Connected
+                && grant.subject == self.group_key
+                && grant.max_requests != 0
+                && let Some(Wake::Grace {
+                    grant: permit @ None,
+                    ..
+                }) = &mut self.wake
+            {
+                *permit = Some((grant.id, grant.expires_ms));
+            }
+            return Vec::new();
+        }
         let allowed = match grant.trigger {
             Trigger::Arrival | Trigger::Resume | Trigger::RefreshNow => {
                 grant.subject == self.group_key
@@ -348,10 +445,16 @@ impl Engine for HyperxEngine {
         bytes: &[u8],
         now: Ms,
     ) -> Vec<Action> {
-        if collection != self.command || origin != ReportOrigin::Input {
+        if collection != self.command
+            || origin != ReportOrigin::Input
+            || bytes.len() != self.report.first_output().len()
+        {
             return Vec::new();
         }
-        let Some((reply, event)) = self.report.decode(bytes) else {
+        if self.report == HyperxReport::Universal {
+            return self.universal_input(bytes, now);
+        }
+        let Some((reply, event)) = self.report.decode_legacy(bytes) else {
             return Vec::new();
         };
         let Some(query) = reply else {
@@ -382,20 +485,44 @@ impl Engine for HyperxEngine {
         actions
     }
 
-    fn on_tick(&mut self, _now: Ms) -> Vec<Action> {
-        Vec::new()
+    fn on_tick(&mut self, now: Ms) -> Vec<Action> {
+        let Some(Wake::Grace { at, grant }) = self.wake else {
+            return Vec::new();
+        };
+        if now < at {
+            return Vec::new();
+        }
+        self.wake = None;
+        let Some((grant, expires)) = grant.filter(|&(_, expires)| now <= expires) else {
+            return Vec::new();
+        };
+        self.wake = Some(Wake::Reply {
+            until: expires.min(now.saturating_add(UNIVERSAL_REPLY_MS)),
+        });
+        vec![Action::Send {
+            grant,
+            collection: self.command,
+            kind: ReportKind::Output,
+            bytes: UNIVERSAL.to_vec(),
+            deadline: None,
+        }]
     }
 
     fn next_deadline(&self) -> Option<Ms> {
-        None
+        match self.wake {
+            Some(Wake::Grace { at, .. }) => Some(at),
+            _ => None,
+        }
     }
 
     fn allowed_writes(&self) -> &'static [WriteRule] {
         const HX66_RULES: [WriteRule; 3] = rules(HX66);
         const ALPHA_RULES: [WriteRule; 3] = rules(ALPHA);
+        const UNIVERSAL_RULES: [WriteRule; 1] = [output_rule(&UNIVERSAL)];
         match self.report {
             HyperxReport::Hx66 => &HX66_RULES,
             HyperxReport::Alpha21bb => &ALPHA_RULES,
+            HyperxReport::Universal => &UNIVERSAL_RULES,
         }
     }
 

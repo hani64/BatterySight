@@ -1275,7 +1275,6 @@ fn hyperx_wrong_windows_roles_widths_and_unsupported_protocols_do_not_open() {
         hyperx_group(0x069F, 0xFF13, 1, 62),
         hyperx_group(0x069F, 0xFF13, 1, 64),
         hyperx_group(0x0795, 0xFF13, 1, 62),
-        hyperx_group(0x08BE, 0xFF13, 0xFF00, 64),
         hyperx_group(0x0696, 0xFF13, 1, 62),
         hyperx_group(0x06BE, 0xFF13, 1, 62),
     ] {
@@ -1365,4 +1364,288 @@ fn hyperx_foreign_short_late_and_over_budget_replies_never_send() {
     );
     hyperx_input(&mut hub, 1, 31, &[0x21, 0xBB, 3, 2], &[]);
     hyperx_input(&mut hub, 2, 31, &[0x21, 0xBB, 0x0C, 1], &[]);
+}
+
+fn hyperx_universal_group(pid: u16, page: u16, usage: u16) -> HidGroup {
+    let mut group = hyperx_group(pid, page, usage, 64);
+    group.collections[1].interface = Some(2);
+    group
+}
+
+fn hyperx_universal_alpha() -> HidGroup {
+    hyperx_universal_group(0x08BE, 0xFF13, 0xFF00)
+}
+
+// NGENUITY Haste 2 capture (ngenuity-linux-cli); Windows Alpha 2 capture
+// (HaloBattery #26) and HeadsetControl Alpha 2. All battery payloads are synthetic.
+#[test]
+fn hyperx_universal_valid_wake_push_cancels_grace_without_enabling_interval_reads() {
+    for (pid, page, usage, kind) in [
+        (0x08BE, 0xFF13, 0xFF00, DeviceKind::Headset),
+        (0x0F98, 0xFF00, 1, DeviceKind::Mouse),
+    ] {
+        let mut hub = hub();
+        let group = hyperx_universal_group(pid, page, usage);
+        let selected = hub
+            .select_group(&group, |_, _| panic!("no metadata gate"))
+            .expect("documented dedicated universal collection");
+        assert_eq!(selected.command_report_id(), Some(0x50));
+        assert!(selected.reads(RX) && selected.sends(RX) && !selected.opens(OTHER));
+        hyperx_sent(hub.handle(HubInput::GroupArrived(group), 0), 64, &[]);
+        hyperx_sent(hub.handle(HubInput::Resume, 1), 64, &[]);
+        hyperx_sent(hub.handle(HubInput::RefreshNow, 2), 64, &[]);
+        hyperx_input(&mut hub, 3, 64, &[0x51, 2, 35, 0], &[]);
+        assert!(hub.snapshot().is_empty());
+        assert_eq!(hub.next_deadline(), None);
+        hyperx_input(&mut hub, 10, 64, &[0xFB, 0x0A, 1], &[]);
+        assert_eq!(hub.next_deadline(), Some(2010));
+        hyperx_input(
+            &mut hub,
+            2009,
+            64,
+            &[0x51, 2, 74, 1, 26, 0, 0x9C, 0x0F],
+            &[],
+        );
+        let reading = hub.snapshot().remove(0);
+        assert_eq!(reading.kind, kind);
+        assert_eq!(reading.verification, Verification::SourceVerified);
+        assert_eq!(reading.via, Via::Receiver);
+        assert_eq!(reading.presence, Presence::Online);
+        assert_eq!(reading.source, Source::Push);
+        assert_eq!(reading.level, Some(Level::Percent(74)));
+        assert_eq!(reading.millivolts, Some(3996));
+        assert_eq!(reading.charge, Charge::Charging);
+        assert!(!reading.reports_changes);
+        assert_eq!(reading.poll_min_ms, None);
+        assert_eq!(hub.audio_ready_at(&reading.key), None);
+        assert_eq!(hub.next_deadline(), None);
+        hyperx_sent(hub.handle(HubInput::Tick, 2010), 64, &[]);
+        hub.handle(
+            HubInput::SetIntervals([(reading.key.clone(), 1)].into()),
+            2011,
+        );
+        hyperx_sent(hub.handle(HubInput::RefreshNow, 600_000), 64, &[]);
+        hyperx_sent(hub.handle(HubInput::Resume, 600_001), 64, &[]);
+        hyperx_sent(
+            hub.handle(HubInput::Activity(reading.key), 600_002),
+            64,
+            &[],
+        );
+        hyperx_sent(hub.handle(HubInput::Tick, 600_003), 64, &[]);
+    }
+}
+
+#[test]
+fn hyperx_universal_sends_only_one_exact_fallback_after_a_valid_edge_without_a_push() {
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    for (collection, origin, width, prefix) in [
+        (OTHER, ReportOrigin::Input, 64, &[0xFB, 0x0A, 1][..]),
+        (RX, ReportOrigin::FeatureReply, 64, &[0xFB, 0x0A, 1]),
+        (RX, ReportOrigin::Input, 63, &[0xFB, 0x0A, 1]),
+        (RX, ReportOrigin::Input, 65, &[0xFB, 0x0A, 1]),
+        (RX, ReportOrigin::Input, 64, &[0xFB, 0x4A, 1]),
+        (RX, ReportOrigin::Input, 64, &[0xFB, 0x0A, 2]),
+        (RX, ReportOrigin::Input, 64, &[0x53, 1, 1]),
+        (RX, ReportOrigin::Input, 64, &[0x66, 0x0B, 1]),
+    ] {
+        hyperx_sent(
+            hub.handle(
+                HubInput::Report {
+                    collection,
+                    origin,
+                    bytes: hyperx_packet(width, prefix),
+                },
+                1,
+            ),
+            64,
+            &[],
+        );
+        assert_eq!(hub.next_deadline(), None);
+    }
+    hyperx_input(&mut hub, 2, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 1000, 64, &[0xFB, 0x0A, 1], &[]);
+    assert_eq!(hub.next_deadline(), Some(2002));
+
+    // A different echo/target, invalid level/status, and ACKs are not battery samples.
+    for (index, frame) in [
+        &[0x51, 3, 78, 0][..],
+        &[0x51, 0x42, 78, 0],
+        &[0x51, 0x82, 78, 0],
+        &[0x51, 0xC2, 78, 0],
+        &[0x51, 2, 101, 0],
+        &[0x51, 2, 78, 4],
+        &[
+            0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x50, 0x42, 0,
+        ],
+        &[0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x52, 1, 0],
+        &[0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x50, 2, 3],
+        &[0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x50, 2, 0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        hyperx_input(&mut hub, 1500 + index as Ms, 64, frame, &[]);
+        assert_eq!(hub.next_deadline(), Some(2002));
+        assert!(hub.snapshot().is_empty());
+    }
+    hyperx_sent(hub.handle(HubInput::Tick, 2001), 64, &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 2002), 64, &[0x50, 2]);
+    hyperx_input(&mut hub, 2003, 64, &[0x51, 0x42, 78, 0], &[]);
+    hyperx_input(&mut hub, 2004, 64, &[0x51, 3, 78, 0], &[]);
+    hyperx_input(&mut hub, 2005, 64, &[0x51, 2, 78, 4], &[]);
+    assert!(hub.snapshot().is_empty());
+    hyperx_input(
+        &mut hub,
+        2006,
+        64,
+        &[0x51, 2, 78, 2, 26, 0, 0x80, 0x0F],
+        &[],
+    );
+    let state = &hub.snapshot()[0];
+    assert_eq!(state.level, Some(Level::Percent(78)));
+    assert_eq!(state.charge, Charge::Full);
+    assert_eq!(state.source, Source::Query);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_input(&mut hub, 4000, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 4001, 64, &[0x51, 2, 99, 0], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 6000), 64, &[]);
+    assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(78)));
+}
+
+#[test]
+fn hyperx_universal_down_cancels_grace_and_pending_reply_without_refreshing_the_sample() {
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    hyperx_input(&mut hub, 1, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 2, 64, &[0x51, 2, 67, 1, 26, 0, 0x21, 0x0F], &[]);
+    let reading = hub.snapshot().remove(0);
+    hyperx_input(&mut hub, 3, 64, &[0xFB, 0x0A, 0], &[]);
+    let assert_last_sample = |hub: &Hub, presence| {
+        let state = &hub.snapshot()[0];
+        assert_eq!(state.presence, presence);
+        assert_eq!(state.charge, Charge::Unknown);
+        assert_eq!(state.level, reading.level);
+        assert_eq!(state.millivolts, reading.millivolts);
+        assert_eq!(state.updated_ms, reading.updated_ms);
+        assert_eq!(state.source, reading.source);
+    };
+    assert_last_sample(&hub, Presence::Offline);
+    hyperx_input(&mut hub, 4, 64, &[0xFB, 0x0A, 1], &[]);
+    assert_last_sample(&hub, Presence::Online);
+    hyperx_input(&mut hub, 2003, 64, &[0xFB, 0x0A, 0], &[]);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_sent(hub.handle(HubInput::Tick, 2004), 64, &[]);
+    hyperx_input(&mut hub, 2005, 64, &[0x51, 2, 86, 1], &[]);
+    assert_last_sample(&hub, Presence::Offline);
+
+    hyperx_input(&mut hub, 3000, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 5000), 64, &[0x50, 2]);
+    hyperx_input(&mut hub, 5001, 64, &[0xFB, 0x0A, 0], &[]);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_input(&mut hub, 5002, 64, &[0x51, 2, 86, 1], &[]);
+    assert_last_sample(&hub, Presence::Offline);
+
+    hyperx_input(&mut hub, 6000, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 8000), 64, &[0x50, 2]);
+    hyperx_input(&mut hub, 9001, 64, &[0x51, 2, 86, 1], &[]);
+    assert_last_sample(&hub, Presence::Online);
+    hyperx_input(&mut hub, 9900, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 12_000), 64, &[]);
+}
+
+#[test]
+fn hyperx_universal_zero_budget_never_retries_or_sends() {
+    let mut hub = Hub::new(
+        Catalog::builtin(),
+        Policy {
+            discovery_budget: 0,
+            ..Policy::default()
+        },
+    );
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    hyperx_input(&mut hub, 1, 64, &[0xFB, 0x0A, 1], &[]);
+    assert_eq!(hub.next_deadline(), Some(2001));
+    hyperx_sent(hub.handle(HubInput::Tick, 2001), 64, &[]);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_input(&mut hub, 2002, 64, &[0x51, 2, 85, 0], &[]);
+    assert!(hub.snapshot().is_empty());
+    hyperx_sent(hub.handle(HubInput::Tick, 20_000), 64, &[]);
+}
+
+#[test]
+fn hyperx_universal_denies_wrong_roles_and_unverified_targets() {
+    let hub = hub();
+    let alpha = hyperx_universal_alpha();
+    let command = &alpha.collections[1];
+    for wrong in [
+        Collection {
+            interface: Some(0),
+            ..command.clone()
+        },
+        Collection {
+            usage: 1,
+            ..command.clone()
+        },
+        Collection {
+            usage_page: 0xFF00,
+            ..command.clone()
+        },
+        Collection {
+            input_len: 63,
+            ..command.clone()
+        },
+        Collection {
+            output_len: 65,
+            ..command.clone()
+        },
+        Collection {
+            pid: 0x0ABE,
+            ..command.clone()
+        },
+    ] {
+        assert!(
+            hub.select_group(&group(wrong), |_, _| panic!("no metadata gate"))
+                .is_none()
+        );
+    }
+    let mut ambiguous = alpha;
+    ambiguous.collections.push(Collection {
+        id: CollectionId(3),
+        ..ambiguous.collections[1].clone()
+    });
+    assert!(
+        hub.select_group(&ambiguous, |_, _| panic!("no metadata gate"))
+            .is_none()
+    );
+    for (pid, page, usage, interface) in [
+        (0x0AC1, 0xFF90, 0xFF00, 3),
+        (0x0CC1, 0xFF90, 0xFF00, 3),
+        (0x0BC1, 0xFF90, 0xFF00, 3),
+        (0x06C1, 0xFF90, 0xFF00, 3),
+        (0x01BF, 0xFF90, 0xFF00, 3),
+        (0x01C5, 0xFF90, 0xFF00, 3),
+        (0x0D97, 0xFF00, 1, 2),
+        (0x0AB5, 0xFF00, 1, 2),
+        (0x0DA0, 0xFF00, 1, 2),
+    ] {
+        let mut group = hyperx_universal_group(pid, page, usage);
+        group.collections[1].interface = Some(interface);
+        assert!(
+            hub.select_group(&group, |_, _| panic!("no metadata gate"))
+                .is_none()
+        );
+    }
 }

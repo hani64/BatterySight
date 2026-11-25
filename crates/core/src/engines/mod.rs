@@ -635,4 +635,43 @@ source = "Linux hid-logitech-hidpp"
             assert!(!allowed(role, ReportKind::Output, &bytes));
         }
     }
+
+    #[test]
+    fn hyperx_universal_allowlists_only_the_unrouted_50_02_output() {
+        use crate::engine::write_allowed;
+        use crate::hid::ReportKind;
+        use crate::scheduler::GrantId;
+
+        let mut group = group(0x03F0, 0xFF13, 0xFF00, 64);
+        let collection = &mut group.collections[0];
+        collection.pid = 0x08BE;
+        collection.interface = Some(2);
+        let id = collection.id;
+        let catalog = Catalog::builtin();
+        let selection = select(&group, &catalog).expect("documented collection");
+        let engine = selection.engine(&group, &catalog).unwrap();
+        let role = selection.send_role(id).unwrap();
+        let allowed = |role, kind, bytes: &[u8]| {
+            write_allowed(&*engine, role, kind, bytes, GrantId(1)).is_some()
+        };
+
+        let mut bytes = [0; 64];
+        for command in u8::MIN..=u8::MAX {
+            bytes[0] = command;
+            for subreport in u8::MIN..=u8::MAX {
+                bytes[1] = subreport;
+                assert_eq!(
+                    allowed(role, ReportKind::Output, &bytes),
+                    (command, subreport) == (0x50, 2),
+                );
+            }
+        }
+        bytes[..2].copy_from_slice(&[0x50, 2]);
+        assert!(!allowed(role, ReportKind::GetFeature, &bytes));
+        assert!(!allowed(role, ReportKind::SetFeature, &bytes));
+        assert!(!allowed(CollectionRole(2), ReportKind::Output, &bytes));
+        assert!(!allowed(role, ReportKind::Output, &bytes[..63]));
+        bytes[63] = 1;
+        assert!(!allowed(role, ReportKind::Output, &bytes));
+    }
 }

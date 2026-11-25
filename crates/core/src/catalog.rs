@@ -46,12 +46,13 @@ pub enum SteelseriesReport {
     Station01Percent,
 }
 
-/// The exact HX66 or Alpha control report format used by a HyperX dongle.
+/// The exact control report format used by a HyperX dongle or base station.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HyperxReport {
     Hx66,
     Alpha21bb,
+    Universal,
 }
 
 /// Per-device deviations from engine defaults.

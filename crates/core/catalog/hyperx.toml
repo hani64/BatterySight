@@ -37,3 +37,30 @@ status = "source-verified"
 source = "HaloBattery #220/#318 (Windows HID caps/collection); HeadsetControl hyperx_cloud_alpha_wireless.hpp (31-byte output); HyperHeadset cloud_alpha_wireless.rs and #26 (selectors and offsets)"
 send = { usage_page = 0xFF43, usage = 0x0202, interface = 3, input_len = 31, output_len = 31 }
 hyperx = "alpha21bb"
+
+# Windows HID descriptor/captures: https://github.com/HeyOkay/HaloBattery/issues/26
+[[device]]
+name = "HyperX Cloud Alpha 2 Wireless"
+vid = 0x03F0
+pids = [0x08BE]
+kind = "headset"
+engine = "hyperx"
+status = "source-verified"
+source = "HaloBattery #26 (Windows FF13:FF00 MI_02 descriptor and battery exchange); HeadsetControl hyperx_cloud_alpha_2_wireless.hpp (FB 0A link events)"
+send = { usage_page = 0xFF13, usage = 0xFF00, interface = 2, input_len = 64, output_len = 64 }
+hyperx = "universal"
+quirks = { query_wakes = true }
+
+# NGENUITY USB capture and HID descriptor: https://github.com/PMarinov1994/ngenuity-linux-cli
+# Native Windows collection: https://github.com/NahuelGenchi/lares/pull/85
+[[device]]
+name = "HyperX Pulsefire Haste 2 Wireless"
+vid = 0x03F0
+pids = [0x0F98]
+kind = "mouse"
+engine = "hyperx"
+status = "source-verified"
+source = "lares #85 (Windows 0F98 64-byte collection); ngenuity-linux-cli Haste 2 startup-battery-sleep-wake USB capture (descriptor, target-zero exchange and FB 0A edges)"
+send = { usage_page = 0xFF00, usage = 1, interface = 2, input_len = 64, output_len = 64 }
+hyperx = "universal"
+quirks = { query_wakes = true }
