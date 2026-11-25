@@ -1562,6 +1562,79 @@ fn hyperx_universal_down_cancels_grace_and_pending_reply_without_refreshing_the_
     hyperx_sent(hub.handle(HubInput::Tick, 12_000), 64, &[]);
 }
 
+fn hyperx_universal_status_down_cancels_wake(after_fallback: bool) {
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    hyperx_input(&mut hub, 10, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 11, 64, &[0x51, 2, 74, 1, 26, 0, 0x9C, 0x0F], &[]);
+    let mut expected = hub.snapshot().remove(0);
+    hyperx_input(&mut hub, 12, 64, &[0xFB, 0x0A, 0], &[]);
+    hyperx_input(&mut hub, 13, 64, &[0xFB, 0x0A, 1], &[]);
+
+    for (collection, origin, width, frame) in [
+        (OTHER, ReportOrigin::Input, 64, [0x53, 1, 0]),
+        (RX, ReportOrigin::FeatureReply, 64, [0x53, 1, 0]),
+        (RX, ReportOrigin::Input, 63, [0x53, 1, 0]),
+        (RX, ReportOrigin::Input, 65, [0x53, 1, 0]),
+        (RX, ReportOrigin::Input, 64, [0x53, 0x41, 0]),
+        (RX, ReportOrigin::Input, 64, [0x53, 2, 0]),
+        (RX, ReportOrigin::Input, 64, [0x53, 1, 2]),
+        (RX, ReportOrigin::Input, 64, [0x53, 1, 1]),
+    ] {
+        hyperx_sent(
+            hub.handle(
+                HubInput::Report {
+                    collection,
+                    origin,
+                    bytes: hyperx_packet(width, &frame),
+                },
+                1013,
+            ),
+            64,
+            &[],
+        );
+        assert_eq!(hub.next_deadline(), Some(2013));
+        assert_eq!(hub.snapshot()[0].presence, Presence::Online);
+    }
+
+    let down = if after_fallback {
+        hyperx_sent(hub.handle(HubInput::Tick, 2013), 64, &[0x50, 2]);
+        2014
+    } else {
+        2012
+    };
+    // ngenuity-linux-cli Universal §3.3 and HeadsetControl Alpha 2:
+    // a target-zero 53 01 00 reports asleep/off, even on a shared HID handle.
+    hyperx_input(&mut hub, down, 64, &[0x53, 1, 0], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 2015), 64, &[]);
+    hyperx_input(&mut hub, 2016, 64, &[0x53, 1, 1], &[]);
+    hyperx_input(
+        &mut hub,
+        2017,
+        64,
+        &[0x51, 2, 92, 1, 26, 0, 0x88, 0x0F],
+        &[],
+    );
+    assert_eq!(hub.next_deadline(), None);
+    expected.presence = Presence::Offline;
+    expected.charge = Charge::Unknown;
+    assert_eq!(hub.snapshot(), [expected]);
+}
+
+#[test]
+fn hyperx_universal_exact_asleep_status_cancels_grace() {
+    hyperx_universal_status_down_cancels_wake(false);
+}
+
+#[test]
+fn hyperx_universal_exact_asleep_status_cancels_pending_reply() {
+    hyperx_universal_status_down_cancels_wake(true);
+}
+
 #[test]
 fn hyperx_universal_zero_budget_never_retries_or_sends() {
     let mut hub = Hub::new(

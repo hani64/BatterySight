@@ -281,7 +281,8 @@ impl HyperxEngine {
         // Only dedicated target zero is admitted. Do not mask the routing bits.
         // FF ACKs/NACKs are not a battery response and never advance this state.
         match bytes {
-            [0xFB, 0x0A, state @ (0 | 1), ..] => {
+            // Another handle's link-status reply can disprove a link, never establish one.
+            [0xFB, 0x0A, state @ (0 | 1), ..] | [0x53, 0x01, state @ 0, ..] => {
                 let up = *state == 1;
                 if self.online == up {
                     return Vec::new();
