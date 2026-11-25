@@ -10,6 +10,11 @@ updates:
       # windows and windows-core must move together.
       windows:
         patterns: ["windows", "windows-*"]
+    ignore:
+      # windows-core must match the version `windows` depends on: `#[implement]` expands
+      # to `::windows_core` paths, so two versions do not compile. Bump it by hand together
+      # with `windows`.
+      - dependency-name: "windows-core"
 
   - package-ecosystem: github-actions
     directory: /
