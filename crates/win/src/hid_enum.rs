@@ -18,8 +18,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CR_BUFFER_SMALL, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData,
-    HidD_GetAttributes, HidD_GetPreparsedData, HidD_GetProductString, HidP_GetCaps,
+    GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_STATUS_SUCCESS,
+    HIDP_VALUE_CAPS, HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetPreparsedData,
+    HidD_GetProductString, HidP_GetButtonCaps, HidP_GetCaps, HidP_GetValueCaps, HidP_Input,
     PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Devices::Properties::{
@@ -325,6 +326,18 @@ fn query(path: &[u16]) -> Option<HidInterface> {
 
     let instance = instance_id(&wide);
     let interface = instance.as_ref().and_then(|id| interface_number(id));
+    // Linux hidraw and the USB captures identify MI_01 and report 05, not the Windows
+    // top-level usage or padded report width. Inspect the cached descriptor, not input.
+    let input_report_05 = if attributes.VendorID == 0x3710
+        && matches!(attributes.ProductID, 0x5402 | 0x5403)
+        && interface == Some(1)
+        && caps.UsagePage >= 0xFF00
+        && caps.InputReportByteLength >= 5
+    {
+        declares_input_05(preparsed.0, &caps)
+    } else {
+        None
+    };
     let node = instance.as_ref().and_then(locate_node);
     let container = node.and_then(container);
     Some(HidInterface {
@@ -337,6 +350,7 @@ fn query(path: &[u16]) -> Option<HidInterface> {
             usage: caps.Usage,
             interface,
             input_len: caps.InputReportByteLength,
+            input_report_05,
             output_len: caps.OutputReportByteLength,
             feature_len: caps.FeatureReportByteLength,
             product: String::new(),
@@ -344,6 +358,43 @@ fn query(path: &[u16]) -> Option<HidInterface> {
         container,
         node,
     })
+}
+
+fn declares_input_05(preparsed: PHIDP_PREPARSED_DATA, caps: &HIDP_CAPS) -> Option<bool> {
+    let mut count = caps.NumberInputValueCaps;
+    if count != 0 {
+        let mut values = vec![HIDP_VALUE_CAPS::default(); usize::from(count)];
+        // SAFETY: the buffer holds `count` caps and the caller owns the preparsed data.
+        let status =
+            unsafe { HidP_GetValueCaps(HidP_Input, values.as_mut_ptr(), &mut count, preparsed) };
+        if status != HIDP_STATUS_SUCCESS {
+            return None;
+        }
+        if values
+            .get(..usize::from(count))?
+            .iter()
+            .any(|cap| cap.ReportID == 5)
+        {
+            return Some(true);
+        }
+    }
+    let mut count = caps.NumberInputButtonCaps;
+    if count == 0 {
+        return Some(false);
+    }
+    let mut buttons = vec![HIDP_BUTTON_CAPS::default(); usize::from(count)];
+    // SAFETY: the buffer holds `count` caps and the caller owns the preparsed data.
+    let status =
+        unsafe { HidP_GetButtonCaps(HidP_Input, buttons.as_mut_ptr(), &mut count, preparsed) };
+    if status != HIDP_STATUS_SUCCESS {
+        return None;
+    }
+    Some(
+        buttons
+            .get(..usize::from(count))?
+            .iter()
+            .any(|cap| cap.ReportID == 5),
+    )
 }
 
 /// The PnP instance ID of the device node behind the NUL-terminated interface path.
@@ -514,6 +565,7 @@ mod tests {
                 usage,
                 interface: None,
                 input_len: 7,
+                input_report_05: None,
                 output_len: 7,
                 feature_len: 0,
                 product: String::new(),

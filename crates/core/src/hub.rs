@@ -535,7 +535,21 @@ impl Hub {
         if pass.depth > MAX_NESTED_GRANTS || self.owner(key) != Some(gid) {
             return;
         }
-        let Some(grant) = self.scheduler.request(key, gid, trigger, now) else {
+        let sonix = self.engines.get(&gid).is_some_and(|slot| slot.kind == EngineKind::Sonix);
+        let grant = if sonix
+            && matches!(
+                trigger,
+                Trigger::Arrival | Trigger::Connected | Trigger::Resume
+                    | Trigger::RefreshNow | Trigger::Awake
+            )
+        {
+            self.scheduler.request_feature_transaction(
+                key, gid, trigger, now, engines::SONIX_OPERATION_BUDGET,
+            )
+        } else {
+            self.scheduler.request(key, gid, trigger, now)
+        };
+        let Some(grant) = grant else {
             return;
         };
         self.deliver_grant(gid, grant, now, pass);
@@ -1196,6 +1210,7 @@ quirks = { query_wakes = true }
                 usage: 0x0002,
                 interface: None,
                 input_len: 20,
+                input_report_05: None,
                 output_len: 1,
                 feature_len: 0,
                 product: "Fake Receiver".into(),

@@ -630,6 +630,7 @@ pub(crate) mod tests {
                 usage,
                 interface: None,
                 input_len: 7,
+                input_report_05: None,
                 output_len: 7,
                 feature_len: 0,
                 product: String::new(),

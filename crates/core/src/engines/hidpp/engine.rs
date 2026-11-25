@@ -1024,6 +1024,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             usage,
             interface: None,
             input_len: len,
+            input_report_05: None,
             output_len: len,
             feature_len: 0,
             product: product.into(),

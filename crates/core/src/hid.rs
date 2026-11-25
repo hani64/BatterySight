@@ -38,6 +38,8 @@ pub struct Collection {
     /// USB interface number from the PnP instance ID, when present.
     pub interface: Option<u8>,
     pub input_len: u16,
+    /// Whether cached descriptor metadata declares Input Report ID 05, when inspected for SONiX.
+    pub input_report_05: Option<bool>,
     pub output_len: u16,
     pub feature_len: u16,
     /// Product metadata for pure matching, or the display name after runtime admission.

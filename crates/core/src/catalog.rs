@@ -14,6 +14,7 @@ pub enum EngineKind {
     Rapoo,
     Steelseries,
     Hyperx,
+    Sonix,
 }
 
 /// The input status format and any known wired PID for a Rapoo VT model.
@@ -225,6 +226,7 @@ const BUILTIN_FILES: &[&str] = &[
     include_str!("../catalog/rapoo.toml"),
     include_str!("../catalog/steelseries.toml"),
     include_str!("../catalog/hyperx.toml"),
+    include_str!("../catalog/pulsar.toml"),
 ];
 
 impl Catalog {
@@ -388,6 +390,7 @@ send = { usage_page = 0xFF00, usage = 1, interface = 4, output_len = 7, feature_
             usage: 2,
             interface: Some(3),
             input_len: 20,
+            input_report_05: None,
             output_len: 0,
             feature_len: 0,
             product: String::new(),

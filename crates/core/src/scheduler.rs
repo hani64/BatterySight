@@ -251,7 +251,20 @@ impl Scheduler {
         trigger: Trigger,
         now: Ms,
     ) -> Option<Grant> {
-        self.request_with_source(key, owner, trigger, ActivitySource::Audio, now)
+        self.request_with_source(key, owner, trigger, ActivitySource::Audio, now, None)
+    }
+
+    /// A bounded feature transaction needs more operations than a simple read.
+    /// It still uses the trigger's ordinary eligibility, history and grant lifetime.
+    pub(crate) fn request_feature_transaction(
+        &mut self,
+        key: &DeviceKey,
+        owner: GroupId,
+        trigger: Trigger,
+        now: Ms,
+        budget: u16,
+    ) -> Option<Grant> {
+        self.request_with_source(key, owner, trigger, ActivitySource::Audio, now, Some(budget))
     }
 
     /// Charging retains the existing Activity grant for the engine, but does not
@@ -268,6 +281,7 @@ impl Scheduler {
             Trigger::Activity,
             ActivitySource::Charging,
             now,
+            None,
         )
     }
 
@@ -278,6 +292,7 @@ impl Scheduler {
         trigger: Trigger,
         activity_source: ActivitySource,
         now: Ms,
+        operation_budget: Option<u16>,
     ) -> Option<Grant> {
         let slot = self.devices.get_mut(key)?;
         let caps = slot.caps;
@@ -330,6 +345,7 @@ impl Scheduler {
                 (self.policy.read_budget, self.policy.read_ms)
             }
         };
+        let max_requests = operation_budget.unwrap_or(max_requests);
         let expires_ms = now.saturating_add(duration);
         let id = GrantId(self.next_id);
         self.next_id += 1;

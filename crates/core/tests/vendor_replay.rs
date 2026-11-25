@@ -33,6 +33,7 @@ fn collection(pid: u16, usage: u16, len: u16) -> Collection {
         usage,
         interface: Some(1),
         input_len: len,
+        input_report_05: None,
         output_len: len,
         feature_len: 0,
         product: String::new(),
@@ -452,6 +453,7 @@ fn steelseries_group(pid: u16, interface: u8, width: u16) -> HidGroup {
         usage_page: 0xFFC0,
         usage: 1,
         input_len: width,
+        input_report_05: None,
         output_len: width,
         feature_len: 0,
         product: String::new(),
@@ -1000,6 +1002,7 @@ fn hyperx_group(pid: u16, page: u16, usage: u16, width: u16) -> HidGroup {
         usage,
         interface: Some(3),
         input_len: width,
+        input_report_05: None,
         output_len: width,
         feature_len: 0,
         product: String::new(),
@@ -1721,4 +1724,373 @@ fn hyperx_universal_denies_wrong_roles_and_unverified_targets() {
                 .is_none()
         );
     }
+}
+
+// PML xlite_v4_wireless.py and issue #21: report 5 on MI_01. The test TLC's
+// usage and width are synthetic; only the report's documented bytes carry meaning.
+const SONIX_UP: &[u8] = &[0x05, 0x08, 0x01, 0x01];
+const SONIX_DOWN: &[u8] = &[0x05, 0x08, 0x02, 0x01];
+const SONIX_PUSH: &[u8] = &[0x05, 0x07, 0x01, 0x51, 0x01];
+const SONIX_PULSE: &[u8] = &[0x05, 0x0D, 0x64];
+// HaloBattery PR #213 and research §8.2: report ID, status, echo and wire byte 6.
+const SONIX_OK: &[u8] = &[0, 1, 0x08, 0x81, 1, 0, 0, 24];
+const SONIX_PENDING: &[u8] = &[0, 2, 0x08, 0x81, 1];
+const SONIX_ASLEEP: &[u8] = &[0, 5, 0x08, 0x81, 1];
+const SONIX_FOREIGN: &[u8] = &[0, 1, 0x08, 0x81, 2, 0, 0, 99];
+
+fn sonix_group(pid: u16) -> HidGroup {
+    let rx = Collection {
+        id: RX,
+        vid: 0x3710,
+        pid,
+        usage_page: 0xFF01,
+        usage: 1,
+        interface: Some(1),
+        input_len: 8,
+        input_report_05: Some(true),
+        output_len: 0,
+        feature_len: 0,
+        product: String::new(),
+    };
+    let tx = Collection {
+        id: OTHER,
+        interface: Some(3),
+        usage_page: 0xFFFF,
+        input_len: 0,
+        feature_len: 65,
+        input_report_05: None,
+        ..rx.clone()
+    };
+    HidGroup {
+        id: GroupId(1),
+        collections: vec![rx, tx],
+    }
+}
+
+fn sonix_report(
+    hub: &mut Hub,
+    now: Ms,
+    collection: CollectionId,
+    origin: ReportOrigin,
+    width: usize,
+    prefix: &[u8],
+) -> Vec<HubOutput> {
+    hub.handle(
+        HubInput::Report {
+            collection,
+            origin,
+            bytes: hyperx_packet(width, prefix),
+        },
+        now,
+    )
+}
+
+fn sonix_input(hub: &mut Hub, now: Ms, prefix: &[u8]) -> Vec<HubOutput> {
+    sonix_report(hub, now, RX, ReportOrigin::Input, 8, prefix)
+}
+
+fn sonix_mailbox(hub: &mut Hub, now: Ms, prefix: &[u8]) -> Vec<HubOutput> {
+    sonix_report(hub, now, OTHER, ReportOrigin::FeatureReply, 65, prefix)
+}
+
+fn sonix_send(out: Vec<HubOutput>, expected: Option<(ReportKind, Ms)>) {
+    let sent: Vec<_> = out
+        .into_iter()
+        .filter(|e| *e != HubOutput::StateChanged)
+        .collect();
+    let Some((kind, at)) = expected else {
+        assert!(sent.is_empty(), "unexpected operation: {sent:?}");
+        return;
+    };
+    let mut bytes = vec![0; 65];
+    if kind == ReportKind::SetFeature {
+        bytes[2..5].copy_from_slice(&[8, 0x81, 1]);
+        bytes[63] = 0x8A;
+    }
+    assert_eq!(
+        sent,
+        [HubOutput::Send {
+            collection: OTHER,
+            kind,
+            bytes,
+            deadline: Some(at),
+        }]
+    );
+}
+
+fn sonix_arrival(hub: &mut Hub, pid: u16, deadline: Ms) {
+    sonix_send(
+        hub.handle(HubInput::GroupArrived(sonix_group(pid)), 0),
+        Some((ReportKind::GetFeature, deadline)),
+    );
+}
+
+fn sonix_snapshot(hub: &Hub, percent: u8, charge: Charge, source: Source) {
+    let states = hub.snapshot();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].level, Some(Level::Percent(percent)));
+    assert_eq!(states[0].charge, charge);
+    assert_eq!(states[0].source, source);
+    assert_eq!(states[0].via, Via::Receiver);
+    assert_eq!(states[0].verification, Verification::SourceVerified);
+}
+
+#[test]
+fn sonix_link_edge_grace_is_not_a_pulse_and_a_push_suppresses_it() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_input(&mut hub, 2_000, SONIX_PULSE), None);
+    sonix_send(sonix_input(&mut hub, 2_010, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 2_020, SONIX_PULSE), None);
+    sonix_send(sonix_input(&mut hub, 2_500, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 4_009), None);
+    sonix_send(sonix_input(&mut hub, 4_009, SONIX_PUSH), None);
+    sonix_send(hub.handle(HubInput::Tick, 4_010), None);
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    assert_eq!(hub.snapshot()[0].presence, Presence::Online);
+
+    sonix_send(sonix_input(&mut hub, 5_000, SONIX_DOWN), None);
+    sonix_send(sonix_input(&mut hub, 65_000, SONIX_PULSE), None);
+    assert_ne!(hub.snapshot()[0].presence, Presence::Online);
+    sonix_send(sonix_input(&mut hub, 70_000, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 71_000, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 71_999), None);
+    sonix_send(
+        hub.handle(HubInput::Tick, 72_000),
+        Some((ReportKind::GetFeature, 73_000)),
+    );
+    sonix_send(hub.handle(HubInput::Tick, 73_000), None);
+    sonix_send(sonix_input(&mut hub, 74_000, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 80_000), None);
+}
+
+#[test]
+fn sonix_awake_uses_shared_interval_and_requires_a_fresh_linked_pulse() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_input(&mut hub, 2_000, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 2_100, SONIX_PUSH), None);
+    let state = hub.snapshot().pop().unwrap();
+    assert_eq!(state.poll_min_ms, Some(60_000));
+    let key = state.key;
+    let interval = |ms| HubInput::SetIntervals([(key.clone(), ms)].into());
+    sonix_send(hub.handle(interval(1_000), 2_100), None);
+    sonix_send(sonix_input(&mut hub, 62_099, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_100), None);
+    sonix_send(hub.handle(HubInput::Activity(key.clone()), 62_100), None);
+    sonix_send(
+        sonix_report(&mut hub, 62_100, RX, ReportOrigin::FeatureReply, 8, SONIX_PULSE),
+        None,
+    );
+    sonix_send(
+        sonix_input(&mut hub, 62_100, SONIX_PULSE),
+        Some((ReportKind::GetFeature, 63_100)),
+    );
+    sonix_send(sonix_input(&mut hub, 62_101, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::RefreshNow, 62_102), None);
+    sonix_send(hub.handle(HubInput::Tick, 63_100), None);
+    sonix_send(hub.handle(interval(180_000), 63_100), None);
+    sonix_send(sonix_input(&mut hub, 242_101, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Tick, 242_102), None);
+    sonix_send(
+        sonix_input(&mut hub, 242_102, SONIX_PULSE),
+        Some((ReportKind::GetFeature, 243_102)),
+    );
+}
+
+#[test]
+fn sonix_busy_get_first_and_awake_reply_after_four_operations() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_input(&mut hub, 2_000, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 2_100, SONIX_PUSH), None);
+    let deadline = 63_100;
+    let get = Some((ReportKind::GetFeature, deadline));
+    sonix_send(sonix_input(&mut hub, 62_100, SONIX_PULSE), get);
+    sonix_send(sonix_mailbox(&mut hub, 62_100, &[0, 2, 1, 0x84, 4]), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_119), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_120), get);
+    sonix_send(sonix_mailbox(&mut hub, 62_120, SONIX_PENDING), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_140), get);
+    sonix_send(
+        sonix_mailbox(&mut hub, 62_140, SONIX_FOREIGN),
+        Some((ReportKind::SetFeature, deadline)),
+    );
+    sonix_send(sonix_mailbox(&mut hub, 62_141, SONIX_OK), None);
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    sonix_send(hub.handle(HubInput::Tick, 62_160), get);
+    sonix_send(sonix_mailbox(&mut hub, 62_160, SONIX_OK), None);
+    sonix_snapshot(&hub, 24, Charge::Charging, Source::Query);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_resends_once_only_after_matching_pending_and_a_stable_reset() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    let get = Some((ReportKind::GetFeature, 1_000));
+    let set = Some((ReportKind::SetFeature, 1_000));
+    sonix_send(sonix_mailbox(&mut hub, 0, SONIX_FOREIGN), set);
+    for (at, mailbox) in [
+        (20, SONIX_FOREIGN),
+        (40, SONIX_FOREIGN),
+        (60, SONIX_FOREIGN),
+        (80, SONIX_PENDING),
+        (100, SONIX_FOREIGN),
+        (120, SONIX_FOREIGN),
+    ] {
+        sonix_send(hub.handle(HubInput::Tick, at), get);
+        sonix_send(sonix_mailbox(&mut hub, at, mailbox), None);
+    }
+    sonix_send(hub.handle(HubInput::Tick, 140), get);
+    sonix_send(sonix_mailbox(&mut hub, 140, SONIX_FOREIGN), set);
+    for at in (160..1_000).step_by(20) {
+        sonix_send(hub.handle(HubInput::Tick, at), get);
+        sonix_send(
+            sonix_mailbox(&mut hub, at, if at == 160 { SONIX_PENDING } else { SONIX_FOREIGN }),
+            None,
+        );
+    }
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_mailbox(&mut hub, 1_001, SONIX_OK), None);
+    sonix_send(hub.handle(HubInput::Tick, 600_000), None);
+    assert_eq!(hub.next_deadline(), None);
+    assert!(hub.snapshot().iter().all(|s| s.level.is_none()));
+}
+
+#[test]
+fn sonix_rejects_wrong_echo_width_role_and_level_then_05_is_final() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
+    sonix_send(
+        sonix_mailbox(&mut hub, 0, SONIX_OK),
+        Some((ReportKind::SetFeature, 1_000)),
+    );
+    for (at, reply) in [
+        (20, SONIX_OK), // unchanged preflight latch is not a fresh reply
+        (40, SONIX_FOREIGN),
+        (60, &[0, 1, 0x08, 0x81, 1, 0, 0, 101][..]),
+        (80, &[0, 5, 0x08, 0x85, 1][..]),
+    ] {
+        sonix_send(hub.handle(HubInput::Tick, at), Some((ReportKind::GetFeature, 1_000)));
+        sonix_send(sonix_mailbox(&mut hub, at, reply), None);
+        sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    }
+    sonix_send(
+        hub.handle(HubInput::Tick, 100),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    for (collection, origin, width, bytes) in [
+        (RX, ReportOrigin::FeatureReply, 65, SONIX_OK),
+        (OTHER, ReportOrigin::Input, 65, SONIX_OK),
+        (OTHER, ReportOrigin::FeatureReply, 64, SONIX_OK),
+    ] {
+        sonix_send(sonix_report(&mut hub, 100, collection, origin, width, bytes), None);
+    }
+    sonix_send(sonix_mailbox(&mut hub, 120, SONIX_ASLEEP), None);
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    assert_eq!(hub.snapshot()[0].presence, Presence::Asleep);
+    sonix_send(hub.handle(HubInput::Tick, 140), None);
+    sonix_send(sonix_mailbox(&mut hub, 141, SONIX_OK), None);
+    sonix_send(sonix_input(&mut hub, 90_000, SONIX_PULSE), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_down_cancels_and_the_earlier_grant_expiry_caps_operations() {
+    let mut hub = Hub::new(
+        Catalog::builtin(),
+        Policy {
+            discovery_ms: 70,
+            ..Policy::default()
+        },
+    );
+    sonix_arrival(&mut hub, 0x5402, 70);
+    sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
+    sonix_send(
+        sonix_mailbox(&mut hub, 0, &[]),
+        Some((ReportKind::SetFeature, 70)),
+    );
+    sonix_send(
+        hub.handle(HubInput::Tick, 20),
+        Some((ReportKind::GetFeature, 70)),
+    );
+    sonix_send(sonix_input(&mut hub, 21, SONIX_DOWN), None);
+    sonix_send(sonix_mailbox(&mut hub, 22, SONIX_OK), None);
+    sonix_send(hub.handle(HubInput::Tick, 70), None);
+    assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(81)));
+    assert_ne!(hub.snapshot()[0].presence, Presence::Online);
+
+    sonix_send(sonix_input(&mut hub, 100, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 2_100), None);
+    sonix_send(hub.handle(HubInput::Tick, 100_000), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_validates_read_and_write_roles_per_pid_without_substitution() {
+    let hub = hub();
+    let select = |g: &HidGroup| hub.select_group(g, |_, _| panic!("no product gate"));
+    for pid in [0x5402, 0x5403, 0x5404] {
+        let mut g = sonix_group(pid);
+        let chosen = select(&g).expect("documented battery command collection");
+        assert_eq!(chosen.reads(RX), pid != 0x5404);
+        assert!(!chosen.reads(OTHER));
+        assert!(!chosen.sends(RX));
+        assert!(chosen.sends(OTHER));
+        assert_eq!(chosen.command_report_id(), Some(0));
+        g.collections[1].interface = Some(2);
+        assert!(select(&g).is_none());
+    }
+    let mut g = sonix_group(0x5402);
+    g.collections.push(Collection { id: CollectionId(3), ..g.collections[1].clone() });
+    assert!(select(&g).is_none());
+    let mut g = sonix_group(0x5402);
+    g.collections.push(Collection { id: CollectionId(3), ..g.collections[0].clone() });
+    assert!(select(&g).is_none());
+    for (page, width, has_report_05) in [
+        (0xFF01, 8, None),
+        (0xFF01, 8, Some(false)),
+        (1, 8, Some(true)),
+        (0xFF01, 4, Some(true)),
+    ] {
+        let mut g = sonix_group(0x5402);
+        g.collections[0].usage_page = page;
+        g.collections[0].input_len = width;
+        g.collections[0].input_report_05 = has_report_05;
+        assert!(select(&g).is_none());
+    }
+    let mut g = sonix_group(0x5402);
+    g.collections.push(Collection {
+        id: CollectionId(3),
+        input_report_05: None,
+        ..g.collections[0].clone()
+    });
+    assert!(select(&g).is_none());
+    let g = sonix_group(0x5402);
+    let selected = select(&g).unwrap();
+    assert!(!selected.ready(&group(g.collections[0].clone())));
+    assert!(!selected.ready(&group(g.collections[1].clone())));
+    for pid in [0x5405, 0x5406, 0x5504, 0x3401, 0x3402, 0x3406, 0x3409, 0x3410] {
+        assert!(select(&sonix_group(pid)).is_none());
+    }
+}
+
+#[test]
+fn sonix_feinmann_has_only_battery_one_shots_not_a_poll_interval() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5404, 1_000);
+    sonix_send(sonix_mailbox(&mut hub, 0, &[]), Some((ReportKind::SetFeature, 1_000)));
+    sonix_send(hub.handle(HubInput::Tick, 20), Some((ReportKind::GetFeature, 1_000)));
+    sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
+    sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
+    assert_eq!(hub.snapshot()[0].poll_min_ms, None);
+    sonix_send(sonix_input(&mut hub, 3_000, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 5_000), None);
+    sonix_send(sonix_input(&mut hub, 70_000, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Resume, 70_000), Some((ReportKind::GetFeature, 71_000)));
 }
