@@ -185,10 +185,23 @@ fn screenshots() {
         save(&dir, &format!("card-{theme}"), w, h, &pixels);
     }
 
-    // The history chart, in the window's 9 pt Segoe UI at 192 DPI.
-    let (width, height) = (1312, 826);
+    // The history chart, as the window draws it at 192 DPI.
     let now = super::unix_now_ms();
-    let samples = demo_day(now);
+    let day = Duration::from_secs(24 * 3600);
+    render_chart(&dir, "chart", &demo_day(now), day, (656, 413), DPI);
+}
+
+/// Paints `samples` over `window` with [`chart::paint`] into a `size` (96-DPI pixels) chart
+/// at `dpi`, in the history window's 9 pt Segoe UI, and saves it as `name`.
+fn render_chart(
+    dir: &Path,
+    name: &str,
+    samples: &[Sample],
+    window: Duration,
+    size: (i32, i32),
+    dpi: u32,
+) {
+    let (width, height) = (size.0 * dpi as i32 / 96, size.1 * dpi as i32 / 96);
     // SAFETY: a memory DC with its own DIB section and font, all deleted below; the bits
     // pointer is written by CreateDIBSection and stays valid while the section lives.
     unsafe {
@@ -209,7 +222,7 @@ fn screenshots() {
         let dib = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
         let old_bitmap = SelectObject(dc, dib.into());
         let font = CreateFontW(
-            -(9 * DPI as i32 / 72),
+            -(9 * dpi as i32 / 72),
             0,
             0,
             0,
@@ -231,13 +244,49 @@ fn screenshots() {
             right: width,
             bottom: height,
         };
-        chart::paint(dc, rect, &samples, Duration::from_secs(24 * 3600));
+        chart::paint(dc, rect, samples, window);
         let (w, h, pixels) = dib_pixels(dc);
-        save(&dir, "chart", w, h, &pixels);
+        save(dir, name, w, h, &pixels);
         SelectObject(dc, old_font);
         SelectObject(dc, old_bitmap);
         let _ = DeleteObject(font.into());
         let _ = DeleteObject(dib.into());
         let _ = DeleteDC(dc);
     }
+}
+
+/// Renders the history in `BATTERYSIGHT_HISTORY` (a `history.tsv`; read only) through the
+/// chart, every device over 24 hours and 7 days, at the window's 96-DPI size, into
+/// `target/screenshots/<BATTERYSIGHT_PREVIEW or "preview">`: a before/after check of chart
+/// changes on real data.
+#[test]
+#[ignore = "renders real history for a visual check; run on purpose"]
+fn chart_previews() {
+    let Some(path) = std::env::var_os("BATTERYSIGHT_HISTORY") else {
+        return;
+    };
+    let label = std::env::var("BATTERYSIGHT_PREVIEW").unwrap_or_else(|_| "preview".into());
+    let dir = out_dir().join(label);
+    fs::create_dir_all(&dir).unwrap();
+    let text = fs::read_to_string(path).unwrap();
+    let mut by_key: std::collections::BTreeMap<String, Vec<Sample>> = Default::default();
+    for sample in text.lines().filter_map(Sample::parse) {
+        by_key.entry(sample.key.0.clone()).or_default().push(sample);
+    }
+    for (i, samples) in by_key.values_mut().enumerate() {
+        samples.sort_by_key(|s| s.at_unix_ms);
+        for (range, window) in [("24h", 24), ("7d", 7 * 24)] {
+            let window = Duration::from_secs(window * 3600);
+            render_chart(
+                &dir,
+                &format!("device{i}-{range}"),
+                samples,
+                window,
+                (656, 413),
+                96,
+            );
+        }
+    }
+    let keys: Vec<&String> = by_key.keys().collect();
+    fs::write(dir.join("keys.txt"), format!("{keys:?}")).unwrap();
 }

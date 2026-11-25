@@ -16,12 +16,16 @@ use std::cell::RefCell;
 use batterysight_win::trace::ui_line;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_DASH,
+    D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LINE_JOIN_ROUND,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
+    ID2D1DCRenderTarget, ID2D1Factory, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -32,6 +36,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::core::{BOOL, PCWSTR, Result, w};
+use windows_numerics::Vector2;
 
 thread_local! {
     static ENGINE: RefCell<State> = const { RefCell::new(State::Untried) };
@@ -49,6 +54,15 @@ pub struct Engine {
     dwrite: IDWriteFactory,
     fonts: IDWriteFontCollection,
     target: ID2D1DCRenderTarget,
+    /// Round caps and joins, solid; and the same dashed.
+    solid: ID2D1StrokeStyle,
+    dashed: ID2D1StrokeStyle,
+}
+
+/// A line to stroke through `points` (pixels); one point alone is a dot.
+pub struct Stroke {
+    pub points: Vec<(f32, f32)>,
+    pub dashed: bool,
 }
 
 /// A font: the first of `faces` the system has (else the last), `size` px per em, `weight`
@@ -155,10 +169,24 @@ impl Engine {
             let fonts = fonts.ok_or_else(windows::core::Error::empty)?;
             let target = factory.CreateDCRenderTarget(&props)?;
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            let style = |dash| D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                miterLimit: 10.0,
+                dashStyle: dash,
+                dashOffset: 0.0,
+            };
+            let solid = factory.CreateStrokeStyle(&style(D2D1_DASH_STYLE_SOLID), None)?;
+            let dashed = factory.CreateStrokeStyle(&style(D2D1_DASH_STYLE_DASH), None)?;
             Ok(Engine {
                 dwrite,
                 fonts,
                 target,
+                solid,
+                dashed,
             })
         }
     }
@@ -274,6 +302,59 @@ impl Engine {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
+            }
+            t.EndDraw(None, None)
+        }
+    }
+
+    /// Strokes `strokes` in `rgb` (dashed ones at half opacity), `width` px wide with round
+    /// caps and joins, antialiased, over what `dc` already holds in `bounds`; point
+    /// coordinates are relative to `bounds`, and nothing is drawn outside it.
+    pub fn stroke(
+        &self,
+        dc: HDC,
+        bounds: RECT,
+        strokes: &[Stroke],
+        rgb: [u8; 3],
+        width: f32,
+    ) -> Result<()> {
+        let t = &self.target;
+        let point = |&(x, y): &(f32, f32)| Vector2 { X: x, Y: y };
+        // SAFETY: `dc` is live and holds `bounds`; every pointer outlives the call that
+        // reads it; drawing ends (EndDraw) on every path once it has begun.
+        unsafe {
+            t.BindDC(dc, &bounds)?;
+            let solid = t.CreateSolidColorBrush(&color(rgb, 255), None)?;
+            let faint = t.CreateSolidColorBrush(&color(rgb, 128), None)?;
+            let factory = t.GetFactory()?;
+            t.BeginDraw();
+            for stroke in strokes {
+                let (brush, style) = if stroke.dashed {
+                    (&faint, &self.dashed)
+                } else {
+                    (&solid, &self.solid)
+                };
+                match &stroke.points[..] {
+                    [] => {}
+                    [dot] => t.FillEllipse(
+                        &D2D1_ELLIPSE {
+                            point: point(dot),
+                            radiusX: width,
+                            radiusY: width,
+                        },
+                        brush,
+                    ),
+                    [first, rest @ ..] => {
+                        let path = factory.CreatePathGeometry()?;
+                        let sink = path.Open()?;
+                        sink.BeginFigure(point(first), D2D1_FIGURE_BEGIN_HOLLOW);
+                        let rest: Vec<Vector2> = rest.iter().map(point).collect();
+                        sink.AddLines(&rest);
+                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                        sink.Close()?;
+                        t.DrawGeometry(&path, brush, width, style);
+                    }
+                }
             }
             t.EndDraw(None, None)
         }
