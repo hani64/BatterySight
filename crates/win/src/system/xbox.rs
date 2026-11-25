@@ -554,7 +554,12 @@ impl Source {
         let wgi = |key: &DeviceKey| key.0.starts_with(WGI_PREFIX);
         for (key, (name, via)) in shown.iter().filter(|(key, _)| !previous.contains_key(key)) {
             self.replaced.remove(key);
+            // A row returning under its own key stands for itself, not for another row.
+            let returning = self.departed.iter().any(|row| row.key == *key);
             self.departed.retain(|row| row.key != *key);
+            if returning {
+                continue;
+            }
             let found = self
                 .departed
                 .iter()
@@ -1567,5 +1572,47 @@ mod tests {
         );
         assert_eq!(same.len(), 2);
         assert!(same.iter().any(|state| state.key.0 == "pad:wgi:5"));
+    }
+
+    #[test]
+    fn a_pad_returning_under_its_own_key_does_not_take_anothers_row() {
+        let mut source = Source::default();
+        let mut hub = hub();
+        let a = || stable_pad(1, NRID);
+        let b = || stable_pad(2, NRID_2);
+        apply(
+            &mut source,
+            &mut hub,
+            poll(vec![a(), b()], &[]),
+            no_xinput,
+            0,
+        );
+        // B is unplugged, then A is unplugged and replugged within B's grace.
+        apply(
+            &mut source,
+            &mut hub,
+            poll(vec![a()], &[]),
+            no_xinput,
+            1_000,
+        );
+        apply(&mut source, &mut hub, poll(vec![], &[]), no_xinput, 2_000);
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![a()], &[]),
+            no_xinput,
+            3_000,
+        );
+        let mut rows: Vec<_> = states
+            .iter()
+            .map(|state| (state.key.clone(), state.presence))
+            .collect();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut expected = vec![
+            (a().key(), Presence::Online),
+            (b().key(), Presence::Offline),
+        ];
+        expected.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(rows, expected);
     }
 }
