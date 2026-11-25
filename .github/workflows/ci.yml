@@ -2,19 +2,76 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the toolchain and components rust-toolchain.toml pins.
+      - name: Toolchain
+        run: rustup toolchain install
+      # Saved from main only: per-branch caches fill the repository's cache quota.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      # Internal docs link private items on purpose (no crate is published).
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Dependencies (bans, sources)
+        if: ${{ !cancelled() }}
+        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
+        with:
+          command: check bans sources
+      - name: No personal paths in tracked files
+        if: ${{ !cancelled() }}
+        run: |
+          pattern='[A-Za-z]:[\\/]Users[\\/]|/home/[a-z]|/Users/[A-Za-z]'
+          if hits=$(git grep -nIE "$pattern" -- ':!.github/workflows/ci.yml'); then
+            while IFS=: read -r file line _; do
+              echo "::error file=$file,line=$line::Personal path; replace it with a placeholder such as %LOCALAPPDATA%"
+            done <<< "$hits"
+            exit 1
+          fi
+      - name: No AI co-author trailers
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='^co-authored-by:.*(claude|anthropic|copilot|openai|chatgpt|codex|gpt-|cursor|gemini|devin-ai|aider|windsurf|codeium|tabnine|google-labs-jules)'
+          if hits=$(git log --format=%B "$BASE..$HEAD" | grep -iE "$pattern"); then
+            echo "::error::Remove AI co-author trailers (see CONTRIBUTING.md):"
+            echo "$hits"
+            exit 1
+          fi

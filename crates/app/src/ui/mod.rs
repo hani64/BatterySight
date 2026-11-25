@@ -107,7 +107,7 @@ pub struct DeviceView {
     /// Charged full on power: a check where a charging device has its bolt.
     pub full: bool,
     pub low: bool,
-    /// Tells the device apart from the other shown devices of its kind ([`caption`]).
+    /// Tells the device apart from the other shown devices of its kind ([`captions_for`]).
     pub caption: Option<String>,
     /// The hover card's text ([`card::card_text`]), one line each, for tray icons.
     pub tooltip: String,
