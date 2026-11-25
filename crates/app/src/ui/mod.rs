@@ -684,10 +684,14 @@ impl Ui {
         }
     }
 
-    /// A new snapshot: records its history samples, shows it, and notifies the devices
-    /// whose fresh readings reached their low-battery threshold ([`Alerts::check`]).
+    /// A new snapshot: remembers new or changed device names (saved only then), records its
+    /// history samples, shows it, and notifies the devices whose fresh readings reached
+    /// their low-battery threshold ([`Alerts::check`]).
     fn changed(&mut self) {
         let states = read_snapshot(&self.runtime);
+        if self.settings.remember_names(&states) {
+            self.save();
+        }
         self.record(&states);
         self.update_views(&states);
         self.follow_hover(Some(&states));

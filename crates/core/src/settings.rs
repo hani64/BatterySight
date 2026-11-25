@@ -66,6 +66,8 @@ pub struct Settings {
     pub monitors: MonitorChoice,
     pub display: DisplayMode,
     pub autostart: bool,
+    /// Each device's last seen name, so the history can name devices not connected now.
+    pub names: BTreeMap<DeviceKey, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +124,19 @@ impl Settings {
                 let minutes = interval_of(value)
                     .ok_or_else(|| invalid(&format!("intervals.{key}"), INTERVAL_FORM))?;
                 settings.intervals.insert(DeviceKey(key.clone()), minutes);
+            }
+        }
+        if let Some(value) = table.get("names") {
+            let Value::Table(entries) = value else {
+                return Err(invalid("names", "expected a table of device keys"));
+            };
+            for (key, value) in entries {
+                let name = value
+                    .as_str()
+                    .ok_or_else(|| invalid(&format!("names.{key}"), "expected a string"))?;
+                settings
+                    .names
+                    .insert(DeviceKey(key.clone()), name.to_owned());
             }
         }
         if let Some(value) = table.get("monitors") {
@@ -193,6 +208,10 @@ impl Settings {
             let minutes = (*minutes).clamp(1, INTERVAL_MAX_MIN);
             let _ = writeln!(out, "{} = {minutes}", quote(&key.0));
         }
+        out.push_str("\n# names: each device's last seen name, for the battery history\n[names]\n");
+        for (key, name) in &self.names {
+            let _ = writeln!(out, "{} = {}", quote(&key.0), quote(name));
+        }
         out
     }
 
@@ -214,6 +233,18 @@ impl Settings {
     pub fn set_interval(&mut self, key: &DeviceKey, minutes: u16) {
         self.intervals
             .insert(key.clone(), minutes.clamp(1, INTERVAL_MAX_MIN));
+    }
+
+    /// Remembers the names of `states`; whether any was new or changed (and so needs saving).
+    pub fn remember_names(&mut self, states: &[DeviceState]) -> bool {
+        let mut changed = false;
+        for s in states {
+            if self.names.get(&s.key) != Some(&s.name) {
+                self.names.insert(s.key.clone(), s.name.clone());
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Every poll interval in milliseconds, as the scheduler takes them.
@@ -385,6 +416,12 @@ mod tests {
             monitors: MonitorChoice::Named(r"\\.\DISPLAY2".into()),
             display: DisplayMode::Tray,
             autostart: true,
+            names: [
+                (key("bt:0000000000000000000000000000000A"), "Buds".into()),
+                (key("pad:wgi:1"), "Pad \"one\" \\ ünï".into()),
+            ]
+            .into_iter()
+            .collect(),
         };
         let text = settings.to_toml();
         assert_eq!(Settings::from_toml(&text), Ok(settings), "{text}");
@@ -429,8 +466,33 @@ mod tests {
         );
         assert_eq!(settings.display, DisplayMode::Tray);
         assert!(settings.autostart);
+        // A file from before names were kept.
+        assert!(settings.names.is_empty());
 
         assert_eq!(Settings::from_toml(""), Ok(Settings::default()));
+    }
+
+    #[test]
+    fn names_are_remembered_only_when_new_or_changed() {
+        let mut settings = Settings::default();
+        let mut buds = state("bt:0000000000000000000000000000000A");
+        buds.name = "Galaxy Buds2".into();
+        let pad = state("pad:wgi:1");
+        assert!(settings.remember_names(&[buds.clone(), pad.clone()]));
+        assert_eq!(settings.names[&buds.key], "Galaxy Buds2");
+        // Unchanged: nothing to write.
+        assert!(!settings.remember_names(&[buds.clone(), pad.clone()]));
+        assert!(!settings.remember_names(&[]));
+        buds.name = "My Buds".into();
+        assert!(settings.remember_names(&[buds.clone()]));
+        assert_eq!(settings.names[&buds.key], "My Buds");
+        assert_eq!(settings.names[&pad.key], "pad:wgi:1");
+    }
+
+    #[test]
+    fn names_must_be_strings() {
+        assert!(Settings::from_toml("[names]\na = 3\n").is_err());
+        assert!(Settings::from_toml("names = 3\n").is_err());
     }
 
     #[test]
