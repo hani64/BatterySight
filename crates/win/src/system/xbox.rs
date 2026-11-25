@@ -15,7 +15,7 @@ use batterysight_core::model::{
 };
 use batterysight_core::time::Ms;
 use windows::Foundation::{EventHandler, IReference};
-use windows::Gaming::Input::RawGameController;
+use windows::Gaming::Input::{Gamepad, IGameController, RawGameController};
 use windows::System::Power::BatteryStatus;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::UI::Input::XboxController::{
@@ -24,8 +24,8 @@ use windows::Win32::UI::Input::XboxController::{
     BATTERY_TYPE_DISCONNECTED, BATTERY_TYPE_NIMH, BATTERY_TYPE_WIRED, XINPUT_BATTERY_INFORMATION,
     XINPUT_STATE, XInputGetBatteryInformation, XInputGetState,
 };
+use windows::core::Interface;
 
-use crate::hid_enum::HidInterface;
 use crate::reactor::{OsEvent, Poster};
 use crate::system::{HidBus, hid_bus};
 
@@ -51,6 +51,8 @@ pub(crate) struct Pad {
     pub(crate) pid: u16,
     /// Reached through the Xbox Wireless Adapter rather than a cable.
     pub(crate) wireless: bool,
+    /// WGI also exposes it as a `Gamepad` (a local cast); wheels and joysticks are not.
+    pub(crate) gamepad: bool,
     pub(crate) name: String,
     /// Read only for identified pads.
     pub(crate) report: Option<Report>,
@@ -122,22 +124,95 @@ fn charge(report: &Report) -> Option<Charge> {
     }
 }
 
-/// A Microsoft pad whose product never appears on a non-USB HID path. Bluetooth pads are
-/// HID devices, so this rules them out; one product on several transports rules out all.
+/// A Microsoft gamepad whose product never appears on a non-USB HID path. Bluetooth pads
+/// are HID devices, so this rules them out; one product on several transports rules out all.
 fn identified(pad: &Pad, non_usb: &BTreeSet<(u16, u16)>) -> bool {
-    pad.vid == MICROSOFT && !non_usb.contains(&(pad.vid, pad.pid))
+    pad.vid == MICROSOFT && counted(pad, non_usb)
 }
 
-/// Hides an XInput row in its removal grace once WGI rows replaced the XInput provider.
-pub(crate) fn hide_replaced(states: &mut Vec<DeviceState>) {
-    if states
-        .iter()
-        .any(|state| state.key.0.starts_with(WGI_PREFIX))
-    {
-        states.retain(|state| {
-            !state.key.0.starts_with(XINPUT_PREFIX) || state.presence == Presence::Online
-        });
+/// A gamepad of any vendor that can hold an XInput slot other than a Bluetooth one.
+fn counted(pad: &Pad, non_usb: &BTreeSet<(u16, u16)>) -> bool {
+    pad.gamepad && !non_usb.contains(&(pad.vid, pad.pid))
+}
+
+/// The hex digits after `tag` (`vid` or `pid`, then `_` or `&`) in a lowercase path segment.
+fn hex_after<'a>(segment: &'a str, tag: &str) -> Option<&'a str> {
+    let start = segment
+        .match_indices(tag)
+        .map(|(at, _)| at + tag.len())
+        .find(|&at| matches!(segment.as_bytes().get(at), Some(b'_' | b'&')))?
+        + 1;
+    let rest = &segment[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// VID/PID from a HID interface path's hardware segment: `VID_045E&PID_0B12` (USB),
+/// `vid&0002045e_pid&02e0` (Classic: source prefix 0002) or `VID&02045e_PID&0b13` (LE).
+fn path_product(path: &str) -> Option<(u16, u16)> {
+    let hardware = path.split('#').nth(1)?;
+    let vid = hex_after(hardware, "vid")?;
+    let pid = hex_after(hardware, "pid")?;
+    if !matches!(vid.len(), 4 | 6 | 8) || pid.len() != 4 {
+        return None;
     }
+    let vid = u16::from_str_radix(&vid[vid.len() - 4..], 16).ok()?;
+    Some((vid, u16::from_str_radix(pid, 16).ok()?))
+}
+
+/// The products of present HID interfaces that are not on a USB HID path, from the
+/// Configuration Manager list text alone (nothing is opened). `None` if a path mentioning
+/// Microsoft's VID cannot be parsed, which then identifies no Microsoft pad.
+pub(crate) fn non_usb_products(list: &[u16]) -> Option<BTreeSet<(u16, u16)>> {
+    let mut products = BTreeSet::new();
+    for path in list
+        .split(|&unit| unit == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let text = String::from_utf16_lossy(path).to_ascii_lowercase();
+        match (hid_bus(path), path_product(&text)) {
+            (HidBus::Usb, Some(_)) => {}
+            (_, Some(product)) => {
+                products.insert(product);
+            }
+            (_, None) if text.contains("045e") => return None,
+            (_, None) => {}
+        }
+    }
+    Some(products)
+}
+
+/// Hides rows in their removal grace that another row now stands for: one provider's
+/// offline rows while the other provider has an online row, and an offline WGI row while
+/// an online WGI row of the same name and transport exists (a replugged pad gets a new key).
+pub(crate) fn hide_replaced(states: &mut Vec<DeviceState>) {
+    let online = |prefix: &str| {
+        states
+            .iter()
+            .any(|state| state.key.0.starts_with(prefix) && state.presence == Presence::Online)
+    };
+    let (wgi_online, xinput_online) = (online(WGI_PREFIX), online(XINPUT_PREFIX));
+    let replugged: Vec<(String, Via)> = states
+        .iter()
+        .filter(|state| state.key.0.starts_with(WGI_PREFIX) && state.presence == Presence::Online)
+        .map(|state| (state.name.clone(), state.via))
+        .collect();
+    states.retain(|state| {
+        if state.presence == Presence::Online {
+            true
+        } else if state.key.0.starts_with(XINPUT_PREFIX) {
+            !wgi_online
+        } else if state.key.0.starts_with(WGI_PREFIX) {
+            !xinput_online
+                && !replugged
+                    .iter()
+                    .any(|(name, via)| *name == state.name && *via == state.via)
+        } else {
+            true
+        }
+    });
 }
 
 fn observation(
@@ -175,11 +250,33 @@ pub(crate) struct Source {
     /// Controllers seen at the last poll and their local identifiers.
     controllers: Vec<(RawGameController, u32)>,
     next_id: u32,
+    /// Non-USB HID products from the last successful interface list; `None` until listed
+    /// again after a controller or HID change, Refresh or resume, or after a failed list.
+    products: Option<BTreeSet<(u16, u16)>>,
 }
 
 impl Source {
     pub(crate) fn request(&mut self) {
         self.requested = true;
+    }
+
+    /// A controller or HID interface came or went, or Refresh or resume: list the HID
+    /// interface paths again at the next poll, which is due now.
+    pub(crate) fn hid_changed(&mut self) {
+        self.products = None;
+        self.requested = true;
+    }
+
+    /// The cached non-USB products, listing them first if needed. `None` (identify no pad)
+    /// while the list fails or cannot be parsed; the next poll then lists again.
+    pub(crate) fn products(
+        &mut self,
+        list: impl FnOnce() -> Option<Vec<u16>>,
+    ) -> Option<BTreeSet<(u16, u16)>> {
+        if self.products.is_none() {
+            self.products = list().and_then(|list| non_usb_products(&list));
+        }
+        self.products.clone()
     }
 
     pub(crate) fn deadline(&self) -> Option<Ms> {
@@ -201,11 +298,8 @@ impl Source {
     }
 
     /// Lists the WGI controllers and reads batteries for identified pads only. `None` when
-    /// WGI or the HID enumeration fails, which says nothing about removals.
-    pub(crate) fn poll(
-        &mut self,
-        enumerate: impl FnOnce() -> Option<Vec<HidInterface>>,
-    ) -> Option<Poll> {
+    /// WGI or the HID interface list fails, which says nothing about removals.
+    pub(crate) fn poll(&mut self, interfaces: impl FnOnce() -> Option<Vec<u16>>) -> Option<Poll> {
         let list = RawGameController::RawGameControllers().ok()?;
         let mut controllers = Vec::new();
         let mut pads = Vec::new();
@@ -232,20 +326,21 @@ impl Source {
                 vid,
                 pid,
                 wireless: false,
+                // A local cast; it sends nothing to the controller.
+                gamepad: controller
+                    .cast::<IGameController>()
+                    .and_then(|controller| Gamepad::FromGameController(&controller))
+                    .is_ok(),
                 name: String::new(),
                 report: None,
             });
             controllers.push((controller, id));
         }
         self.controllers = controllers;
-        let non_usb = if pads.iter().any(|pad| pad.vid == MICROSOFT) {
-            enumerate()?
-                .iter()
-                .filter(|interface| hid_bus(&interface.path) != HidBus::Usb)
-                .map(|interface| (interface.collection.vid, interface.collection.pid))
-                .collect()
-        } else {
+        let non_usb = if pads.is_empty() {
             BTreeSet::new()
+        } else {
+            self.products(interfaces)?
         };
         for (pad, (controller, _)) in pads.iter_mut().zip(&self.controllers) {
             if identified(pad, &non_usb) {
@@ -276,6 +371,9 @@ impl Source {
         } else {
             Some(self.periodic.unwrap_or(now.saturating_add(REREAD_MS)))
         };
+        // Without identifiers, slots can only stand for the identified pads one-to-one, and
+        // only if every gamepad that could hold a slot is one of them.
+        let slot_holders = pads.iter().filter(|pad| counted(pad, &non_usb)).count();
         let pads: Vec<_> = pads
             .into_iter()
             .filter(|pad| identified(pad, &non_usb))
@@ -284,8 +382,8 @@ impl Source {
             .iter()
             .any(|pad| pad.report.as_ref().and_then(bucket).is_some());
         let mut inputs = Vec::new();
-        let slots = (!self.wgi_reports && !pads.is_empty()).then(xinput);
-        // Without identifiers, slots can only stand for the identified pads one-to-one.
+        let slots =
+            (!self.wgi_reports && !pads.is_empty() && slot_holders == pads.len()).then(xinput);
         let usable: Vec<_> = slots
             .into_iter()
             .flatten()
@@ -439,6 +537,7 @@ mod tests {
             vid: MICROSOFT,
             pid,
             wireless: true,
+            gamepad: true,
             name: "Example Controller".into(),
             report,
         }
@@ -813,5 +912,170 @@ mod tests {
         ] {
             assert_eq!(hid_bus(&wide(path)), bus, "{path}");
         }
+    }
+
+    #[test]
+    fn a_wgi_row_does_not_linger_when_xinput_takes_over() {
+        let mut source = Source::default();
+        let mut hub = hub();
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(1, USB, None)], &[]),
+            || [None; 4],
+            0,
+        );
+        assert_eq!(rows(&states), [("pad:wgi:1", None)]);
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(1, USB, None)], &[]),
+            || [slot(BATTERY_TYPE_NIMH, BATTERY_LEVEL_LOW), None, None, None],
+            60_000,
+        );
+        assert_eq!(
+            rows(&states),
+            [("pad:xinput:0", Some(Level::Coarse(CoarseLevel::Low)))]
+        );
+    }
+
+    #[test]
+    fn a_replugged_pad_shows_one_row() {
+        let mut source = Source::default();
+        let mut hub = hub();
+        let full = || Some(report(100, 100));
+        apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(1, USB, full())], &[]),
+            no_xinput,
+            0,
+        );
+        // WGI hands the same pad back as a new controller object.
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(2, USB, full())], &[]),
+            no_xinput,
+            1_000,
+        );
+        assert_eq!(
+            rows(&states),
+            [("pad:wgi:2", Some(Level::Coarse(CoarseLevel::Full)))]
+        );
+        // A different pad that left is still shown in its grace.
+        let other = Pad {
+            name: "Other Controller".into(),
+            ..pad(3, USB, full())
+        };
+        apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(2, USB, full()), other], &[]),
+            no_xinput,
+            2_000,
+        );
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(2, USB, full())], &[]),
+            no_xinput,
+            3_000,
+        );
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[1].key.0, "pad:wgi:3");
+        assert_eq!(states[1].presence, Presence::Offline);
+    }
+
+    #[test]
+    fn third_party_xinput_pads_are_never_shown_as_xbox() {
+        let third_party = |id| Pad {
+            vid: 0x3537,
+            ..pad(id, 0x1000, None)
+        };
+        // A Microsoft wheel or joystick is not a gamepad and is never identified.
+        let wheel = Pad {
+            gamepad: false,
+            ..pad(1, 0x0001, None)
+        };
+        let mut source = Source::default();
+        let mut hub = hub();
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![wheel, third_party(2)], &[]),
+            no_xinput,
+            0,
+        );
+        assert!(states.is_empty());
+        // Two USB gamepads, one third-party: the slots cannot be attributed.
+        let mut source = Source::default();
+        let mut hub = self::hub();
+        let states = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![pad(1, USB, None), third_party(2)], &[]),
+            || {
+                [
+                    slot(BATTERY_TYPE_NIMH, BATTERY_LEVEL_LOW),
+                    slot(BATTERY_TYPE_ALKALINE, BATTERY_LEVEL_FULL),
+                    None,
+                    None,
+                ]
+            },
+            0,
+        );
+        assert_eq!(rows(&states), [("pad:wgi:1", None)]);
+    }
+
+    fn list(paths: &[&str]) -> Vec<u16> {
+        let mut list: Vec<u16> = Vec::new();
+        for path in paths {
+            list.extend(path.encode_utf16().chain([0]));
+        }
+        list.push(0);
+        list
+    }
+
+    const CLASSIC: &str = r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002045e_pid&02e0&col01#1&2&0&0000#{4d1e55b2}";
+    const LE: &str = r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02045e_PID&0b13_REV&0509_000000000000#1&2&0&0000#{4d1e55b2}";
+
+    #[test]
+    fn non_usb_products_come_from_path_text_and_fail_closed() {
+        let products = non_usb_products(&list(&[
+            r"\\?\HID#VID_045E&PID_0B12&IG_00#1&2&0&0000#{4d1e55b2}",
+            CLASSIC,
+            LE,
+            r"\\?\HID#ConvertedDevice&Col01#1&2&0&0000#{4d1e55b2}",
+        ]));
+        assert_eq!(
+            products,
+            Some([(MICROSOFT, 0x02E0), (MICROSOFT, 0x0B13)].into())
+        );
+        // A Microsoft path without a parsable product rules out every Microsoft pad.
+        for unparsable in [
+            r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002045e#1&2&0&0000#{4d1e55b2}",
+            r"\\?\HID#VID_045E&PID_XYZ#1&2&0&0000#{4d1e55b2}",
+        ] {
+            assert_eq!(non_usb_products(&list(&[CLASSIC, unparsable])), None);
+        }
+    }
+
+    #[test]
+    fn hid_products_are_relisted_only_on_triggers_and_after_failures() {
+        let mut source = Source::default();
+        let listed = || Some(list(&[LE]));
+        let unlisted = || -> Option<Vec<u16>> { unreachable!("not re-listed") };
+        let expected = Some(BTreeSet::from([(MICROSOFT, BLE)]));
+        assert_eq!(source.products(listed), expected);
+        assert_eq!(source.products(unlisted), expected);
+        // A failed list identifies nothing, so no placeholder bucket can be read, and
+        // the next poll lists again.
+        source.hid_changed();
+        assert_eq!(source.deadline(), Some(0));
+        assert_eq!(source.products(|| None), None);
+        assert_eq!(source.products(|| Some(list(&[CLASSIC, "045e"]))), None);
+        assert_eq!(source.products(listed), expected);
+        assert_eq!(source.products(unlisted), expected);
     }
 }

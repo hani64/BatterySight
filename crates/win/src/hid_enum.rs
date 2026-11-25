@@ -241,7 +241,7 @@ fn is_collection_part(part: &str) -> bool {
 
 /// The present HID interface paths as a NUL-separated, double-NUL-terminated list, or `None`
 /// when Configuration Manager fails.
-fn interface_list() -> Option<Vec<u16>> {
+pub(crate) fn interface_list() -> Option<Vec<u16>> {
     for _ in 0..LIST_ATTEMPTS {
         let mut len = 0u32;
         // SAFETY: `len` is a valid out pointer and the GUID outlives the call.

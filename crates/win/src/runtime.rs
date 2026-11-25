@@ -341,7 +341,7 @@ impl Device {
                         self.guard.clear();
                         self.rescan();
                         self.rearm_bluetooth();
-                        self.xbox.request();
+                        self.xbox.hid_changed();
                         self.feed(HubInput::RefreshNow, now_ms());
                     }
                     Ok(Command::SetIntervals(gaps)) => {
@@ -441,6 +441,7 @@ impl Device {
             }
             OsEvent::InterfaceRemoved { path } => {
                 self.bluetooth.request(now_ms(), false);
+                self.xbox.hid_changed();
                 let path = path_key(&path);
                 let awaiting = self.replacements.len();
                 self.replacements.retain(|paths| !paths.contains(&path));
@@ -457,6 +458,7 @@ impl Device {
             }
             OsEvent::InterfaceArrived => {
                 self.bluetooth.request(now_ms(), true);
+                self.xbox.hid_changed();
                 self.guard.on_arrival(now_ms());
                 true
             }
@@ -476,7 +478,7 @@ impl Device {
                 self.guard.clear();
                 self.rescan();
                 self.rearm_bluetooth();
-                self.xbox.request();
+                self.xbox.hid_changed();
                 self.feed(HubInput::Resume, now_ms());
                 false
             }
@@ -494,7 +496,7 @@ impl Device {
                 false
             }
             OsEvent::GameControllers => {
-                self.xbox.request();
+                self.xbox.hid_changed();
                 false
             }
             OsEvent::WriteFailed { .. } | OsEvent::Wake => false,
@@ -527,7 +529,7 @@ impl Device {
     }
 
     fn poll_xbox(&mut self) {
-        let polled = self.xbox.poll(hid_enum::enumerate);
+        let polled = self.xbox.poll(hid_enum::interface_list);
         let now = now_ms();
         let inputs = self.xbox.reconcile(polled, xbox::read_xinput, now);
         self.apply_system(inputs, now);
