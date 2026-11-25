@@ -948,7 +948,7 @@ impl Device {
                     .is_some_and(|container| cached.contains_key(container))
             }
         });
-        xbox::hide_replaced(&mut snapshot);
+        self.xbox.hide_replaced(&mut snapshot);
         if *published != snapshot {
             *published = snapshot;
             drop(published);
