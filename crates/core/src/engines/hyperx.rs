@@ -256,12 +256,16 @@ impl HyperxEngine {
                     self.pending = None;
                     self.charge = None;
                 }
-                if self.online == up || !self.registered {
-                    self.online = up;
-                    return None;
-                }
+                let changed = self.online != up;
                 self.online = up;
-                (None, None, (!up).then_some(Charge::Unknown))
+                return (changed && self.registered).then(|| Action::Presence {
+                    key: self.key.clone(),
+                    presence: if up {
+                        Presence::Online
+                    } else {
+                        Presence::Offline
+                    },
+                });
             }
             Event::Battery(level, millivolts) => {
                 self.online = true;
@@ -288,11 +292,7 @@ impl HyperxEngine {
             level,
             millivolts,
             charge,
-            presence: Some(if self.online {
-                Presence::Online
-            } else {
-                Presence::Offline
-            }),
+            presence: Some(Presence::Online),
             source,
         };
         if registering {

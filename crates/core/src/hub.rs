@@ -784,6 +784,21 @@ impl Hub {
                         pass.changed = true;
                     }
                 }
+                Action::Presence { key, presence } => {
+                    let key = self.hub_key(gid, key);
+                    if self.device_owner(&key) != Some(gid) {
+                        continue;
+                    }
+                    self.note_presence(&key, Some(presence));
+                    if let Some(state) = self.states.get_mut(&key) {
+                        pass.changed |= state.presence != presence;
+                        state.presence = presence;
+                        if presence == Presence::Offline {
+                            pass.changed |= state.charge != Charge::Unknown;
+                            state.charge = Charge::Unknown;
+                        }
+                    }
+                }
                 Action::Asleep(key) => {
                     let key = self.hub_key(gid, key);
                     if self.device_owner(&key) != Some(gid) {

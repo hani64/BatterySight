@@ -1106,6 +1106,16 @@ fn hyperx_hx66_replays_only_one_shots_and_passive_changes() {
         hyperx_input(&mut hub, 11, 62, &[0x66, 0x0C, 1], &[]);
         hyperx_input(&mut hub, 12, 62, &[0x66, 0x0A, 1], &[]);
         assert_eq!(hub.snapshot()[0].charge, Charge::Charging);
+        let last_reading = hub.snapshot().remove(0);
+        let assert_presence = |hub: &Hub, presence: Presence, charge: Charge| {
+            let state = &hub.snapshot()[0];
+            assert_eq!(state.presence, presence);
+            assert_eq!(state.charge, charge);
+            assert_eq!(state.level, last_reading.level);
+            assert_eq!(state.millivolts, last_reading.millivolts);
+            assert_eq!(state.updated_ms, last_reading.updated_ms);
+            assert_eq!(state.source, last_reading.source);
+        };
         assert_eq!(hub.next_deadline(), None);
         assert_eq!(hub.audio_ready_at(&key), None);
         hyperx_sent(hub.handle(HubInput::Tick, 600_012), 62, &[]);
@@ -1113,21 +1123,22 @@ fn hyperx_hx66_replays_only_one_shots_and_passive_changes() {
         hyperx_input(&mut hub, 600_014, 62, &[0x66, 0x0B, 0], &[]);
         hyperx_input(&mut hub, 600_015, 62, &[0x66, 0x0D, 0, 0, 0], &[]);
         hyperx_input(&mut hub, 600_016, 62, &[0x66, 0x0F, 0], &[]);
-        assert_eq!(hub.snapshot()[0].presence, Presence::Offline);
-        assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(75)));
-        assert_eq!(hub.snapshot()[0].charge, Charge::Unknown);
+        assert_presence(&hub, Presence::Offline, Charge::Unknown);
         hyperx_input(&mut hub, 600_017, 62, &[0x66, 0x0F, 1], &[]);
         hyperx_input(&mut hub, 600_018, 62, &[0x66, 0x0B, 1], &[]);
-        assert_eq!(hub.snapshot()[0].presence, Presence::Online);
+        assert_presence(&hub, Presence::Online, Charge::Unknown);
 
         hyperx_sent(hub.handle(HubInput::Resume, 600_019), 62, &[0x66, 0x82]);
         hyperx_input(&mut hub, 600_020, 62, &[0x66, 0x82, 1], &[0x66, 0x89]);
         hyperx_input(&mut hub, 600_021, 62, &[0x66, 0x89, 0, 0, 0], &[]);
-        assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(75)));
-        assert_eq!(hub.snapshot()[0].presence, Presence::Offline);
+        assert_presence(&hub, Presence::Offline, Charge::Unknown);
+        // A real up echo may continue its existing grant, but isn't a reading.
         hyperx_sent(hub.handle(HubInput::RefreshNow, 600_022), 62, &[0x66, 0x82]);
-        hyperx_input(&mut hub, 600_023, 62, &[0x66, 0x82, 0], &[]);
-        assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(75)));
+        hyperx_input(&mut hub, 600_023, 62, &[0x66, 0x82, 1], &[0x66, 0x89]);
+        assert_presence(&hub, Presence::Online, Charge::Unknown);
+        hyperx_sent(hub.handle(HubInput::Resume, 620_024), 62, &[0x66, 0x82]);
+        hyperx_input(&mut hub, 620_025, 62, &[0x66, 0x82, 0], &[]);
+        assert_presence(&hub, Presence::Offline, Charge::Unknown);
     }
 }
 

@@ -6,7 +6,7 @@
 
 use crate::engines::hidpp::frame::{FIRST_REGISTER_SUB_ID, LONG, SHORT, SW_ID};
 use crate::hid::{CollectionId, CollectionRole, ReportKind, ReportOrigin};
-use crate::model::{DeviceKey, DeviceUpdate};
+use crate::model::{DeviceKey, DeviceUpdate, Presence};
 use crate::scheduler::{Capabilities, Grant, GrantId};
 use crate::time::Ms;
 
@@ -38,6 +38,11 @@ pub enum Action {
     Unregister(DeviceKey),
     /// New reading or presence for a registered device.
     Update(DeviceUpdate),
+    /// Presence without a new battery sample or a grant. Offline clears charge.
+    Presence {
+        key: DeviceKey,
+        presence: Presence,
+    },
     /// The device sleeps or lost its link: stop asking it.
     Asleep(DeviceKey),
     /// A link to `key` (a device or this engine's group key) was established: the hub
