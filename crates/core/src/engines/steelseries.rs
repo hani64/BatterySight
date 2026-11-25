@@ -445,11 +445,9 @@ impl SteelseriesEngine {
         };
         if self.report == SteelseriesReport::GameBuds {
             // GameBuds B9/BB are settings; only B5 carries the RF link here.
-            return match bytes {
-                &[0, 0xB5, _, _, left, right, ..] => {
-                    Some(self.link_event(Link::buds(left, right)?))
-                }
-                &[0, 0xB7, left @ 0..=100, right @ 0..=100, ..] => {
+            return match *bytes {
+                [0, 0xB5, _, _, left, right, ..] => Some(self.link_event(Link::buds(left, right)?)),
+                [0, 0xB7, left @ 0..=100, right @ 0..=100, ..] => {
                     let link = self.link.filter(|link| link.up())?;
                     let level = self.sample_buds(link, left, right)?;
                     Some(self.update(true, Some(level), None, Source::Push))
@@ -475,9 +473,9 @@ impl SteelseriesEngine {
     }
 
     fn station_event(&mut self, bytes: &[u8]) -> Option<Vec<Action>> {
-        match bytes {
-            &[0x07, 0xB5, _, _, link, ..] => Some(self.link_event(radio_link(link)?)),
-            &[0x07, 0xB7, raw, _, state, ..] => {
+        match *bytes {
+            [0x07, 0xB5, _, _, link, ..] => Some(self.link_event(radio_link(link)?)),
+            [0x07, 0xB7, raw, _, state, ..] => {
                 let level = self.report.level(raw)?;
                 // GG distinguishes the B7 charging enum from B0 headset-battery status.
                 let charge = if state == 4 {

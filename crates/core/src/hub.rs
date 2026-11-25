@@ -2085,7 +2085,7 @@ quirks = { query_wakes = true }
         let key = dev("logi:unit:12345678");
         hub.handle(hidpp_receiver(), 0);
         hidpp_discover_unified(&mut hub, 1, 1, 1, unit);
-        assert_eq!(hub.keys_of(GroupId(1)), [key.clone()]);
+        assert_eq!(hub.keys_of(GroupId(1)), std::slice::from_ref(&key));
         let read = [0x11, 1, 8, 0x1B];
         assert_eq!(
             sends(&hidpp_try_send(&mut hub, &read)),

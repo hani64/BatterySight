@@ -309,7 +309,7 @@ fn locate(id: &[u16], flags: CM_LOCATE_DEVNODE_FLAGS) -> Result<Option<u32>> {
 fn property(node: u32, key: &DEVPROPKEY, data: &mut [u8]) -> Result<Option<(DEVPROPTYPE, u32)>> {
     let mut kind = DEVPROPTYPE::default();
     let mut size = data.len() as u32;
-    let buffer = (!data.is_empty()).then(|| data.as_mut_ptr());
+    let buffer = (!data.is_empty()).then_some(data.as_mut_ptr());
     // SAFETY: `buffer` points to `size` writable bytes (or is absent for a size query).
     let status = unsafe { CM_Get_DevNode_PropertyW(node, key, &mut kind, buffer, &mut size, 0) };
     match status {
@@ -339,8 +339,10 @@ fn friendly_name(node: u32) -> Result<Option<String>> {
         return Ok(None);
     };
     let name: String = char::decode_utf16(
-        data.chunks_exact(2)
-            .map(|u| u16::from_le_bytes([u[0], u[1]]))
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&u| u16::from_le_bytes(u))
             .take_while(|&u| u != 0),
     )
     .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
