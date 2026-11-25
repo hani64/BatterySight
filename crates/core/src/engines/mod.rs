@@ -4,7 +4,7 @@ pub mod hidpp;
 mod hyperx;
 pub mod rapoo;
 mod sonix;
-mod steelseries;
+pub mod steelseries;
 
 use crate::catalog::{Catalog, CollectionSelector, DeviceEntry, EngineKind};
 use crate::engine::Engine;

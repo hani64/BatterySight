@@ -34,7 +34,7 @@ use windows::core::Interface;
 
 use crate::hid_enum::interface_node;
 use crate::reactor::{OsEvent, Poster};
-use crate::system::{HidBus, hid_bus};
+use crate::system::{HidBus, PathVendor, hid_bus, path_vendor};
 
 pub(crate) const MICROSOFT: u16 = 0x045E;
 /// Local re-read while any controller is present; WGI has no battery event.
@@ -151,57 +151,8 @@ fn counted(pad: &Pad, hid: &HidProducts) -> bool {
     pad.gamepad && !hid.non_usb.contains(&(pad.vid, pad.pid))
 }
 
-/// The hex digits after `tag` (`vid` or `pid`, then `_` or `&`) in a lowercase path segment.
-fn hex_after<'a>(segment: &'a str, tag: &str) -> Option<&'a str> {
-    let start = segment
-        .match_indices(tag)
-        .map(|(at, _)| at + tag.len())
-        .find(|&at| matches!(segment.as_bytes().get(at), Some(b'_' | b'&')))?
-        + 1;
-    let rest = &segment[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_hexdigit())
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
 /// Microsoft's Bluetooth SIG company identifier, used with VID source `0001`/`01`.
 const MICROSOFT_SIG: u16 = 0x0006;
-
-/// What a HID path's hardware segment says about its vendor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PathVendor {
-    /// A USB-IF VID and PID: `vid_045e&pid_0b12` (USB), `vid&0002045e_pid&02e0`
-    /// (Classic) or `vid&02045e_pid&0b13` (LE).
-    Product(u16, u16),
-    /// A Bluetooth SIG company identifier (source `0001`/`01`).
-    SigCompany(u16),
-    /// No VID token, a zero or unknown source, or no readable PID.
-    Unknown,
-}
-
-fn path_vendor(hardware: &str) -> PathVendor {
-    let Some(vid) = hex_after(hardware, "vid") else {
-        return PathVendor::Unknown;
-    };
-    let (source, id) = match vid.len() {
-        4 => ("0002", vid),
-        6 => vid.split_at(2),
-        8 => vid.split_at(4),
-        _ => return PathVendor::Unknown,
-    };
-    let Ok(id) = u16::from_str_radix(id, 16) else {
-        return PathVendor::Unknown;
-    };
-    let pid = hex_after(hardware, "pid")
-        .filter(|pid| pid.len() == 4)
-        .and_then(|pid| u16::from_str_radix(pid, 16).ok());
-    match (source, pid) {
-        ("0002" | "02", Some(pid)) => PathVendor::Product(id, pid),
-        ("0001" | "01", _) => PathVendor::SigCompany(id),
-        _ => PathVendor::Unknown,
-    }
-}
 
 /// What the Configuration Manager list text says; nothing is opened. Instance segments
 /// are never inspected. No Microsoft pad is identified while a present path carries

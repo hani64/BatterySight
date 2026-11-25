@@ -21,9 +21,13 @@ const CAPS: Capabilities = Capabilities {
     min_query_gap_ms: 0,
 };
 
-// Only the first compatible reply inside the status window is attributed to our
-// query. B0 lacks a transaction ID; an interleaved GG reply is indistinguishable.
-const REPLY_MS: Ms = 2_000;
+/// Only the first compatible reply inside this window after a query is attributed to it.
+/// B0 lacks a transaction ID; an interleaved GG reply is indistinguishable.
+pub const REPLY_MS: Ms = 2_000;
+/// How long a base station needs after it is found before its first query.
+pub const STATION_SETTLE_MS: Ms = 5_000;
+/// How long a dongle needs after it is found before its first query.
+const DONGLE_SETTLE_MS: Ms = 1_500;
 
 const fn b0<const N: usize>(id: u8) -> [u8; N] {
     let mut bytes = [0; N];
@@ -509,7 +513,11 @@ impl Engine for SteelseriesEngine {
         }
         match grant.trigger {
             Trigger::Arrival => {
-                let settle = if self.report.station() { 5_000 } else { 1_500 };
+                let settle = if self.report.station() {
+                    STATION_SETTLE_MS
+                } else {
+                    DONGLE_SETTLE_MS
+                };
                 self.settle_until = now.saturating_add(settle);
                 self.arrival = (grant.max_requests > 0 && self.settle_until <= grant.expires_ms)
                     .then_some(Arrival {

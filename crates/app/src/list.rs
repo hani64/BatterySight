@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use batterysight_core::catalog::{Catalog, SteelseriesReport};
 use batterysight_core::engines::hidpp::engine::DEVICE_TIMEOUT_MS;
+use batterysight_core::engines::steelseries::{REPLY_MS, STATION_SETTLE_MS};
 use batterysight_core::model::{
     Charge, CoarseLevel, DeviceState, Level, Presence, Verification, Via,
 };
-use batterysight_win::{hid_enum, runtime};
+use batterysight_win::{runtime, system};
 
 /// The list is printed once no change arrived for this long... Longer than the
 /// HID++ device timeout, so a device whose first answer comes late, or a direct
@@ -20,20 +21,18 @@ const QUIET: Duration = Duration::from_millis(DEVICE_TIMEOUT_MS as u64 + 1_000);
 /// ...or once this much time has passed since the runtime started.
 const MAX_WAIT: Duration = Duration::from_secs(10);
 /// While a Nova base station is present, the list is not printed before this: the station
-/// is first asked 5 s after it is opened (it needs that long to settle) and its reply is
-/// expected within 2 s; the last second covers opening the devices.
-const STATION_FIRST_READING: Duration = Duration::from_secs(8);
+/// is first asked once it has settled after it is found, and its reply is expected within
+/// the reply window; the last second covers opening the devices.
+const STATION_FIRST_READING: Duration =
+    Duration::from_millis(STATION_SETTLE_MS + REPLY_MS + 1_000);
 
 /// Starts the runtime, waits for the readings to settle and prints one line per device.
 /// Returns the process exit code.
 pub fn run() -> i32 {
     let catalog = Catalog::builtin();
-    // Cached attributes only, as the runtime itself reads them; nothing is sent.
-    let station = hid_enum::enumerate().is_some_and(|interfaces| {
-        interfaces
-            .iter()
-            .any(|i| is_station(&catalog, i.collection.vid, i.collection.pid))
-    });
+    // From the device paths' text alone; nothing is opened.
+    let station = system::present_products()
+        .is_some_and(|products| station_present(&catalog, products));
     let floor = if station {
         STATION_FIRST_READING
     } else {
@@ -69,6 +68,13 @@ pub fn run() -> i32 {
     }
     let _ = out.flush();
     0
+}
+
+/// Whether any of the present `products` (VID:PID) is a Nova base station.
+fn station_present(catalog: &Catalog, products: impl IntoIterator<Item = (u16, u16)>) -> bool {
+    products
+        .into_iter()
+        .any(|(vid, pid)| is_station(catalog, vid, pid))
 }
 
 /// Whether `vid:pid` is a Nova base station, whose first reading comes only after its
@@ -318,6 +324,25 @@ mod tests {
         for (got, want) in rows {
             assert_eq!(got, want);
         }
+    }
+
+    #[test]
+    fn station_window_is_the_engines_settle_and_reply_window_plus_slack() {
+        use batterysight_core::engines::steelseries::{REPLY_MS, STATION_SETTLE_MS};
+        assert_eq!(
+            STATION_FIRST_READING,
+            Duration::from_millis(STATION_SETTLE_MS + REPLY_MS) + Duration::from_secs(1)
+        );
+        assert_eq!(STATION_FIRST_READING, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn a_station_is_found_among_present_products() {
+        let catalog = Catalog::builtin();
+        let present = |products: &[(u16, u16)]| station_present(&catalog, products.iter().copied());
+        assert!(present(&[(0x046D, 0xC547), (0x1038, 0x12E0)]));
+        assert!(!present(&[(0x046D, 0xC547), (0x1038, 0x2202)]));
+        assert!(!present(&[]));
     }
 
     #[test]
