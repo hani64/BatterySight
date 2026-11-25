@@ -108,6 +108,14 @@ pub struct DeviceUpdate {
     pub source: Source,
 }
 
+/// A reading from a system source that does not participate in HID grant routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemObservation {
+    pub update: DeviceUpdate,
+    pub verification: Verification,
+    pub reports_changes: bool,
+}
+
 impl DeviceState {
     /// Merges `u` into `self`. A sleeping or offline device keeps its last known level.
     pub fn apply(&mut self, u: &DeviceUpdate, now: Ms) {

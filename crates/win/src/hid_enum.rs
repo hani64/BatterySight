@@ -15,7 +15,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_DevNode_PropertyW,
     CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW,
     CM_Get_Device_Interface_PropertyW, CM_Get_Parent, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
-    CR_BUFFER_SMALL, CR_SUCCESS,
+    CM_MapCrToWin32Err, CONFIGRET, CR_BUFFER_SMALL, CR_NO_SUCH_VALUE, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
     GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_STATUS_SUCCESS,
@@ -27,7 +27,7 @@ use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId,
     DEVPROP_TYPE_GUID, DEVPROP_TYPE_STRING, DEVPROPTYPE,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_GEN_FAILURE, HANDLE, WIN32_ERROR};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -339,7 +339,7 @@ fn query(path: &[u16]) -> Option<HidInterface> {
         None
     };
     let node = instance.as_ref().and_then(locate_node);
-    let container = node.and_then(container);
+    let container = node.and_then(|node| node_container(node).ok().flatten());
     Some(HidInterface {
         path: wide,
         collection: Collection {
@@ -434,7 +434,8 @@ fn locate_node(instance: &[u16; INSTANCE_ID_LEN]) -> Option<u32> {
     (status == CR_SUCCESS).then_some(node)
 }
 
-fn container(node: u32) -> Option<ContainerId> {
+/// Reads a cached physical identity without opening the device.
+pub(crate) fn node_container(node: u32) -> windows::core::Result<Option<ContainerId>> {
     let mut kind = DEVPROPTYPE::default();
     let mut guid = GUID::zeroed();
     let mut size = size_of::<GUID>() as u32;
@@ -449,10 +450,23 @@ fn container(node: u32) -> Option<ContainerId> {
             0,
         )
     };
-    if status != CR_SUCCESS || kind != DEVPROP_TYPE_GUID {
-        return None;
+    if matches!(status, CR_NO_SUCH_VALUE | CR_BUFFER_SMALL) {
+        return Ok(None);
     }
-    container_id(&guid)
+    cm_result(status)?;
+    Ok(
+        (kind == DEVPROP_TYPE_GUID && size as usize == size_of::<GUID>())
+            .then(|| container_id(&guid))
+            .flatten(),
+    )
+}
+
+pub(crate) fn cm_result(status: CONFIGRET) -> windows::core::Result<()> {
+    if status == CR_SUCCESS {
+        return Ok(());
+    }
+    // SAFETY: maps a return code; no pointers involved.
+    WIN32_ERROR(unsafe { CM_MapCrToWin32Err(status, ERROR_GEN_FAILURE.0) }).ok()
 }
 
 /// The bus-reported name cached by PnP, not a HID product-string request. A composite
@@ -481,7 +495,7 @@ pub(crate) fn cached_product_name(interface: &HidInterface) -> Option<String> {
         let mut parent = 0;
         // SAFETY: `parent` is a valid out pointer.
         if unsafe { CM_Get_Parent(&mut parent, node, 0) } != CR_SUCCESS
-            || container(parent) != Some(id)
+            || node_container(parent).ok().flatten() != Some(id)
         {
             return None;
         }

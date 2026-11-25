@@ -10,7 +10,8 @@ use crate::engine::{Action, Engine, FeatureSetId, WriteDestination, write_allowe
 use crate::engines::{self, Selection};
 use crate::hid::{CollectionId, CollectionRole, GroupId, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{
-    Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, Verification, Via,
+    Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, SystemObservation,
+    Verification, Via,
 };
 use crate::scheduler::{Capabilities, Grant, GrantId, Policy, Scheduler, Trigger};
 use crate::time::Ms;
@@ -24,6 +25,8 @@ pub enum HubInput {
     /// Runtime arrival after opening the collections selected before any device I/O.
     MatchedGroupArrived(HidGroup, Selection),
     GroupRemoved(GroupId),
+    System(SystemObservation),
+    SystemGone(DeviceKey),
     Report {
         collection: CollectionId,
         origin: ReportOrigin,
@@ -170,6 +173,12 @@ struct Pass {
     depth: usize,
 }
 
+/// System devices have no scheduler registration, even during the removal grace.
+struct SystemDevice {
+    state: DeviceState,
+    expires_at: Option<Ms>,
+}
+
 pub struct Hub {
     catalog: Catalog,
     factory: Option<EngineFactory>,
@@ -181,6 +190,7 @@ pub struct Hub {
     /// several groups at once (e.g. receiver and cable).
     owners: BTreeMap<DeviceKey, Vec<Registrant>>,
     states: BTreeMap<DeviceKey, DeviceState>,
+    system: BTreeMap<DeviceKey, SystemDevice>,
     /// Devices no engine owns any more, and when their entries expire.
     grace: BTreeMap<DeviceKey, Ms>,
 }
@@ -195,6 +205,7 @@ impl Hub {
             routes: HashMap::new(),
             owners: BTreeMap::new(),
             states: BTreeMap::new(),
+            system: BTreeMap::new(),
             grace: BTreeMap::new(),
         }
     }
@@ -223,6 +234,8 @@ impl Hub {
                 self.arrive(&group, Some(&selection), now, &mut pass)
             }
             HubInput::GroupRemoved(id) => self.remove_group(id, now, &mut pass),
+            HubInput::System(observation) => self.observe_system(observation, now, &mut pass),
+            HubInput::SystemGone(key) => self.system_gone(&key, now, &mut pass),
             HubInput::Report {
                 collection,
                 origin,
@@ -266,7 +279,19 @@ impl Hub {
 
     /// Every known device, ordered by key.
     pub fn snapshot(&self) -> Vec<DeviceState> {
-        self.states.values().cloned().collect()
+        let mut hid = self.states.values().peekable();
+        let mut system = self.system.values().map(|device| &device.state).peekable();
+        let mut states = Vec::with_capacity(hid.len() + system.len());
+        while let (Some(a), Some(b)) = (hid.peek(), system.peek()) {
+            let next = if a.key <= b.key {
+                hid.next()
+            } else {
+                system.next()
+            };
+            states.extend(next.cloned());
+        }
+        states.extend(hid.chain(system).cloned());
+        states
     }
 
     /// When the next `Tick` is due: the earliest engine deadline, grace expiry or charging
@@ -276,8 +301,88 @@ impl Hub {
             .values()
             .filter_map(|slot| slot.engine.next_deadline())
             .chain(self.grace.values().copied())
+            .chain(self.system.values().filter_map(|device| device.expires_at))
             .chain(self.charging_reads().map(|(_, at)| at))
             .min()
+    }
+
+    fn observe_system(&mut self, observation: SystemObservation, now: Ms, pass: &mut Pass) {
+        let SystemObservation {
+            update,
+            verification,
+            reports_changes,
+        } = observation;
+        if update.presence == Some(Presence::Offline) {
+            self.system_gone(&update.key, now, pass);
+            return;
+        }
+        if let Some(device) = self.system.get_mut(&update.key) {
+            let returning = device.expires_at.take().is_some();
+            let state = &mut device.state;
+            let sample_changed = update.level.is_some_and(|level| Some(level) != state.level)
+                || update
+                    .millivolts
+                    .is_some_and(|mv| Some(mv) != state.millivolts)
+                || update.charge.is_some_and(|charge| charge != state.charge);
+            let presence = update.presence.unwrap_or(if returning {
+                Presence::Online
+            } else {
+                state.presence
+            });
+            if sample_changed
+                || update.name.as_ref().is_some_and(|name| *name != state.name)
+                || update.kind.is_some_and(|kind| kind != state.kind)
+                || update.via.is_some_and(|via| via != state.via)
+                || presence != state.presence
+                || verification != state.verification
+                || reports_changes != state.reports_changes
+            {
+                let (source, updated_ms) = (state.source, state.updated_ms);
+                state.apply(&update, now);
+                state.presence = presence;
+                state.verification = verification;
+                state.reports_changes = reports_changes;
+                if !sample_changed {
+                    state.source = source;
+                    state.updated_ms = updated_ms;
+                }
+                pass.changed = true;
+            }
+        } else {
+            let state = DeviceState {
+                key: update.key.clone(),
+                name: update.name.unwrap_or_default(),
+                kind: update.kind.unwrap_or(DeviceKind::Other),
+                via: update.via.unwrap_or(Via::Usb),
+                level: update.level,
+                millivolts: update.millivolts,
+                charge: update.charge.unwrap_or(Charge::Unknown),
+                presence: update.presence.unwrap_or(Presence::Online),
+                updated_ms: now,
+                source: update.source,
+                verification,
+                poll_min_ms: None,
+                reports_changes,
+            };
+            self.system.insert(
+                update.key,
+                SystemDevice {
+                    state,
+                    expires_at: None,
+                },
+            );
+            pass.changed = true;
+        }
+    }
+
+    fn system_gone(&mut self, key: &DeviceKey, now: Ms, pass: &mut Pass) {
+        if let Some(device) = self.system.get_mut(key)
+            && device.expires_at.is_none()
+        {
+            device.state.presence = Presence::Offline;
+            device.expires_at = Some(now.saturating_add(REMOVAL_GRACE_MS));
+            pass.changed = true;
+        }
     }
 
     /// Devices asked during use that are owned, online and charging, each with when the
@@ -484,6 +589,10 @@ impl Hub {
             self.scheduler.unregister(&key);
             pass.changed = true;
         }
+        let system_count = self.system.len();
+        self.system
+            .retain(|_, device| device.expires_at.is_none_or(|at| now < at));
+        pass.changed |= system_count != self.system.len();
     }
 
     /// Requests one shot from each group that answers for itself, or from each
@@ -583,8 +692,8 @@ impl Hub {
         }
     }
 
-    /// Group whose engine currently owns device `key`: its latest live registrant.
-    fn device_owner(&self, key: &DeviceKey) -> Option<GroupId> {
+    /// The latest live HID registrant of `key`, if there is one.
+    pub fn device_owner(&self, key: &DeviceKey) -> Option<GroupId> {
         self.owners
             .get(key)
             .and_then(|groups| groups.last().map(|owner| owner.group))
@@ -2236,6 +2345,78 @@ quirks = { query_wakes = true }
 
         assert_eq!(sends(&out), vec![vec![0xC0]]);
         assert_eq!(grants(&f).last(), Some(&(a, Trigger::Connected)));
+    }
+
+    fn system_reading(
+        presence: Presence,
+        level: Option<Level>,
+        source: crate::model::Source,
+    ) -> HubInput {
+        HubInput::System(crate::model::SystemObservation {
+            update: DeviceUpdate {
+                key: dev("bt:synthetic"),
+                name: Some("Headset".into()),
+                kind: Some(DeviceKind::Headset),
+                via: Some(Via::Bluetooth),
+                level,
+                millivolts: None,
+                charge: None,
+                presence: Some(presence),
+                source,
+            },
+            verification: Verification::SourceVerified,
+            reports_changes: true,
+        })
+    }
+
+    #[test]
+    fn system_readings_change_once_and_never_route_grants() {
+        use crate::model::Source;
+        let mut hub = hub(&[]);
+        let key = dev("bt:synthetic");
+        let first = system_reading(Presence::Online, Some(Level::Percent(80)), Source::Os);
+        assert_eq!(hub.handle(first.clone(), 10), [HubOutput::StateChanged]);
+        let initial = hub.snapshot();
+        assert!(initial[0].reports_changes);
+        assert_eq!(initial[0].verification, Verification::SourceVerified);
+        assert_eq!(initial[0].poll_min_ms, None);
+        assert!(hub.handle(first, 20).is_empty());
+        assert_eq!(hub.snapshot(), initial);
+        let second = system_reading(Presence::Online, Some(Level::Percent(65)), Source::Os);
+        assert_eq!(hub.handle(second.clone(), 30), [HubOutput::StateChanged]);
+        assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(65)));
+        assert_eq!(hub.snapshot()[0].updated_ms, 30);
+        assert!(hub.handle(second, 40).is_empty());
+        assert!(hub.handle(HubInput::Activity(key.clone()), 50).is_empty());
+        assert!(hub.handle(HubInput::RefreshNow, 60).is_empty());
+        assert!(hub.handle(HubInput::Resume, 70).is_empty());
+        assert_eq!(hub.audio_ready_at(&key), None);
+    }
+
+    #[test]
+    fn system_presence_keeps_sample_and_disappearance_expires_once() {
+        use crate::model::Source;
+        let mut hub = hub(&[]);
+        hub.handle(
+            system_reading(Presence::Online, Some(Level::Percent(80)), Source::Os),
+            10,
+        );
+        let asleep = system_reading(Presence::Asleep, None, Source::Push);
+        assert_eq!(hub.handle(asleep, 20), [HubOutput::StateChanged]);
+        let gone = HubInput::SystemGone(dev("bt:synthetic"));
+        assert_eq!(hub.handle(gone.clone(), 30), [HubOutput::StateChanged]);
+        assert!(hub.handle(gone, 50).is_empty());
+        let last = &hub.snapshot()[0];
+        assert_eq!(last.presence, Presence::Offline);
+        assert_eq!(last.level, Some(Level::Percent(80)));
+        assert_eq!((last.source, last.updated_ms), (Source::Os, 10));
+        assert_eq!(hub.next_deadline(), Some(60_030));
+        assert!(hub.handle(HubInput::Tick, 60_029).is_empty());
+        assert_eq!(
+            hub.handle(HubInput::Tick, 60_030),
+            [HubOutput::StateChanged]
+        );
+        assert!(hub.snapshot().is_empty());
     }
 
     #[test]

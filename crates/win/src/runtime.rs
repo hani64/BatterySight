@@ -22,16 +22,19 @@ use batterysight_core::catalog::{Catalog, EngineKind};
 use batterysight_core::engines::Selection;
 use batterysight_core::hid::{CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
-use batterysight_core::model::{DeviceKey, DeviceState};
+use batterysight_core::model::{DeviceKey, DeviceState, Presence};
 use batterysight_core::scheduler::Policy;
 use batterysight_core::time::Ms;
 use windows::Win32::Foundation::E_UNEXPECTED;
 
 use crate::audio::{self, Mta};
 use crate::hid_enum::{self, ContainerId, HidInterface};
-use crate::notify::register_hid_notifications;
+use crate::notify::{
+    RadioNotify, register_bluetooth_interfaces, register_hid_notifications, watch_local_radios,
+};
 use crate::power::register_power;
 use crate::reactor::{FeatureFailure, OsEvent, Poster, Reactor, clock_ms as now_ms};
+use crate::system::bluetooth;
 use crate::trace::{Direction, Trace};
 
 /// How long [`RuntimeHandle::stop`] waits for the device thread to finish.
@@ -149,6 +152,8 @@ fn device_thread(
         }
     };
     let _ = ready.send(Ok(reactor.poster()));
+    let _bluetooth_interfaces = register_bluetooth_interfaces(&reactor.poster());
+    let radios = watch_local_radios(&reactor.poster());
     // Without it no device is read on audio activity; every other trigger still works.
     let _audio = audio::start(reactor.poster())
         .inspect_err(|_| {
@@ -159,6 +164,7 @@ fn device_thread(
         .ok();
     Device {
         hub: Hub::new(Catalog::builtin(), Policy::default()),
+        radios,
         reactor,
         groups: Vec::new(),
         replacements: BTreeSet::new(),
@@ -167,6 +173,8 @@ fn device_thread(
         release_at: None,
         held: BTreeMap::new(),
         audio: AudioActivity::default(),
+        bluetooth: bluetooth::Source::default(),
+        hid_containers: BTreeMap::new(),
         trace: Trace::from_env(),
         states,
         on_change,
@@ -221,6 +229,7 @@ struct Opened {
 /// The device thread's state.
 struct Device {
     hub: Hub,
+    radios: Vec<RadioNotify>,
     reactor: Reactor,
     groups: Vec<Opened>,
     /// Still-present groups closed for a selection change, eligible for one replacement.
@@ -236,6 +245,9 @@ struct Device {
     /// The present groups the reopen cap held back at the last scan, with their release.
     held: BTreeMap<PathSet, Ms>,
     audio: AudioActivity,
+    bluetooth: bluetooth::Source,
+    /// Retain the last HID container during the hub's removal grace for deduplication.
+    hid_containers: BTreeMap<DeviceKey, ContainerId>,
     trace: Option<Trace>,
     states: Arc<Mutex<Vec<DeviceState>>>,
     on_change: Box<dyn Fn() + Send>,
@@ -286,6 +298,7 @@ impl AudioActivity {
 impl Device {
     fn run(mut self, commands: &Receiver<Command>) {
         self.rescan();
+        self.bluetooth.request(now_ms(), false);
         loop {
             let now = now_ms();
             if self
@@ -300,6 +313,9 @@ impl Device {
             }
             if self.activity_deadline().is_some_and(|at| now >= at) {
                 self.check_activity(now, audio::peak);
+            }
+            if self.bluetooth.take_due(now) {
+                self.rescan_bluetooth();
             }
             // May return nothing before the deadline; the loop then checks it again.
             let events = self.reactor.wait(self.deadline(), now_ms());
@@ -316,6 +332,7 @@ impl Device {
                         // A refresh also reopens groups the read-failure guard closed.
                         self.guard.clear();
                         self.rescan();
+                        self.rearm_bluetooth();
                         self.feed(HubInput::RefreshNow, now_ms());
                     }
                     Ok(Command::SetIntervals(gaps)) => {
@@ -414,6 +431,7 @@ impl Device {
                 })
             }
             OsEvent::InterfaceRemoved { path } => {
+                self.bluetooth.request(now_ms(), false);
                 let path = path_key(&path);
                 let awaiting = self.replacements.len();
                 self.replacements.retain(|paths| !paths.contains(&path));
@@ -429,13 +447,26 @@ impl Device {
                 }) || cancelled
             }
             OsEvent::InterfaceArrived => {
+                self.bluetooth.request(now_ms(), true);
                 self.guard.on_arrival(now_ms());
                 true
+            }
+            OsEvent::BluetoothInterface { radio, arrived } => {
+                if radio {
+                    self.rearm_bluetooth();
+                }
+                self.bluetooth.request(now_ms(), arrived);
+                false
+            }
+            OsEvent::BluetoothLink { connected } => {
+                self.bluetooth.request(now_ms(), connected);
+                false
             }
             OsEvent::Resume => {
                 // Handles stay open: a device asleep across the suspend keeps its entry.
                 self.guard.clear();
                 self.rescan();
+                self.rearm_bluetooth();
                 self.feed(HubInput::Resume, now_ms());
                 false
             }
@@ -462,6 +493,33 @@ impl Device {
         self.apply_scan(hid_enum::enumerate(), now_ms());
     }
 
+    fn rearm_bluetooth(&mut self) {
+        self.radios = watch_local_radios(&self.reactor.poster());
+        self.bluetooth.request(now_ms(), false);
+    }
+
+    fn rescan_bluetooth(&mut self) {
+        let scanned = bluetooth::scan();
+        self.apply_bluetooth_scan(scanned, now_ms());
+    }
+
+    fn apply_bluetooth_scan(
+        &mut self,
+        scanned: windows::core::Result<Vec<bluetooth::Observation>>,
+        now: Ms,
+    ) {
+        let mut changed = false;
+        for input in self.bluetooth.reconcile(scanned, now) {
+            changed |= self
+                .hub
+                .handle(input, now)
+                .contains(&HubOutput::StateChanged);
+        }
+        if changed {
+            self.publish();
+        }
+    }
+
     /// When the device thread must next wake: the hub's deadline, a held-back group's
     /// release or an activity check, whichever comes first.
     fn deadline(&self) -> Option<Ms> {
@@ -469,6 +527,7 @@ impl Device {
             self.hub.next_deadline(),
             self.release_at,
             self.activity_deadline(),
+            self.bluetooth.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -789,8 +848,68 @@ impl Device {
             }
         }
         if changed {
-            let snapshot = self.hub.snapshot();
-            *self.states.lock().unwrap_or_else(PoisonError::into_inner) = snapshot;
+            self.publish();
+        }
+    }
+
+    fn publish(&mut self) {
+        let mut snapshot = self.hub.snapshot();
+        // For each cached container, record whether it also has an Online HID
+        // owner (Some(true)), only an inactive HID entry (Some(false)), or neither.
+        let mut cached: BTreeMap<_, _> = snapshot
+            .iter()
+            .filter_map(|state| {
+                Some((bluetooth::container_of(&state.key)?, (state.presence, None)))
+            })
+            .collect();
+        self.hid_containers.retain(|key, _| {
+            snapshot
+                .binary_search_by(|state| state.key.cmp(key))
+                .is_ok()
+        });
+        for state in &snapshot {
+            let owner = self.hub.device_owner(&state.key);
+            if let Some(owner) = owner {
+                if let Some(container) = self
+                    .groups
+                    .iter()
+                    .find(|group| group.id == owner)
+                    .and_then(|group| group.container)
+                {
+                    if let Some(last) = self.hid_containers.get_mut(&state.key) {
+                        *last = container;
+                    } else {
+                        self.hid_containers.insert(state.key.clone(), container);
+                    }
+                } else {
+                    self.hid_containers.remove(&state.key);
+                }
+            }
+            if let Some(container) = self.hid_containers.get(&state.key)
+                && let Some((_, hid)) = cached.get_mut(container)
+            {
+                let live = owner.is_some() && state.presence == Presence::Online;
+                *hid = Some(hid.unwrap_or(false) || live);
+            }
+        }
+        snapshot.retain(|state| {
+            if let Some(container) = bluetooth::container_of(&state.key) {
+                let (_, hid) = cached[&container];
+                hid != Some(true) && (state.presence == Presence::Online || hid.is_none())
+            } else if let Some((presence, hid)) = self
+                .hid_containers
+                .get(&state.key)
+                .and_then(|container| cached.get(container))
+            {
+                *presence != Presence::Online || *hid == Some(true)
+            } else {
+                true
+            }
+        });
+        let mut published = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        if *published != snapshot {
+            *published = snapshot;
+            drop(published);
             (self.on_change)();
         }
     }
@@ -1451,6 +1570,7 @@ mod tests {
     fn device() -> Device {
         Device {
             hub: Hub::new(Catalog::builtin(), Policy::default()),
+            radios: Vec::new(),
             reactor: Reactor::new().unwrap(),
             groups: Vec::new(),
             replacements: BTreeSet::new(),
@@ -1459,6 +1579,8 @@ mod tests {
             release_at: None,
             held: BTreeMap::new(),
             audio: AudioActivity::default(),
+            bluetooth: bluetooth::Source::default(),
+            hid_containers: BTreeMap::new(),
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),
             on_change: Box::new(|| {}),
@@ -1970,6 +2092,55 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
         fn next_deadline(&self) -> Option<Ms> {
             None
         }
+    }
+
+    #[test]
+    fn bluetooth_yields_only_to_live_hid_state_in_its_own_container() {
+        let (mut device, _, _) = audio_device(None);
+        let observation = |container| bluetooth::Observation {
+            container,
+            name: "Cached Bluetooth".into(),
+            kind: batterysight_core::model::DeviceKind::Headset,
+            connected: true,
+            level: Some(72),
+        };
+        // Merely opening an unrelated group cannot hide this cache entry.
+        let empty = [3; 16];
+        device
+            .groups
+            .push(opened_fixture(3, "unregistered", Some(empty)));
+        device.apply_bluetooth_scan(Ok(vec![observation(HEADSET), observation(empty)]), 10);
+        let visible = || bluetooth::key_for(&empty);
+        assert_eq!(
+            device
+                .states
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.key.clone())
+                .collect::<Vec<_>>(),
+            [
+                visible(),
+                DeviceKey("headset".into()),
+                DeviceKey("mouse".into())
+            ],
+        );
+        let index = device
+            .groups
+            .iter()
+            .position(|group| group.id == GroupId(1))
+            .unwrap();
+        device.remove(index);
+        let states = device.states.lock().unwrap();
+        assert_eq!(
+            states.iter().map(|s| s.key.clone()).collect::<Vec<_>>(),
+            [
+                bluetooth::key_for(&HEADSET),
+                visible(),
+                DeviceKey("mouse".into())
+            ],
+        );
+        assert_eq!(states[0].updated_ms, 10);
     }
 
     const HEADSET: ContainerId = [1; 16];

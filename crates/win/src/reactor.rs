@@ -72,6 +72,10 @@ pub enum OsEvent {
     InterfaceArrived,
     /// The HID interface at `path` (NUL-terminated, as in `HidInterface::path`) went away.
     InterfaceRemoved { path: Vec<u16> },
+    /// Local Bluetooth interface changed; radio interfaces also need new handle watches.
+    BluetoothInterface { radio: bool, arrived: bool },
+    /// Local radio's data-link notification, with no peer identifier.
+    BluetoothLink { connected: bool },
     /// The system resumed from sleep.
     Resume,
     /// The render endpoints of `container` got their first active audio session (`active`)
