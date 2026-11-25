@@ -66,6 +66,8 @@ pub struct Settings {
     pub monitors: MonitorChoice,
     pub display: DisplayMode,
     pub autostart: bool,
+    /// Each device's last seen name, so the history can name devices not connected now.
+    pub names: BTreeMap<DeviceKey, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +124,19 @@ impl Settings {
                 let minutes = interval_of(value)
                     .ok_or_else(|| invalid(&format!("intervals.{key}"), INTERVAL_FORM))?;
                 settings.intervals.insert(DeviceKey(key.clone()), minutes);
+            }
+        }
+        if let Some(value) = table.get("names") {
+            let Value::Table(entries) = value else {
+                return Err(invalid("names", "expected a table of device keys"));
+            };
+            for (key, value) in entries {
+                let name = value
+                    .as_str()
+                    .ok_or_else(|| invalid(&format!("names.{key}"), "expected a string"))?;
+                settings
+                    .names
+                    .insert(DeviceKey(key.clone()), name.to_owned());
             }
         }
         if let Some(value) = table.get("monitors") {
@@ -193,6 +208,10 @@ impl Settings {
             let minutes = (*minutes).clamp(1, INTERVAL_MAX_MIN);
             let _ = writeln!(out, "{} = {minutes}", quote(&key.0));
         }
+        out.push_str("\n# names: each device's last seen name, for the battery history\n[names]\n");
+        for (key, name) in &self.names {
+            let _ = writeln!(out, "{} = {}", quote(&key.0), quote(name));
+        }
         out
     }
 
@@ -214,6 +233,25 @@ impl Settings {
     pub fn set_interval(&mut self, key: &DeviceKey, minutes: u16) {
         self.intervals
             .insert(key.clone(), minutes.clamp(1, INTERVAL_MAX_MIN));
+    }
+
+    /// Remembers the names of `states`; whether any was new or changed (and so needs saving).
+    pub fn remember_names(&mut self, states: &[DeviceState]) -> bool {
+        let mut changed = false;
+        for s in states {
+            if self.names.get(&s.key) != Some(&s.name) {
+                self.names.insert(s.key.clone(), s.name.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Forgets the names of devices for which `keep` is false; whether any was removed.
+    pub fn forget_names(&mut self, keep: impl Fn(&DeviceKey) -> bool) -> bool {
+        let before = self.names.len();
+        self.names.retain(|key, _| keep(key));
+        self.names.len() != before
     }
 
     /// Every poll interval in milliseconds, as the scheduler takes them.
@@ -357,6 +395,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::Generic,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 
@@ -384,6 +423,14 @@ mod tests {
             monitors: MonitorChoice::Named(r"\\.\DISPLAY2".into()),
             display: DisplayMode::Tray,
             autostart: true,
+            names: [
+                (key("bt:0000000000000000000000000000000A"), "Buds".into()),
+                (key("pad:wgi:1"), "Pad \"one\" \\ ünï".into()),
+                (key("ctl"), "a\nb\t\u{1}\u{7f}\"'''".into()),
+                (key("long"), "x".repeat(10_000)),
+            ]
+            .into_iter()
+            .collect(),
         };
         let text = settings.to_toml();
         assert_eq!(Settings::from_toml(&text), Ok(settings), "{text}");
@@ -428,8 +475,49 @@ mod tests {
         );
         assert_eq!(settings.display, DisplayMode::Tray);
         assert!(settings.autostart);
+        // A file from before names were kept.
+        assert!(settings.names.is_empty());
 
         assert_eq!(Settings::from_toml(""), Ok(Settings::default()));
+    }
+
+    #[test]
+    fn names_are_remembered_only_when_new_or_changed() {
+        let mut settings = Settings::default();
+        let mut buds = state("bt:0000000000000000000000000000000A");
+        buds.name = "Galaxy Buds2".into();
+        let pad = state("pad:wgi:1");
+        assert!(settings.remember_names(&[buds.clone(), pad.clone()]));
+        assert_eq!(settings.names[&buds.key], "Galaxy Buds2");
+        // Unchanged: nothing to write.
+        assert!(!settings.remember_names(&[buds.clone(), pad.clone()]));
+        assert!(!settings.remember_names(&[]));
+        buds.name = "My Buds".into();
+        assert!(settings.remember_names(&[buds.clone()]));
+        assert_eq!(settings.names[&buds.key], "My Buds");
+        assert_eq!(settings.names[&pad.key], "pad:wgi:1");
+    }
+
+    #[test]
+    fn names_without_a_device_or_history_are_forgotten() {
+        let mut settings = Settings::default();
+        for k in ["now", "kept", "gone"] {
+            settings.names.insert(key(k), k.to_uppercase());
+        }
+        let keep = |k: &DeviceKey| k.0 == "now" || k.0 == "kept";
+        assert!(settings.forget_names(keep));
+        assert_eq!(
+            settings.names.keys().cloned().collect::<Vec<_>>(),
+            keys(&["kept", "now"])
+        );
+        // Nothing left to remove: nothing to write.
+        assert!(!settings.forget_names(keep));
+    }
+
+    #[test]
+    fn names_must_be_strings() {
+        assert!(Settings::from_toml("[names]\na = 3\n").is_err());
+        assert!(Settings::from_toml("names = 3\n").is_err());
     }
 
     #[test]

@@ -1,26 +1,56 @@
 //! Overlapped HID handles and the operations queued on them.
 //!
-//! An [`Op`] is one overlapped `ReadFile` or `WriteFile` with its own buffer. While the kernel
+//! An [`Op`] is one overlapped read, write or feature control with its own buffer. While the kernel
 //! owns it, it lives as a raw pointer: the `OVERLAPPED` pointer handed to the call is the
 //! pointer to the whole `Op`. The completion port returns that pointer and
 //! [`Op::from_completion`] makes it a `Box` again, so an `Op` is freed only after its
 //! completion packet has been dequeued.
 
+#[cfg(test)]
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::slice;
 
 use batterysight_core::hid::CollectionId;
+use windows::Wdk::System::IO::NtDeviceIoControlFile;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ,
-    GENERIC_WRITE, HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, RtlNtStatusToDosError, STATUS_PENDING, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
     WriteFile,
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+#[cfg(test)]
+use windows::Win32::{
+    Foundation::NTSTATUS,
+    System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE},
+};
 use windows::core::PCWSTR;
 
 use crate::hid_enum::OwnedHandle;
+
+// hidclass.h: CTL_CODE(FILE_DEVICE_KEYBOARD, 100, METHOD_*_DIRECT, FILE_ANY_ACCESS).
+const IOCTL_HID_SET_FEATURE: u32 = (0x0B << 16) | (100 << 2) | 1; // METHOD_IN_DIRECT
+const IOCTL_HID_GET_FEATURE: u32 = (0x0B << 16) | (100 << 2) | 2; // METHOD_OUT_DIRECT
+
+#[cfg(test)]
+pub(crate) type FeatureControl = unsafe fn(
+    HANDLE,
+    Option<HANDLE>,
+    PIO_APC_ROUTINE,
+    Option<*const c_void>,
+    *mut IO_STATUS_BLOCK,
+    u32,
+    Option<*const c_void>,
+    u32,
+    Option<*mut c_void>,
+    u32,
+) -> NTSTATUS;
+
+#[cfg(test)]
+pub(crate) const FEATURE_CONTROL: FeatureControl = NtDeviceIoControlFile;
 
 /// Whether Windows holds the collection exclusively: mouse (0x01/0x02) and keyboard
 /// (0x01/0x06) collections of the generic desktop page. HID++ uses the vendor collections.
@@ -28,30 +58,25 @@ pub(crate) fn is_exclusive(usage_page: u16, usage: u16) -> bool {
     usage_page == 0x01 && matches!(usage, 0x02 | 0x06)
 }
 
-/// Opens a collection for overlapped I/O, shared read/write, never exclusively.
-///
-/// Asks for read and write access, and for read access alone when that is denied. Returns the
-/// handle and whether it is writable. A `path` that is not NUL-terminated is refused with
-/// `ERROR_INVALID_PARAMETER`.
-pub(crate) fn open(path: &[u16]) -> windows::core::Result<(OwnedHandle, bool)> {
+/// Whether the collection is vendor-defined (usage page 0xFF00-0xFFFF), never a system
+/// keyboard, mouse, gamepad or consumer-control collection.
+pub(crate) fn is_vendor(usage_page: u16) -> bool {
+    usage_page >= 0xFF00
+}
+
+/// Opens a collection with the selected access rights, shared read/write, never exclusively.
+/// A path that is not NUL-terminated is refused with `ERROR_INVALID_PARAMETER`.
+pub(crate) fn open(path: &[u16], read: bool, write: bool) -> windows::core::Result<OwnedHandle> {
     if path.last() != Some(&0) {
         return Err(ERROR_INVALID_PARAMETER.into());
     }
-    match create(path, GENERIC_READ.0 | GENERIC_WRITE.0) {
-        Ok(handle) => Ok((handle, true)),
-        Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {
-            Ok((create(path, GENERIC_READ.0)?, false))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn create(path: &[u16], access: u32) -> windows::core::Result<OwnedHandle> {
+    let read = if read { GENERIC_READ.0 } else { 0 };
+    let write = if write { GENERIC_WRITE.0 } else { 0 };
     // SAFETY: `path` is NUL-terminated and outlives the call.
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
-            access,
+            read | write,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -78,9 +103,11 @@ pub(crate) fn padded(bytes: &[u8], len: usize) -> Option<Vec<u8>> {
 pub(crate) enum Kind {
     Read,
     Write,
+    SetFeature,
+    GetFeature { report_id: u8 },
 }
 
-/// One overlapped read or write and the buffer it fills or sends.
+/// One overlapped operation and the buffer it fills or sends.
 #[repr(C)]
 pub(crate) struct Op {
     /// First field, so a pointer to it is a pointer to the `Op`.
@@ -102,49 +129,123 @@ impl Op {
 
     /// Starts the operation on `handle`, which must be associated with a completion port.
     ///
-    /// Returns `true` when a completion packet will be queued: the operation is pending, or
-    /// already complete with success or a warning status (see [`queues_completion`]). The
-    /// `Op` then belongs to the kernel until [`Op::from_completion`] takes it back, and the
-    /// outcome comes from [`Op::result`]. Returns `false` when the call failed at once with an
-    /// error status; no packet is queued then and the `Op` is freed here.
-    pub(crate) fn start(mut self: Box<Self>, handle: HANDLE) -> bool {
-        self.overlapped = OVERLAPPED::default();
-        let len = self.buffer.len();
-        let op = Box::into_raw(self);
-        // SAFETY: `op` stays allocated until its completion is dequeued, or until it is freed
-        // below when no completion will come. Nothing else touches its buffer meanwhile.
-        let result = unsafe {
-            let overlapped = &raw mut (*op).overlapped;
-            let buffer = (*op).buffer.as_mut_ptr();
-            match (*op).kind {
-                Kind::Read => ReadFile(
-                    handle,
-                    Some(slice::from_raw_parts_mut(buffer, len)),
-                    None,
-                    Some(overlapped),
-                ),
-                Kind::Write => WriteFile(
-                    handle,
-                    Some(slice::from_raw_parts(buffer, len)),
-                    None,
-                    Some(overlapped),
-                ),
+    /// Reports whether a completion packet will be queued.
+    pub(crate) fn start(self: Box<Self>, handle: HANDLE) -> bool {
+        self.submit(|kind, buffer, len, overlapped| {
+            // SAFETY: `submit` gives Windows the buffer and OVERLAPPED until dequeue.
+            let result = unsafe {
+                match kind {
+                    Kind::Read => ReadFile(
+                        handle,
+                        Some(slice::from_raw_parts_mut(buffer, len)),
+                        None,
+                        Some(overlapped),
+                    ),
+                    Kind::Write => WriteFile(
+                        handle,
+                        Some(slice::from_raw_parts(buffer, len)),
+                        None,
+                        Some(overlapped),
+                    ),
+                    _ => unreachable!("feature controls use start_feature"),
+                }
+            };
+            if queues_completion(&result) {
+                Ok(())
+            } else {
+                result
             }
+        })
+        .is_ok()
+    }
+
+    /// Starts a GET or SET control and returns its OVERLAPPED for targeted cancellation.
+    pub(crate) fn start_feature(
+        self: Box<Self>,
+        handle: HANDLE,
+        #[cfg(test)] control: FeatureControl,
+    ) -> windows::core::Result<NonNull<OVERLAPPED>> {
+        #[cfg(not(test))]
+        let control = NtDeviceIoControlFile;
+        self.submit(|kind, buffer, len, overlapped| {
+            let len = len as u32; // HID report widths come from the u16 descriptor lengths.
+            let (code, input, input_len, output, output_len) = match kind {
+                Kind::SetFeature => (
+                    IOCTL_HID_SET_FEATURE,
+                    Some(buffer.cast_const().cast()),
+                    len,
+                    None,
+                    0,
+                ),
+                Kind::GetFeature { .. } => {
+                    (IOCTL_HID_GET_FEATURE, None, 0, Some(buffer.cast()), len)
+                }
+                _ => unreachable!("read and write use start"),
+            };
+            // SAFETY: the IO_STATUS_BLOCK is the two pointer-sized fields at the start
+            // of OVERLAPPED. Use the same address as the IOCP completion context.
+            // `submit` keeps this storage and the buffers alive until dequeue.
+            let status = unsafe {
+                (*overlapped).Internal = STATUS_PENDING.0 as usize;
+                control(
+                    handle,
+                    None,
+                    None,
+                    Some(overlapped.cast_const().cast()),
+                    overlapped.cast(),
+                    code,
+                    input,
+                    input_len,
+                    output,
+                    output_len,
+                )
+            };
+            // NT_ERROR tests the two severity bits. A synchronous warning still queues
+            // a packet; Win32's last error can lose that distinction.
+            if status.0.cast_unsigned() >> 30 == 3 {
+                // SAFETY: this translates a status value and takes no pointers.
+                let error = unsafe { RtlNtStatusToDosError(status) };
+                Err(WIN32_ERROR(error).into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// `issue` returns `Ok` when a packet is expected. An immediate error returns ownership
+    /// here without a packet; otherwise the allocation stays alive until dequeue.
+    fn submit(
+        mut self: Box<Self>,
+        issue: impl FnOnce(Kind, *mut u8, usize, *mut OVERLAPPED) -> windows::core::Result<()>,
+    ) -> windows::core::Result<NonNull<OVERLAPPED>> {
+        self.overlapped = OVERLAPPED::default();
+        let op = Box::into_raw(self);
+        let overlapped = op.cast::<OVERLAPPED>();
+        // SAFETY: the allocation is stable. No one else accesses it before submission;
+        // afterward the kernel owns it while a completion packet is expected.
+        let result = unsafe {
+            issue(
+                (*op).kind,
+                (*op).buffer.as_mut_ptr(),
+                (*op).buffer.len(),
+                overlapped,
+            )
         };
-        if queues_completion(&result) {
-            return true;
+        match result {
+            Ok(()) => Ok(NonNull::new(overlapped).expect("Box yields a non-null pointer")),
+            Err(error) => {
+                // SAFETY: without a packet, the kernel kept no references to the allocation.
+                drop(unsafe { Box::from_raw(op) });
+                Err(error)
+            }
         }
-        // SAFETY: the call failed with an error status (not a warning), so no completion
-        // packet will be queued and the kernel kept no reference.
-        drop(unsafe { Box::from_raw(op) });
-        false
     }
 
     /// Takes back an `Op` whose completion packet was dequeued.
     ///
     /// # Safety
-    /// `overlapped` must come from a completion packet for an `Op` passed to [`Op::start`],
-    /// and each packet may be taken back only once.
+    /// `overlapped` must come from a completion packet for a submitted `Op`, and each packet
+    /// may be taken back only once.
     pub(crate) unsafe fn from_completion(overlapped: *mut OVERLAPPED) -> Box<Op> {
         // SAFETY: per the contract, the pointer is a leaked `Box<Op>`; `overlapped` is its
         // first field of a `repr(C)` struct.
@@ -161,11 +262,8 @@ impl Op {
     }
 }
 
-/// Whether a just-issued overlapped `ReadFile`/`WriteFile` will queue a completion packet.
-///
-/// The I/O manager queues one unless the request failed with an error status. Success,
-/// pending, and a warning status all queue one; for example, `STATUS_BUFFER_OVERFLOW`
-/// surfaces as `ERROR_MORE_DATA`.
+/// Whether a just-issued Win32 `ReadFile` or `WriteFile` queues a completion packet.
+/// `ERROR_MORE_DATA` is the buffer overflow warning on this path.
 fn queues_completion(result: &windows::core::Result<()>) -> bool {
     match result {
         Ok(()) => true,
@@ -179,7 +277,7 @@ fn queues_completion(result: &windows::core::Result<()>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED};
 
     #[test]
     fn only_mouse_and_keyboard_are_exclusive() {
@@ -188,6 +286,15 @@ mod tests {
         assert!(!is_exclusive(0x01, 0x05));
         assert!(!is_exclusive(0x0C, 0x01));
         assert!(!is_exclusive(0xFF00, 0x02));
+    }
+
+    #[test]
+    fn only_vendor_pages_are_vendor() {
+        assert!(is_vendor(0xFF00));
+        assert!(is_vendor(0xFFC0));
+        assert!(!is_vendor(0x0001));
+        assert!(!is_vendor(0x000C));
+        assert!(!is_vendor(0xFEFF));
     }
 
     #[test]

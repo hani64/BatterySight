@@ -1,0 +1,66 @@
+# One vendor collection carries both reads and output. Widths are Windows HID
+# widths including the numbered report ID. Do not try alternate widths or writes.
+
+# Windows 05B7 event capture: https://github.com/davidsantanaalves/HyperBatteryMonitor/issues/13
+# Windows 0FCC selector/exchange: https://github.com/HeyOkay/HaloBattery/issues/435
+[[device]]
+name = "HyperX Cloud III Wireless"
+vid = 0x03F0
+pids = [0x05B7, 0x0C9D, 0x0FCC]
+kind = "headset"
+engine = "hyperx"
+status = "source-verified"
+source = "HyperBatteryMonitor #13 (05B7 Windows input and pushes); auto94 MainForm.cpp (usage); HyperHeadset cloud_iii_wireless.rs (05B7/0C9D, 62-byte output); HaloBattery protocols.md and #435/#436 (0FCC Windows collection, exchange)"
+send = { usage_page = 0xFF13, usage = 1, interface = 3, input_len = 62, output_len = 62 }
+hyperx = "hx66"
+
+# NGENUITY capture (attachment) and analysis: https://github.com/HeyOkay/HaloBattery/issues/155
+[[device]]
+name = "HyperX Cloud II Core Wireless"
+vid = 0x03F0
+pids = [0x0995]
+kind = "headset"
+engine = "hyperx"
+status = "source-verified"
+source = "HaloBattery #155/#177 (62-byte NGENUITY output / 66 measurement); HyperHeadset #11 and HyperBatteryMonitor Cloud2CoreWirelessDevice.cs (push)"
+send = { usage_page = 0xFF13, usage = 1, interface = 3, input_len = 62, output_len = 62 }
+hyperx = "hx66"
+
+# Interleaved 25 push and query replies: https://github.com/LennardKittner/HyperHeadset/issues/26
+[[device]]
+name = "HyperX Cloud Alpha Wireless"
+vid = 0x03F0
+pids = [0x098D]
+kind = "headset"
+engine = "hyperx"
+status = "source-verified"
+source = "HaloBattery #220/#318 (Windows HID caps/collection); HeadsetControl hyperx_cloud_alpha_wireless.hpp (31-byte output); HyperHeadset cloud_alpha_wireless.rs and #26 (selectors and offsets)"
+send = { usage_page = 0xFF43, usage = 0x0202, interface = 3, input_len = 31, output_len = 31 }
+hyperx = "alpha21bb"
+
+# Windows HID descriptor/captures: https://github.com/HeyOkay/HaloBattery/issues/26
+[[device]]
+name = "HyperX Cloud Alpha 2 Wireless"
+vid = 0x03F0
+pids = [0x08BE]
+kind = "headset"
+engine = "hyperx"
+status = "source-verified"
+source = "HaloBattery #26 (Windows FF13:FF00 MI_02 descriptor and battery exchange); HeadsetControl hyperx_cloud_alpha_2_wireless.hpp (FB 0A link events)"
+send = { usage_page = 0xFF13, usage = 0xFF00, interface = 2, input_len = 64, output_len = 64 }
+hyperx = "universal"
+quirks = { query_wakes = true }
+
+# NGENUITY USB capture and HID descriptor: https://github.com/PMarinov1994/ngenuity-linux-cli
+# Native Windows collection: https://github.com/NahuelGenchi/lares/pull/85
+[[device]]
+name = "HyperX Pulsefire Haste 2 Wireless"
+vid = 0x03F0
+pids = [0x0F98]
+kind = "mouse"
+engine = "hyperx"
+status = "source-verified"
+source = "lares #85 (Windows 0F98 64-byte collection); ngenuity-linux-cli Haste 2 startup-battery-sleep-wake USB capture (descriptor, target-zero exchange and FB 0A edges)"
+send = { usage_page = 0xFF00, usage = 1, interface = 2, input_len = 64, output_len = 64 }
+hyperx = "universal"
+quirks = { query_wakes = true }

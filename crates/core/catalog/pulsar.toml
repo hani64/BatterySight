@@ -1,0 +1,36 @@
+# SONiX control uses MI_03 / FFFF:0001, 64 wire bytes plus Windows' ID slot.
+# Fusion2 events use MI_01 / Input Report ID 05. No fixed Windows RX usage or
+# length is published; the engine checks cached descriptor caps for the ID.
+# The cable PIDs and other 3710 protocols are intentionally not admitted here.
+
+[[device]]
+name = "Pulsar Fusion2 1K Dongle"
+vid = 0x3710
+pids = [0x5402]
+kind = "mouse"
+engine = "sonix"
+status = "source-verified"
+source = "pulsar-mouse-linux xlite_v4_wireless.py and #21/#28: X3 with 1K receiver, Fusion2 Windows USBPcap and live link/battery traces; research sections 3 and 8"
+receive = { interface = 1 }
+send = { interface = 3, usage_page = 0xFFFF, usage = 0x0001, feature_len = 65 }
+
+[[device]]
+name = "Pulsar Fusion2 8K Dongle"
+vid = 0x3710
+pids = [0x5403]
+kind = "mouse"
+engine = "sonix"
+status = "source-verified"
+source = "pulsar-mouse-linux fusion2_8k_dongle.py and xlite_v4_wireless.py: X3 LHD link edges and shared framing; HaloBattery #213: X2 V3 Mini 65-byte Windows battery exchange"
+receive = { interface = 1 }
+send = { interface = 3, usage_page = 0xFFFF, usage = 0x0001, feature_len = 65 }
+
+[[device]]
+name = "Pulsar Feinmann 8K Dongle"
+vid = 0x3710
+pids = [0x5404]
+kind = "mouse"
+engine = "sonix"
+status = "source-verified"
+source = "pulsar-mouse-linux feinmann8k.py: MI_03 Windows Fusion USBPcap and hardware battery reads; MI_01 signal quality but no verified link edges or battery pushes"
+send = { interface = 3, usage_page = 0xFFFF, usage = 0x0001, feature_len = 65 }

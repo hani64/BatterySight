@@ -6,9 +6,11 @@
 //! for a HID++ 1.0 one. [`advance`] decides the next step from a reply without
 //! touching engine state.
 
+use crate::engine::{HidppFeatureParams, HidppRegisterParams, HidppTarget, WriteRule};
+use crate::hid::CollectionRole;
 use crate::model::DeviceKind;
 
-use super::frame::{self, Reply};
+use super::frame::{self, Reply, ReplyAddress};
 
 // HID++ 1.0 registers and notification flags. Source: Solaar `hidpp10_constants.py`
 // (`Registers`, `NotificationFlag`).
@@ -51,6 +53,87 @@ const NAME_FEATURE: usize = 0;
 const UNIT_FEATURE: usize = 1;
 const FIRST_BATTERY_FEATURE: usize = 2;
 
+pub(super) const COMMAND: CollectionRole = CollectionRole(0);
+
+// Only the calls made by `request` and `Decoder::read`, not all documented HID++ calls.
+pub(super) const WRITE_RULES: &[WriteRule] = &[
+    feature_rule(0, 1, HidppFeatureParams::Exact([0, 0, PING_MARK])),
+    feature_rule(0, 0, HidppFeatureParams::RootLookup(&FEATURES)),
+    feature_read(0x0005, 0),
+    feature_rule(0x0005, 1, HidppFeatureParams::NameOffset),
+    feature_read(0x0005, 2),
+    feature_read(0x0003, 0),
+    feature_read(0x1004, 1),
+    feature_read(0x1000, 0),
+    feature_read(0x1001, 0),
+    feature_read(0x1F20, 0),
+    register_read(HidppTarget::Receiver, REG_NOTIFICATIONS),
+    register_read(HidppTarget::Device, REG_NOTIFICATIONS),
+    register_read(HidppTarget::Device, REG_BATTERY_STATUS),
+    register_read(HidppTarget::Device, REG_BATTERY_CHARGE),
+    register_rule(
+        HidppTarget::Receiver,
+        SET_REGISTER,
+        REG_NOTIFICATIONS,
+        HidppRegisterParams::EnableNotification {
+            byte: 1,
+            mask: WIRELESS_NOTIFICATIONS,
+        },
+    ),
+    register_rule(
+        HidppTarget::Device,
+        SET_REGISTER,
+        REG_NOTIFICATIONS,
+        HidppRegisterParams::EnableNotification {
+            byte: 0,
+            mask: BATTERY_NOTIFICATIONS,
+        },
+    ),
+    register_rule(
+        HidppTarget::Receiver,
+        SET_REGISTER,
+        REG_RECEIVER_CONNECTION,
+        HidppRegisterParams::Exact([NOTIFY_DEVICES, 0, 0]),
+    ),
+];
+
+const fn feature_rule(feature: u16, function: u8, params: HidppFeatureParams) -> WriteRule {
+    WriteRule::HidppFeature {
+        role: COMMAND,
+        feature,
+        function,
+        params,
+    }
+}
+
+const fn feature_read(feature: u16, function: u8) -> WriteRule {
+    feature_rule(feature, function, HidppFeatureParams::Exact([0; 3]))
+}
+
+const fn register_rule(
+    target: HidppTarget,
+    sub_id: u8,
+    address: u8,
+    params: HidppRegisterParams,
+) -> WriteRule {
+    WriteRule::HidppRegister {
+        role: COMMAND,
+        target,
+        sub_id,
+        address,
+        params,
+    }
+}
+
+const fn register_read(target: HidppTarget, address: u8) -> WriteRule {
+    register_rule(
+        target,
+        GET_REGISTER,
+        address,
+        HidppRegisterParams::Exact([0; 3]),
+    )
+}
+
 /// How a device reports its battery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Decoder {
@@ -76,6 +159,16 @@ impl Decoder {
             0x1000 => Self::LevelStatus,
             0x1001 => Self::Voltage,
             _ => Self::Adc,
+        }
+    }
+
+    pub(super) fn feature_id(self) -> Option<u16> {
+        match self {
+            Self::Unified => Some(0x1004),
+            Self::LevelStatus => Some(0x1000),
+            Self::Voltage => Some(0x1001),
+            Self::Adc => Some(0x1F20),
+            Self::Reg0D | Self::Reg07 => None,
         }
     }
 
@@ -146,12 +239,12 @@ impl Request {
         }
     }
 
-    pub(super) fn reply(self, bytes: &[u8], index: u8) -> Reply<'_> {
+    pub(super) fn reply(self, bytes: &[u8], from: ReplyAddress) -> Reply<'_> {
         match self {
-            Self::Feature { fi, function, .. } => frame::match_fap(bytes, index, fi, function),
+            Self::Feature { fi, function, .. } => frame::match_fap(bytes, from, fi, function),
             Self::Register {
                 sub_id, address, ..
-            } => frame::match_register(bytes, index, sub_id, address),
+            } => frame::match_register(bytes, from, sub_id, address),
         }
     }
 }
@@ -161,6 +254,7 @@ impl Request {
 pub(super) enum Step {
     /// Receiver register 0x00 read, then written with the wireless flag added.
     GetNotifications,
+    /// Holds the receiver's matched read before changing its flags.
     SetNotifications([u8; 3]),
     /// Receiver register 0x02 written with 0x02: report every paired slot with a 0x41.
     NotifyDevices,
@@ -173,6 +267,7 @@ pub(super) enum Step {
     UnitId,
     /// HID++ 1.0 device register 0x00 read, then written with the battery flag added.
     GetReg00,
+    /// Holds the device's matched read before changing its flags.
     SetReg00([u8; 3]),
     /// First battery read of a device being discovered.
     Battery,
@@ -180,11 +275,16 @@ pub(super) enum Step {
     Read,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct IdentityFeatures {
+    name: u8,
+    unit: u8,
+}
+
 /// What discovery has learned about a device so far.
 #[derive(Debug, Default)]
 pub(super) struct Found {
-    name_fi: u8,
-    unit_fi: u8,
+    pub(super) identity: IdentityFeatures,
     pub(super) battery: Option<(Decoder, u8)>,
     name_len: usize,
     pub(super) name: Vec<u8>,
@@ -192,9 +292,29 @@ pub(super) struct Found {
     pub(super) unit: u32,
 }
 
+impl IdentityFeatures {
+    pub(super) fn resolve(self, index: u8, battery: Option<(Decoder, u8)>) -> Option<u16> {
+        let mut features = [
+            Some((self.name, FEATURES[NAME_FEATURE])),
+            Some((self.unit, FEATURES[UNIT_FEATURE])),
+            battery.and_then(|(decoder, fi)| Some((fi, decoder.feature_id()?))),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|(fi, feature)| (fi == index).then_some(feature));
+        let feature = features.next()?;
+        // A device cannot resolve two distinct features at one index.
+        features.next().is_none().then_some(feature)
+    }
+}
+
 impl Found {
+    pub(super) fn name_offset(&self) -> Option<u8> {
+        u8::try_from(self.name.len()).ok()
+    }
+
     fn after_features(&self) -> Step {
-        if self.name_fi != 0 {
+        if self.identity.name != 0 {
             Step::NameLength
         } else {
             self.after_kind()
@@ -202,7 +322,7 @@ impl Found {
     }
 
     fn after_kind(&self) -> Step {
-        if self.unit_fi != 0 {
+        if self.identity.unit != 0 {
             Step::UnitId
         } else {
             Step::Battery
@@ -232,29 +352,33 @@ fn device_kind(t: u8) -> DeviceKind {
     }
 }
 
-/// The first three bytes of `p`, zero-padded.
-fn first3(p: &[u8]) -> [u8; 3] {
-    let mut out = [0; 3];
-    let n = p.len().min(3);
-    out[..n].copy_from_slice(&p[..n]);
-    out
+fn enable_flag(mut read: [u8; 3], byte: usize, mask: u8) -> [u8; 3] {
+    read[byte] |= mask;
+    read
 }
 
 /// The request for discovery `step`; `None` for [`Step::Read`] or a step `f` cannot serve.
 pub(super) fn request(step: Step, f: &Found) -> Option<Request> {
     Some(match step {
         Step::GetNotifications | Step::GetReg00 => Request::get(REG_NOTIFICATIONS),
-        Step::SetNotifications(p) | Step::SetReg00(p) => Request::set(REG_NOTIFICATIONS, p),
+        Step::SetNotifications(read) => Request::set(
+            REG_NOTIFICATIONS,
+            enable_flag(read, 1, WIRELESS_NOTIFICATIONS),
+        ),
+        Step::SetReg00(read) => Request::set(
+            REG_NOTIFICATIONS,
+            enable_flag(read, 0, BATTERY_NOTIFICATIONS),
+        ),
         Step::NotifyDevices => Request::set(REG_RECEIVER_CONNECTION, [NOTIFY_DEVICES, 0, 0]),
         Step::Ping => Request::feature(0, 1, [0, 0, PING_MARK]),
         Step::Feature(i) => {
             let [hi, lo] = FEATURES[i].to_be_bytes();
             Request::feature(0, 0, [hi, lo, 0])
         }
-        Step::NameLength => Request::feature(f.name_fi, 0, [0; 3]),
-        Step::Name => Request::feature(f.name_fi, 1, [u8::try_from(f.name.len()).ok()?, 0, 0]),
-        Step::Kind => Request::feature(f.name_fi, 2, [0; 3]),
-        Step::UnitId => Request::feature(f.unit_fi, 0, [0; 3]),
+        Step::NameLength => Request::feature(f.identity.name, 0, [0; 3]),
+        Step::Name => Request::feature(f.identity.name, 1, [f.name_offset()?, 0, 0]),
+        Step::Kind => Request::feature(f.identity.name, 2, [0; 3]),
+        Step::UnitId => Request::feature(f.identity.unit, 0, [0; 3]),
         Step::Battery => {
             let (decoder, fi) = f.battery?;
             decoder.read(fi)
@@ -273,10 +397,8 @@ pub(super) fn advance<'a>(step: Step, f: &mut Found, reply: Reply<'a>) -> Next<'
     match step {
         Step::GetNotifications => match reply {
             // Only add the wireless flag; leave every other bit as it is.
-            Reply::Ok(p) if p.get(1).is_some_and(|b| b & WIRELESS_NOTIFICATIONS == 0) => {
-                let mut flags = first3(p);
-                flags[1] |= WIRELESS_NOTIFICATIONS;
-                Next::Ask(Step::SetNotifications(flags))
+            Reply::Ok(&[a, b, c, ..]) if b & WIRELESS_NOTIFICATIONS == 0 => {
+                Next::Ask(Step::SetNotifications([a, b, c]))
             }
             // Already on, or refused.
             _ => Next::Done,
@@ -300,11 +422,11 @@ pub(super) fn advance<'a>(step: Step, f: &mut Found, reply: Reply<'a>) -> Next<'
             };
             match i {
                 NAME_FEATURE => {
-                    f.name_fi = fi;
+                    f.identity.name = fi;
                     Next::Ask(Step::Feature(UNIT_FEATURE))
                 }
                 UNIT_FEATURE => {
-                    f.unit_fi = fi;
+                    f.identity.unit = fi;
                     Next::Ask(Step::Feature(FIRST_BATTERY_FEATURE))
                 }
                 _ if fi != 0 => {
@@ -348,10 +470,8 @@ pub(super) fn advance<'a>(step: Step, f: &mut Found, reply: Reply<'a>) -> Next<'
         }
         Step::GetReg00 => match reply {
             // Only add the battery flag; leave every other bit as it is.
-            Reply::Ok(p) if p.first().is_some_and(|b| b & BATTERY_NOTIFICATIONS == 0) => {
-                let mut flags = first3(p);
-                flags[0] |= BATTERY_NOTIFICATIONS;
-                Next::Ask(Step::SetReg00(flags))
+            Reply::Ok(&[a, b, c, ..]) if a & BATTERY_NOTIFICATIONS == 0 => {
+                Next::Ask(Step::SetReg00([a, b, c]))
             }
             _ => Next::Ask(Step::Battery),
         },

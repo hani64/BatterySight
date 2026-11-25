@@ -420,6 +420,7 @@ pub(super) mod tests {
             source: Source::Query,
             verification: Verification::HardwareTested,
             poll_min_ms: None,
+            reports_changes: false,
         };
         let states = [state("A"), state("B")];
         let mut settings = Settings::default();

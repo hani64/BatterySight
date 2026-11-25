@@ -11,6 +11,10 @@
 //! again and `"<unix ms> open failed <paths>"` when none of a group's HID++ collections
 //! open, and `"<unix ms> discovery <group key> failed, retry at <unix ms>"` or
 //! `"<unix ms> discovery <group key> gave up"` when a group's discovery was cut short.
+//! A refused request is logged as `"<unix ms> refused write <kind> <collection id> <reason>"`;
+//! this line contains no report bytes, paths, or device identity.
+//! Feature records use `feature-set`, `feature-get` and `feature-reply` in place of `out`
+//! and `in`. A feature failure records kind, collection and reason, not the report bytes.
 //! The UI adds `"<unix ms> ui <text>"` lines ([`ui_line`]) and the settings and history
 //! store `"<unix ms> store <text>"` lines when a file cannot be read or written or is set
 //! aside. Tracing only records what the runtime already does, so it adds no device
@@ -25,10 +29,12 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use batterysight_core::hid::CollectionId;
+use batterysight_core::hid::{CollectionId, ReportKind};
+use batterysight_core::hub::WriteRefusal;
 use batterysight_core::model::DeviceKey;
 
 use crate::hid_enum::{ContainerId, container_hex};
+use crate::reactor::FeatureFailure;
 
 /// The open trace file: the device thread's, held for the runtime's life, or one opened
 /// for a single [`ui_line`].
@@ -54,6 +60,35 @@ impl Trace {
     pub(crate) fn record(&mut self, direction: Direction, collection: CollectionId, bytes: &[u8]) {
         let mut text = line(unix_ms(), direction, collection, bytes);
         text.push('\n');
+        let _ = self.0.write_all(text.as_bytes());
+    }
+
+    /// Appends only the typed refusal metadata, never the request data.
+    pub(crate) fn write_refused(
+        &mut self,
+        kind: ReportKind,
+        collection: CollectionId,
+        reason: WriteRefusal,
+    ) {
+        let text = format!(
+            "{} refused write {kind:?} {} {reason:?}\n",
+            unix_ms(),
+            collection.0,
+        );
+        let _ = self.0.write_all(text.as_bytes());
+    }
+
+    pub(crate) fn feature_failed(
+        &mut self,
+        collection: CollectionId,
+        kind: ReportKind,
+        reason: FeatureFailure,
+    ) {
+        let text = format!(
+            "{} feature failed {kind:?} {} {reason:?}\n",
+            unix_ms(),
+            collection.0,
+        );
         let _ = self.0.write_all(text.as_bytes());
     }
 
@@ -149,6 +184,9 @@ pub(crate) enum Direction {
     Out,
     /// An input report as read.
     In,
+    FeatureSet,
+    FeatureGet,
+    FeatureReply,
 }
 
 /// `"<unix ms> <out|in> <collection id> <hex>"`, the hex in uppercase pairs without
@@ -157,6 +195,9 @@ fn line(unix_ms: u64, direction: Direction, collection: CollectionId, bytes: &[u
     let direction = match direction {
         Direction::Out => "out",
         Direction::In => "in",
+        Direction::FeatureSet => "feature-set",
+        Direction::FeatureGet => "feature-get",
+        Direction::FeatureReply => "feature-reply",
     };
     let mut text = format!("{unix_ms} {direction} {} ", collection.0);
     for byte in bytes {

@@ -8,7 +8,9 @@
 //! between two inputs are exactly the writes the first one causes.
 
 use batterysight_core::catalog::Catalog;
-use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup};
+use batterysight_core::hid::{
+    Collection, CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin,
+};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
 use batterysight_core::model::{
     Charge, CoarseLevel, DeviceKind, Level, Presence, Verification, Via,
@@ -109,7 +111,9 @@ fn collection(
         pid,
         usage_page,
         usage,
+        interface: None,
         input_len: len,
+        input_report_05: None,
         output_len: len,
         feature_len: 0,
         product: product.into(),
@@ -167,7 +171,11 @@ fn replay(name: &str, text: &str, group: HidGroup) -> Hub {
             }
             Entry::In(collection, bytes) => {
                 now += 1;
-                HubInput::Report { collection, bytes }
+                HubInput::Report {
+                    collection,
+                    origin: ReportOrigin::Input,
+                    bytes,
+                }
             }
             Entry::Wait(ms) => {
                 now += ms;
@@ -189,7 +197,19 @@ fn replay(name: &str, text: &str, group: HidGroup) -> Hub {
 fn sends(out: Vec<HubOutput>) -> Vec<(CollectionId, Vec<u8>)> {
     out.into_iter()
         .filter_map(|o| match o {
-            HubOutput::Send { collection, bytes } => Some((collection, bytes)),
+            HubOutput::Send {
+                collection,
+                kind: ReportKind::Output,
+                bytes,
+                deadline: None,
+                set_id: None,
+            } => Some((collection, bytes)),
+            HubOutput::Send { kind, .. } => panic!("unexpected HID++ operation: {kind:?}"),
+            HubOutput::WriteRefused {
+                kind,
+                collection,
+                reason,
+            } => panic!("unexpected HID++ refusal: {kind:?} {collection:?} {reason:?}"),
             HubOutput::StateChanged | HubOutput::DiscoveryFailed { .. } => None,
         })
         .collect()

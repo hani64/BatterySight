@@ -5,14 +5,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::catalog::{Catalog, EngineKind};
-use crate::engine::{Action, Engine};
-use crate::engines;
-use crate::hid::{CollectionId, GroupId, HidGroup};
+use crate::catalog::{Catalog, CollectionSelector, EngineKind};
+use crate::engine::{Action, Engine, FeatureSetId, WriteDestination, write_allowed};
+use crate::engines::{self, Selection};
+use crate::hid::{CollectionId, CollectionRole, GroupId, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{
-    Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, Verification, Via,
+    Charge, DeviceKey, DeviceKind, DeviceState, DeviceUpdate, Presence, SystemObservation,
+    Verification, Via,
 };
-use crate::scheduler::{Capabilities, Policy, Scheduler, Trigger};
+use crate::scheduler::{Capabilities, Grant, GrantId, Policy, Scheduler, Trigger};
 use crate::time::Ms;
 
 /// How long a removed device keeps its last values before it disappears.
@@ -21,13 +22,23 @@ pub const REMOVAL_GRACE_MS: Ms = 60_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HubInput {
     GroupArrived(HidGroup),
+    /// Runtime arrival after opening the collections selected before any device I/O.
+    MatchedGroupArrived(HidGroup, Selection),
     GroupRemoved(GroupId),
+    System(SystemObservation),
+    SystemGone(DeviceKey),
     Report {
         collection: CollectionId,
+        origin: ReportOrigin,
         bytes: Vec<u8>,
+    },
+    FeatureSetComplete {
+        collection: CollectionId,
+        id: FeatureSetId,
     },
     Resume,
     RefreshNow,
+    /// Audible activity on the physical device, not evidence that it is awake.
     Activity(DeviceKey),
     /// The user's gaps between activity reads, by device key; replaces all earlier ones.
     SetIntervals(HashMap<DeviceKey, Ms>),
@@ -38,7 +49,18 @@ pub enum HubInput {
 pub enum HubOutput {
     Send {
         collection: CollectionId,
+        kind: ReportKind,
         bytes: Vec<u8>,
+        /// For feature operations, the transaction deadline capped by its grant expiry.
+        deadline: Option<Ms>,
+        /// A successful SET completion must return this ID to the issuing engine.
+        set_id: Option<FeatureSetId>,
+    },
+    /// A request was denied without exposing its payload or the device identity.
+    WriteRefused {
+        kind: ReportKind,
+        collection: CollectionId,
+        reason: WriteRefusal,
     },
     /// The snapshot changed during this call.
     StateChanged,
@@ -50,6 +72,22 @@ pub enum HubOutput {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteRefusal {
+    Collection,
+    Width,
+    Rule,
+    Grant,
+    Deadline,
+}
+
+struct SendRequest<'a> {
+    collection: CollectionId,
+    kind: ReportKind,
+    bytes: &'a [u8],
+    deadline: Option<Ms>,
+}
+
 type EngineFactory = Box<dyn Fn(&HidGroup, &Catalog) -> Option<Box<dyn Engine>>>;
 
 /// A group key gets its arrival conversation, `Rediscovery` grants while its engine
@@ -59,6 +97,9 @@ type EngineFactory = Box<dyn Fn(&HidGroup, &Catalog) -> Option<Box<dyn Engine>>>
 const GROUP_CAPS: Capabilities = Capabilities {
     pushes_battery: false,
     query_wakes: false,
+    audio: false,
+    awake_signal: false,
+    charging: false,
     min_query_gap_ms: 0,
 };
 
@@ -66,18 +107,38 @@ const GROUP_CAPS: Capabilities = Capabilities {
 /// reporting `Connected` from inside `on_grant`); deeper requests are dropped.
 const MAX_NESTED_GRANTS: usize = 4;
 
+struct Route {
+    group: GroupId,
+    reads: bool,
+    role: Option<CollectionRole>,
+    output_len: u16,
+    feature_len: u16,
+}
+
 /// One arrived group and its engine.
 struct Slot {
     engine: Box<dyn Engine>,
     key: DeviceKey,
-    /// `(vid, pid)` of the group's first collection, for catalog lookups.
-    ids: Option<(u16, u16)>,
+    /// Vendor ID for wireless PID and family lookups, never a receiver's USB PID.
+    vid: Option<u16>,
+    kind: EngineKind,
+    /// Direct entry chosen during admission, not a second VID/PID search.
+    direct: Option<usize>,
     /// HID product string, the name of a device whose engine gives none.
     product: String,
     collections: Vec<CollectionId>,
     /// Hub keys of devices this engine registered under a shared key another live group
     /// already held (see [`Hub::claim`]), by the engine's own key, which it keeps using.
     aliases: BTreeMap<DeviceKey, DeviceKey>,
+}
+
+impl Slot {
+    fn engine_key<'a>(&'a self, hub_key: &'a DeviceKey) -> &'a DeviceKey {
+        self.aliases
+            .iter()
+            .find_map(|(own, hub)| (hub == hub_key).then_some(own))
+            .unwrap_or(hub_key)
+    }
 }
 
 /// The fields of an [`Action::Register`].
@@ -89,6 +150,21 @@ struct Registration {
     wpid: Option<u16>,
 }
 
+struct Registrant {
+    group: GroupId,
+    caps: Capabilities,
+}
+
+fn apply_polling_caps(state: &mut DeviceState, caps: Capabilities) -> bool {
+    let min =
+        ((caps.audio || caps.awake_signal) && !caps.pushes_battery && caps.min_query_gap_ms > 0)
+            .then_some(caps.min_query_gap_ms);
+    let changed = state.poll_min_ms != min || state.reports_changes != caps.pushes_battery;
+    state.poll_min_ms = min;
+    state.reports_changes = caps.pushes_battery;
+    changed
+}
+
 /// What one `handle` call produces.
 #[derive(Default)]
 struct Pass {
@@ -98,17 +174,24 @@ struct Pass {
     depth: usize,
 }
 
+/// System devices have no scheduler registration, even during the removal grace.
+struct SystemDevice {
+    state: DeviceState,
+    expires_at: Option<Ms>,
+}
+
 pub struct Hub {
     catalog: Catalog,
-    factory: EngineFactory,
+    factory: Option<EngineFactory>,
     scheduler: Scheduler,
     engines: BTreeMap<GroupId, Slot>,
-    routes: HashMap<CollectionId, GroupId>,
+    routes: HashMap<CollectionId, Route>,
     /// Registered devices and every live group whose engine registered them;
     /// the last one is the current owner. The same device can be served by
     /// several groups at once (e.g. receiver and cable).
-    owners: BTreeMap<DeviceKey, Vec<GroupId>>,
+    owners: BTreeMap<DeviceKey, Vec<Registrant>>,
     states: BTreeMap<DeviceKey, DeviceState>,
+    system: BTreeMap<DeviceKey, SystemDevice>,
     /// Devices no engine owns any more, and when their entries expire.
     grace: BTreeMap<DeviceKey, Ms>,
 }
@@ -117,31 +200,68 @@ impl Hub {
     pub fn new(catalog: Catalog, policy: Policy) -> Self {
         Self {
             catalog,
-            factory: Box::new(crate::engines::engine_for),
+            factory: None,
             scheduler: Scheduler::new(policy),
             engines: BTreeMap::new(),
             routes: HashMap::new(),
             owners: BTreeMap::new(),
             states: BTreeMap::new(),
+            system: BTreeMap::new(),
             grace: BTreeMap::new(),
         }
     }
 
     pub fn with_engine_factory(self, f: EngineFactory) -> Self {
-        Self { factory: f, ..self }
+        Self {
+            factory: Some(f),
+            ..self
+        }
+    }
+
+    /// Resolve the roles against this hub's catalog, using only cached OS names for product gates.
+    pub fn select_group(
+        &self,
+        group: &HidGroup,
+        product: impl FnMut(usize, &CollectionSelector) -> Option<bool>,
+    ) -> Option<Selection> {
+        engines::select_with(group, &self.catalog, product)
     }
 
     pub fn handle(&mut self, input: HubInput, now: Ms) -> Vec<HubOutput> {
         let mut pass = Pass::default();
         match input {
-            HubInput::GroupArrived(group) => self.arrive(&group, now, &mut pass),
+            HubInput::GroupArrived(group) => self.arrive(&group, None, now, &mut pass),
+            HubInput::MatchedGroupArrived(group, selection) => {
+                self.arrive(&group, Some(&selection), now, &mut pass)
+            }
             HubInput::GroupRemoved(id) => self.remove_group(id, now, &mut pass),
-            HubInput::Report { collection, bytes } => {
-                if let Some(&gid) = self.routes.get(&collection)
-                    && let Some(slot) = self.engines.get_mut(&gid)
+            HubInput::System(observation) => self.observe_system(observation, now, &mut pass),
+            HubInput::SystemGone(key) => self.system_gone(&key, now, &mut pass),
+            HubInput::Report {
+                collection,
+                origin,
+                bytes,
+            } => {
+                if let Some(route) = self.routes.get(&collection).filter(|route| match origin {
+                    ReportOrigin::Input => route.reads,
+                    ReportOrigin::FeatureReply => route.role.is_some(),
+                }) && let Some(slot) = self.engines.get_mut(&route.group)
                 {
-                    let actions = slot.engine.on_report(collection, &bytes, now);
-                    self.apply(gid, actions, now, &mut pass);
+                    let gid = route.group;
+                    let actions = slot.engine.on_report(collection, origin, &bytes, now);
+                    self.apply(gid, actions, Some(origin), now, &mut pass);
+                }
+            }
+            HubInput::FeatureSetComplete { collection, id } => {
+                if let Some(route) = self
+                    .routes
+                    .get(&collection)
+                    .filter(|route| route.role.is_some())
+                    && let Some(slot) = self.engines.get_mut(&route.group)
+                {
+                    let gid = route.group;
+                    let actions = slot.engine.on_feature_set_complete(collection, id, now);
+                    self.apply(gid, actions, None, now, &mut pass);
                 }
             }
             HubInput::Resume => self.request_all(Trigger::Resume, now, &mut pass),
@@ -162,7 +282,27 @@ impl Hub {
 
     /// Every known device, ordered by key.
     pub fn snapshot(&self) -> Vec<DeviceState> {
-        self.states.values().cloned().collect()
+        let mut hid = self.states.values().peekable();
+        let mut system = self.system.values().map(|device| &device.state).peekable();
+        let mut states = Vec::with_capacity(hid.len() + system.len());
+        while let (Some(a), Some(b)) = (hid.peek(), system.peek()) {
+            let next = if a.key <= b.key {
+                hid.next()
+            } else {
+                system.next()
+            };
+            states.extend(next.cloned());
+        }
+        states.extend(hid.chain(system).cloned());
+        states
+    }
+
+    /// Whether the system provider can still update a known entry without a fresh sample.
+    /// A grace entry is expired at its deadline, even if the next tick has not run yet.
+    pub fn retains_system(&self, key: &DeviceKey, now: Ms) -> bool {
+        self.system
+            .get(key)
+            .is_some_and(|device| device.expires_at.is_none_or(|at| now < at))
     }
 
     /// When the next `Tick` is due: the earliest engine deadline, grace expiry or charging
@@ -172,23 +312,104 @@ impl Hub {
             .values()
             .filter_map(|slot| slot.engine.next_deadline())
             .chain(self.grace.values().copied())
+            .chain(self.system.values().filter_map(|device| device.expires_at))
             .chain(self.charging_reads().map(|(_, at)| at))
             .min()
     }
 
+    fn observe_system(&mut self, observation: SystemObservation, now: Ms, pass: &mut Pass) {
+        let SystemObservation {
+            update,
+            verification,
+            reports_changes,
+        } = observation;
+        if update.presence == Some(Presence::Offline) {
+            self.system_gone(&update.key, now, pass);
+            return;
+        }
+        if let Some(device) = self.system.get_mut(&update.key) {
+            let returning = device.expires_at.take().is_some();
+            let state = &mut device.state;
+            let sample_changed = update.level.is_some_and(|level| Some(level) != state.level)
+                || update
+                    .millivolts
+                    .is_some_and(|mv| Some(mv) != state.millivolts)
+                || update.charge.is_some_and(|charge| charge != state.charge);
+            let presence = update.presence.unwrap_or(if returning {
+                Presence::Online
+            } else {
+                state.presence
+            });
+            if sample_changed
+                || update.name.as_ref().is_some_and(|name| *name != state.name)
+                || update.kind.is_some_and(|kind| kind != state.kind)
+                || update.via.is_some_and(|via| via != state.via)
+                || presence != state.presence
+                || verification != state.verification
+                || reports_changes != state.reports_changes
+            {
+                let (source, updated_ms) = (state.source, state.updated_ms);
+                state.apply(&update, now);
+                state.presence = presence;
+                state.verification = verification;
+                state.reports_changes = reports_changes;
+                if !sample_changed {
+                    state.source = source;
+                    state.updated_ms = updated_ms;
+                }
+                pass.changed = true;
+            }
+        } else {
+            let state = DeviceState {
+                key: update.key.clone(),
+                name: update.name.unwrap_or_default(),
+                kind: update.kind.unwrap_or(DeviceKind::Other),
+                via: update.via.unwrap_or(Via::Usb),
+                level: update.level,
+                millivolts: update.millivolts,
+                charge: update.charge.unwrap_or(Charge::Unknown),
+                presence: update.presence.unwrap_or(Presence::Online),
+                updated_ms: now,
+                source: update.source,
+                verification,
+                poll_min_ms: None,
+                reports_changes,
+            };
+            self.system.insert(
+                update.key,
+                SystemDevice {
+                    state,
+                    expires_at: None,
+                },
+            );
+            pass.changed = true;
+        }
+    }
+
+    fn system_gone(&mut self, key: &DeviceKey, now: Ms, pass: &mut Pass) {
+        if let Some(device) = self.system.get_mut(key)
+            && device.expires_at.is_none()
+        {
+            device.state.presence = Presence::Offline;
+            device.expires_at = Some(now.saturating_add(REMOVAL_GRACE_MS));
+            pass.changed = true;
+        }
+    }
+
     /// Devices asked during use that are owned, online and charging, each with when the
-    /// scheduler could next grant it an activity read: a `Tick` then reads it without any
-    /// activity, as a charging headset that sits silent never pushes its level.
+    /// scheduler could next grant an opted-in charging read.
     fn charging_reads(&self) -> impl Iterator<Item = (&DeviceKey, Ms)> {
-        self.states
-            .values()
-            .filter(|state| {
-                state.poll_min_ms.is_some()
-                    && state.presence == Presence::Online
-                    && state.charge == Charge::Charging
-                    && self.device_owner(&state.key).is_some()
-            })
-            .filter_map(|state| Some((&state.key, self.scheduler.activity_ready_at(&state.key)?)))
+        self.states.values().filter_map(|state| {
+            self.charging_owner(state)?;
+            Some((&state.key, self.scheduler.charging_ready_at(&state.key)?))
+        })
+    }
+
+    fn charging_owner(&self, state: &DeviceState) -> Option<GroupId> {
+        if state.presence != Presence::Online || state.charge != Charge::Charging {
+            return None;
+        }
+        self.device_owner(&state.key)
     }
 
     /// The registered devices `group`'s engine currently owns, ordered by key: those an
@@ -196,35 +417,86 @@ impl Hub {
     pub fn keys_of(&self, group: GroupId) -> Vec<DeviceKey> {
         self.owners
             .iter()
-            .filter(|(_, groups)| groups.last() == Some(&group))
+            .filter(|(_, groups)| groups.last().is_some_and(|owner| owner.group == group))
             .map(|(key, _)| key.clone())
             .collect()
     }
 
-    /// When an [`HubInput::Activity`] for `key` may next be granted; `None` while none can
-    /// be (unknown device, one that pushes its battery, or one asleep).
-    pub fn activity_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
+    /// When an [`HubInput::Activity`] for `key` may next be granted. Awake-only
+    /// devices never set an audio deadline, even while online.
+    pub fn audio_ready_at(&self, key: &DeviceKey) -> Option<Ms> {
         self.scheduler.activity_ready_at(key)
     }
 
-    fn arrive(&mut self, group: &HidGroup, now: Ms, pass: &mut Pass) {
+    fn arrive(&mut self, group: &HidGroup, prepared: Option<&Selection>, now: Ms, pass: &mut Pass) {
         // The same id again means the old handles are gone.
         self.remove_group(group.id, now, pass);
-        let Some(engine) = (self.factory)(group, &self.catalog) else {
-            return;
-        };
+        let resolved;
+        let (engine, selection): (Box<dyn Engine>, Option<&Selection>) =
+            if let Some(factory) = self.factory.as_ref().filter(|_| prepared.is_none()) {
+                let Some(engine) = factory(group, &self.catalog) else {
+                    return;
+                };
+                (engine, None)
+            } else {
+                let selection = if let Some(selection) = prepared {
+                    selection
+                } else {
+                    resolved = engines::select(group, &self.catalog);
+                    let Some(selection) = resolved.as_ref() else {
+                        return;
+                    };
+                    selection
+                };
+                let Some(engine) = selection.engine(group, &self.catalog) else {
+                    return;
+                };
+                (engine, Some(selection))
+            };
         let key = engine.group_key();
-        let collections: Vec<CollectionId> = group.collections.iter().map(|c| c.id).collect();
-        for &c in &collections {
-            self.routes.insert(c, group.id);
+        let mut collections = Vec::new();
+        let mut routed = group
+            .collections
+            .iter()
+            .filter(|c| selection.is_none_or(|selection| selection.opens(c.id)))
+            .peekable();
+        let first = routed.peek().copied();
+        let direct = if let Some(selection) = selection {
+            selection.direct()
+        } else {
+            // Custom engines supply their own routes; a gated entry still requires selection.
+            first.and_then(|c| {
+                let mut entries = self.catalog.direct_entries(c.vid, c.pid);
+                let (index, entry) = entries.next()?;
+                (entries.next().is_none() && entry.receive.is_none() && entry.send.is_none())
+                    .then_some(index)
+            })
+        };
+        for c in routed {
+            collections.push(c.id);
+            let (reads, role) = selection.map_or_else(
+                || (true, engine.collection_role(c.id)),
+                |selection| (selection.reads(c.id), selection.send_role(c.id)),
+            );
+            self.routes.insert(
+                c.id,
+                Route {
+                    group: group.id,
+                    reads,
+                    role,
+                    output_len: c.output_len,
+                    feature_len: c.feature_len,
+                },
+            );
         }
-        let first = group.collections.first();
         self.engines.insert(
             group.id,
             Slot {
                 engine,
                 key: key.clone(),
-                ids: first.map(|c| (c.vid, c.pid)),
+                vid: first.map(|c| c.vid),
+                kind: selection.map_or(EngineKind::Hidpp, Selection::kind),
+                direct,
                 product: first.map(|c| c.product.clone()).unwrap_or_default(),
                 collections,
                 aliases: BTreeMap::new(),
@@ -240,7 +512,7 @@ impl Hub {
             return;
         };
         for c in &slot.collections {
-            if self.routes.get(c) == Some(&id) {
+            if self.routes.get(c).is_some_and(|route| route.group == id) {
                 self.routes.remove(c);
             }
         }
@@ -249,7 +521,7 @@ impl Hub {
         let served: Vec<DeviceKey> = self
             .owners
             .iter()
-            .filter(|(_, groups)| groups.contains(&id))
+            .filter(|(_, groups)| groups.iter().any(|r| r.group == id))
             .map(|(key, _)| key.clone())
             .collect();
         for key in served {
@@ -258,16 +530,26 @@ impl Hub {
     }
 
     /// `gid` no longer serves `key`. Ownership falls back to the latest
-    /// remaining registrant, state untouched. With none left, the device goes
-    /// offline and is kept until the grace expires; the scheduler keeps its
-    /// history so a reconnect within grace cannot bypass the min gap or get a
+    /// remaining registrant and its capabilities, without changing battery values
+    /// or read history. With none left, the device goes offline and is kept until
+    /// the grace expires; a reconnect within grace cannot bypass the min gap or get a
     /// second arrival.
     fn drop_registrant(&mut self, key: &DeviceKey, gid: GroupId, now: Ms, pass: &mut Pass) {
         let Some(groups) = self.owners.get_mut(key) else {
             return;
         };
-        groups.retain(|&g| g != gid);
-        if !groups.is_empty() {
+        let was_owner = groups.last().is_some_and(|owner| owner.group == gid);
+        groups.retain(|r| r.group != gid);
+        if was_owner {
+            self.scheduler.revoke_grants(key);
+        }
+        if let Some(owner) = groups.last() {
+            if was_owner {
+                self.scheduler.set_capabilities(key, owner.caps);
+                if let Some(state) = self.states.get_mut(key) {
+                    pass.changed |= apply_polling_caps(state, owner.caps);
+                }
+            }
             return;
         }
         self.owners.remove(key);
@@ -284,7 +566,7 @@ impl Hub {
         for gid in ids {
             if let Some(slot) = self.engines.get_mut(&gid) {
                 let actions = slot.engine.on_tick(now);
-                self.apply(gid, actions, now, pass);
+                self.apply(gid, actions, None, now, pass);
             }
         }
         let charging: Vec<DeviceKey> = self
@@ -293,9 +575,11 @@ impl Hub {
             .map(|(key, _)| key.clone())
             .collect();
         for key in charging {
-            // An earlier grant's actions may have moved or released the device.
-            if let Some(gid) = self.device_owner(&key) {
-                self.grant(gid, &key, Trigger::Activity, now, pass);
+            // An earlier grant may have changed the charge, presence or owner.
+            if let Some(gid) = self.states.get(&key).and_then(|s| self.charging_owner(s))
+                && let Some(grant) = self.scheduler.request_charging(&key, gid, now)
+            {
+                self.deliver_grant(gid, grant, now, pass);
             }
         }
         let expired: Vec<DeviceKey> = self
@@ -310,15 +594,22 @@ impl Hub {
             self.scheduler.unregister(&key);
             pass.changed = true;
         }
+        let system_count = self.system.len();
+        self.system
+            .retain(|_, device| device.expires_at.is_none_or(|at| now < at));
+        pass.changed |= system_count != self.system.len();
     }
 
-    /// Asks the scheduler for `trigger` on every registered device, then discovers each
-    /// group whose engine registered no device again, as on its arrival.
+    /// Requests one shot from each group that answers for itself, or from each
+    /// registered device. Other groups without a device repeat discovery.
     fn request_all(&mut self, trigger: Trigger, now: Ms, pass: &mut Pass) {
         let devices: Vec<(DeviceKey, GroupId)> = self
             .owners
             .keys()
-            .filter_map(|key| Some((key.clone(), self.device_owner(key)?)))
+            .filter_map(|key| {
+                let gid = self.device_owner(key)?;
+                (!self.engines.get(&gid)?.engine.group_one_shots()).then(|| (key.clone(), gid))
+            })
             .collect();
         for (key, gid) in devices {
             // An earlier grant's actions may have moved or released the device.
@@ -326,16 +617,26 @@ impl Hub {
                 self.grant(gid, &key, trigger, now, pass);
             }
         }
-        let empty: Vec<(GroupId, DeviceKey)> = self
+        let groups: Vec<_> = self
             .engines
             .iter()
-            .filter(|&(&gid, _)| self.rediscoverable(gid))
-            .map(|(&gid, slot)| (gid, slot.key.clone()))
+            .filter_map(|(&gid, slot)| {
+                let one_shot = if slot.engine.group_one_shots() {
+                    trigger
+                } else if self.rediscoverable(gid) {
+                    Trigger::Arrival
+                } else {
+                    return None;
+                };
+                Some((gid, slot.key.clone(), one_shot))
+            })
             .collect();
-        for (gid, key) in empty {
-            if self.rediscoverable(gid) {
+        for (gid, key, one_shot) in groups {
+            if one_shot != Trigger::Arrival {
+                self.grant(gid, &key, one_shot, now, pass);
+            } else if self.rediscoverable(gid) {
                 self.scheduler.rearm_arrival(&key);
-                self.grant(gid, &key, Trigger::Arrival, now, pass);
+                self.grant(gid, &key, one_shot, now, pass);
             }
         }
     }
@@ -347,37 +648,69 @@ impl Hub {
             return false;
         };
         let query_wakes = slot
-            .ids
-            .and_then(|(vid, pid)| self.catalog.device(vid, pid))
+            .direct
+            .and_then(|index| self.catalog.devices().get(index))
             .is_some_and(|device| device.quirks.query_wakes);
-        !query_wakes && !self.owners.values().any(|groups| groups.contains(&gid))
+        !query_wakes
+            && !self
+                .owners
+                .values()
+                .any(|groups| groups.iter().any(|r| r.group == gid))
     }
 
     /// Requests a grant on `key` and, if the scheduler allows it, hands it to `gid`'s engine.
     fn grant(&mut self, gid: GroupId, key: &DeviceKey, trigger: Trigger, now: Ms, pass: &mut Pass) {
         // An engine that asks again from inside `on_grant` must not recurse without end.
-        if pass.depth > MAX_NESTED_GRANTS {
+        if pass.depth > MAX_NESTED_GRANTS || self.owner(key) != Some(gid) {
             return;
         }
-        let Some(mut grant) = self.scheduler.request(key, trigger, now) else {
+        let sonix = self
+            .engines
+            .get(&gid)
+            .is_some_and(|slot| slot.kind == EngineKind::Sonix);
+        let grant = if sonix
+            && matches!(
+                trigger,
+                Trigger::Arrival
+                    | Trigger::Connected
+                    | Trigger::Resume
+                    | Trigger::RefreshNow
+                    | Trigger::Awake
+            ) {
+            self.scheduler.request_feature_transaction(
+                key,
+                gid,
+                trigger,
+                now,
+                engines::SONIX_OPERATION_BUDGET,
+            )
+        } else {
+            self.scheduler.request(key, gid, trigger, now)
+        };
+        let Some(grant) = grant else {
             return;
         };
+        self.deliver_grant(gid, grant, now, pass);
+    }
+
+    fn deliver_grant(&mut self, gid: GroupId, mut grant: Grant, now: Ms, pass: &mut Pass) {
         if let Some(slot) = self.engines.get_mut(&gid) {
-            if let Some((own, _)) = slot.aliases.iter().find(|(_, hub)| **hub == grant.subject) {
-                grant.subject = own.clone();
+            let subject = slot.engine_key(&grant.subject);
+            if subject != &grant.subject {
+                grant.subject = subject.clone();
             }
             let actions = slot.engine.on_grant(&grant, now);
             pass.depth += 1;
-            self.apply(gid, actions, now, pass);
+            self.apply(gid, actions, None, now, pass);
             pass.depth -= 1;
         }
     }
 
-    /// Group whose engine currently owns device `key`: its latest live registrant.
-    fn device_owner(&self, key: &DeviceKey) -> Option<GroupId> {
+    /// The latest live HID registrant of `key`, if there is one.
+    pub fn device_owner(&self, key: &DeviceKey) -> Option<GroupId> {
         self.owners
             .get(key)
-            .and_then(|groups| groups.last().copied())
+            .and_then(|groups| groups.last().map(|owner| owner.group))
     }
 
     /// Group whose engine receives grants on `key`: the registrant of a
@@ -415,7 +748,7 @@ impl Hub {
         let held_elsewhere = |k: &DeviceKey| {
             self.owners
                 .get(k)
-                .is_some_and(|groups| groups.iter().any(|&g| g != gid))
+                .is_some_and(|groups| groups.iter().any(|r| r.group != gid))
         };
         let mut claimed = key.clone();
         let mut n = 1;
@@ -428,7 +761,7 @@ impl Hub {
             if self
                 .owners
                 .get(&previous)
-                .is_some_and(|groups| groups.as_slice() == [gid])
+                .is_some_and(|groups| matches!(groups.as_slice(), [r] if r.group == gid))
             {
                 self.owners.remove(&previous);
                 self.grace.remove(&previous);
@@ -455,20 +788,120 @@ impl Hub {
         claimed
     }
 
+    fn admit_write(
+        &mut self,
+        gid: GroupId,
+        grant: GrantId,
+        request: SendRequest<'_>,
+        now: Ms,
+    ) -> Result<Option<Ms>, WriteRefusal> {
+        let SendRequest {
+            collection,
+            kind,
+            bytes,
+            deadline,
+        } = request;
+        let route = self
+            .routes
+            .get(&collection)
+            .filter(|route| route.group == gid)
+            .ok_or(WriteRefusal::Collection)?;
+        let slot = self.engines.get(&gid).ok_or(WriteRefusal::Collection)?;
+        let role = route
+            .role
+            .filter(|&role| slot.engine.collection_role(collection) == Some(role))
+            .ok_or(WriteRefusal::Collection)?;
+        let width = match kind {
+            ReportKind::Output => route.output_len,
+            ReportKind::SetFeature | ReportKind::GetFeature => route.feature_len,
+        };
+        if width == 0 || bytes.len() != usize::from(width) {
+            return Err(WriteRefusal::Width);
+        }
+        let permit = self
+            .scheduler
+            .pending_send(grant, gid, now)
+            .ok_or(WriteRefusal::Grant)?;
+        let subject = permit.subject();
+        if self
+            .owners
+            .get(subject)
+            .and_then(|groups| groups.last())
+            .map_or(&slot.key != subject, |owner| owner.group != gid)
+        {
+            return Err(WriteRefusal::Grant);
+        }
+        match write_allowed(&*slot.engine, role, kind, bytes, grant).ok_or(WriteRefusal::Rule)? {
+            WriteDestination::Collection => {}
+            WriteDestination::Device(key) => {
+                let key = slot.aliases.get(key).unwrap_or(key);
+                if (subject != &slot.key && subject != key)
+                    || self
+                        .owners
+                        .get(key)
+                        .and_then(|groups| groups.last())
+                        .is_none_or(|owner| owner.group != gid)
+                {
+                    return Err(WriteRefusal::Grant);
+                }
+            }
+            WriteDestination::Group if subject != &slot.key => return Err(WriteRefusal::Grant),
+            WriteDestination::Group => {}
+        }
+        let deadline = match kind {
+            ReportKind::Output => None,
+            ReportKind::SetFeature | ReportKind::GetFeature => Some(
+                deadline
+                    .map(|deadline| deadline.min(permit.expires_ms()))
+                    .filter(|&deadline| deadline > now)
+                    .ok_or(WriteRefusal::Deadline)?,
+            ),
+        };
+        permit.spend();
+        Ok(deadline)
+    }
+
     /// Carries out `actions` from `gid`'s engine. Actions on devices or
-    /// collections the engine does not own are ignored.
-    fn apply(&mut self, gid: GroupId, actions: Vec<Action>, now: Ms, pass: &mut Pass) {
+    /// collections the engine does not own cannot reach the device.
+    fn apply(
+        &mut self,
+        gid: GroupId,
+        actions: Vec<Action>,
+        origin: Option<ReportOrigin>,
+        now: Ms,
+        pass: &mut Pass,
+    ) {
         for action in actions {
             match action {
                 Action::Send {
                     grant,
                     collection,
+                    kind,
                     bytes,
+                    deadline,
                 } => {
-                    if self.routes.get(&collection) == Some(&gid)
-                        && self.scheduler.admit_send(grant, now)
-                    {
-                        pass.out.push(HubOutput::Send { collection, bytes });
+                    let request = SendRequest {
+                        collection,
+                        kind,
+                        bytes: &bytes,
+                        deadline,
+                    };
+                    match self.admit_write(gid, grant, request, now) {
+                        Ok(deadline) => pass.out.push(HubOutput::Send {
+                            collection,
+                            kind,
+                            bytes,
+                            deadline,
+                            set_id: (kind == ReportKind::SetFeature).then_some(FeatureSetId {
+                                grant,
+                                issued_ms: now,
+                            }),
+                        }),
+                        Err(reason) => pass.out.push(HubOutput::WriteRefused {
+                            kind,
+                            collection,
+                            reason,
+                        }),
                     }
                 }
                 Action::Register {
@@ -487,13 +920,7 @@ impl Hub {
                 }
                 Action::Unregister(key) => {
                     let key = self.hub_key(gid, key);
-                    if self
-                        .owners
-                        .get(&key)
-                        .is_some_and(|groups| groups.contains(&gid))
-                    {
-                        self.drop_registrant(&key, gid, now, pass);
-                    }
+                    self.drop_registrant(&key, gid, now, pass);
                 }
                 Action::Update(mut update) => {
                     update.key = self.hub_key(gid, update.key);
@@ -511,6 +938,21 @@ impl Hub {
                             state.presence = Presence::Online;
                         }
                         pass.changed = true;
+                    }
+                }
+                Action::Presence { key, presence } => {
+                    let key = self.hub_key(gid, key);
+                    if self.device_owner(&key) != Some(gid) {
+                        continue;
+                    }
+                    self.note_presence(&key, Some(presence));
+                    if let Some(state) = self.states.get_mut(&key) {
+                        pass.changed |= state.presence != presence;
+                        state.presence = presence;
+                        if presence == Presence::Offline {
+                            pass.changed |= state.charge != Charge::Unknown;
+                            state.charge = Charge::Unknown;
+                        }
                     }
                 }
                 Action::Asleep(key) => {
@@ -532,14 +974,20 @@ impl Hub {
                         continue;
                     }
                     // A connect is a sign of life even when the scheduler refuses the grant.
-                    self.scheduler.mark_awake(&key);
-                    if let Some(state) = self.states.get_mut(&key)
-                        && state.presence != Presence::Online
-                    {
-                        state.presence = Presence::Online;
-                        pass.changed = true;
-                    }
+                    self.mark_online(&key, pass);
                     self.grant(gid, &key, Trigger::Connected, now, pass);
+                }
+                Action::Awake(key) => {
+                    if origin != Some(ReportOrigin::Input) {
+                        continue;
+                    }
+                    let key = self.hub_key(gid, key);
+                    if self.device_owner(&key) != Some(gid) {
+                        continue;
+                    }
+                    // A valid signal proves presence even before a read is due.
+                    self.mark_online(&key, pass);
+                    self.grant(gid, &key, Trigger::Awake, now, pass);
                 }
                 Action::Rediscover => {
                     if self.rediscoverable(gid)
@@ -579,12 +1027,21 @@ impl Hub {
             return;
         };
         let behind_receiver = initial.via == Some(Via::Receiver);
-        let (verification, catalog_name) = self.identity(slot.ids, behind_receiver, wpid);
+        let (verification, catalog_name) = self.identity(slot, behind_receiver, wpid);
         let product = slot.product.clone();
+        // A level-less re-registration (a link or heartbeat frame first) is not a new
+        // reading; HID++ keeps its pre-M3 behaviour.
+        let preserve_level_less_sample = slot.kind != EngineKind::Hidpp
+            && initial.level.is_none()
+            && initial.millivolts.is_none();
 
         let groups = self.owners.entry(key.clone()).or_default();
-        groups.retain(|&g| g != gid);
-        groups.push(gid);
+        if groups.last().is_none_or(|owner| owner.group != gid) {
+            // A restored owner cannot resume a conversation issued before the handoff.
+            self.scheduler.revoke_grants(&key);
+        }
+        groups.retain(|r| r.group != gid);
+        groups.push(Registrant { group: gid, caps });
         self.grace.remove(&key);
         self.scheduler.register(key.clone(), caps);
         // The discovery that registered the device read its battery: audio already playing
@@ -609,12 +1066,18 @@ impl Hub {
                 source: initial.source,
                 verification,
                 poll_min_ms: None,
+                reports_changes: false,
             });
         state.verification = verification;
-        // Asked during use: the activity gap is the only limit on such reads.
-        state.poll_min_ms =
-            (!caps.pushes_battery && caps.min_query_gap_ms > 0).then_some(caps.min_query_gap_ms);
+        apply_polling_caps(state, caps);
+        let sample_history = (preserve_level_less_sample
+            && (state.level.is_some() || state.millivolts.is_some()))
+        .then_some((state.source, state.updated_ms));
         state.apply(&initial, now);
+        if let Some((source, updated_ms)) = sample_history {
+            state.source = source;
+            state.updated_ms = updated_ms;
+        }
         if let Some(name) = catalog_name {
             state.name = name;
         }
@@ -622,6 +1085,17 @@ impl Hub {
             state.presence = Presence::Online;
         }
         pass.changed = true;
+    }
+
+    /// Sign of life only: the last battery reading and its age do not change.
+    fn mark_online(&mut self, key: &DeviceKey, pass: &mut Pass) {
+        self.scheduler.mark_awake(key);
+        if let Some(state) = self.states.get_mut(key)
+            && state.presence != Presence::Online
+        {
+            state.presence = Presence::Online;
+            pass.changed = true;
+        }
     }
 
     /// A reading is a sign of life unless it says the device is away.
@@ -632,31 +1106,30 @@ impl Hub {
         }
     }
 
-    /// Catalog status and name of a device registered by a group with `ids`: its device
-    /// entry, else the vendor family's status and no name, else `Generic`. A device behind a
-    /// receiver is looked up by its wireless PID only (the receiver's USB PID says nothing
-    /// about it); any other device by the group's USB PID.
+    /// HID++ receiver slots use their wireless PID. Dedicated devices, including
+    /// a dongle or base station, use the exact direct entry.
+    /// Both fall back to the selected engine's family status, if present.
     fn identity(
         &self,
-        ids: Option<(u16, u16)>,
+        slot: &Slot,
         behind_receiver: bool,
         wpid: Option<u16>,
     ) -> (Verification, Option<String>) {
-        let Some((vid, pid)) = ids else {
+        let Some(vid) = slot.vid else {
             return (Verification::Generic, None);
         };
-        let entry = if behind_receiver {
+        let entry = if behind_receiver && slot.kind == EngineKind::Hidpp {
             wpid.and_then(|wpid| self.catalog.device_by_wpid(vid, wpid))
         } else {
-            self.catalog.device(vid, pid)
+            slot.direct
+                .and_then(|index| self.catalog.devices().get(index))
         };
         if let Some(device) = entry {
             return (device.status, Some(device.name.clone()));
         }
-        // M1: only HID++ engines exist; the engine's kind joins this lookup with the second one.
         let status = self
             .catalog
-            .family(vid, EngineKind::Hidpp)
+            .family(vid, slot.kind)
             .map_or(Verification::Generic, |family| family.status);
         (status, None)
     }
@@ -669,10 +1142,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::engine::Action;
-    use crate::hid::Collection;
+    use crate::engine::{BytePattern, WriteRule};
+    use crate::hid::{Collection, CollectionRole};
     use crate::model::{DeviceKind, DeviceUpdate, Level, Presence, Source, Verification, Via};
-    use crate::scheduler::{Capabilities, Grant, GrantId, Trigger};
+    use crate::scheduler::{Capabilities, Grant, Trigger};
 
     /// Stands for "the grant being delivered" in scripted `on_grant` sends;
     /// the scheduler never issues id 0.
@@ -681,7 +1154,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Call {
         Grant(Grant),
-        Report(CollectionId, Vec<u8>),
+        Report(CollectionId, ReportOrigin, Vec<u8>),
         Tick(Ms),
     }
 
@@ -690,6 +1163,7 @@ mod tests {
     struct Script {
         on_grant: VecDeque<Vec<Action>>,
         on_report: VecDeque<Vec<Action>>,
+        on_tick: VecDeque<Vec<Action>>,
         deadline: Option<Ms>,
         /// Report `Connected(group key)` from every `on_grant`.
         connected_on_grant: bool,
@@ -701,12 +1175,59 @@ mod tests {
     /// Records every call and replays the next scripted action list per call.
     struct FakeEngine {
         key: DeviceKey,
+        out: CollectionId,
         script: Fake,
+    }
+
+    const COMMAND: CollectionRole = CollectionRole(0);
+
+    const fn fake_byte_rule(bytes: &'static [u8]) -> WriteRule {
+        WriteRule::Bytes {
+            role: COMMAND,
+            kind: ReportKind::Output,
+            wire_len: 1,
+            pattern: BytePattern::Exact(bytes),
+        }
     }
 
     impl Engine for FakeEngine {
         fn group_key(&self) -> DeviceKey {
             self.key.clone()
+        }
+
+        fn collection_role(&self, collection: CollectionId) -> Option<CollectionRole> {
+            (self.out == collection).then_some(COMMAND)
+        }
+
+        fn allowed_writes(&self) -> &'static [WriteRule] {
+            const RULES: &[WriteRule] = &[
+                fake_byte_rule(&[0]),
+                fake_byte_rule(&[1]),
+                fake_byte_rule(&[2]),
+                fake_byte_rule(&[3]),
+                fake_byte_rule(&[4]),
+                fake_byte_rule(&[5]),
+                fake_byte_rule(&[0xA1]),
+                fake_byte_rule(&[0xA2]),
+                fake_byte_rule(&[0xB0]),
+                fake_byte_rule(&[0xC0]),
+                fake_byte_rule(&[0xC2]),
+                fake_byte_rule(&[0xD0]),
+                fake_byte_rule(&[0xD2]),
+                WriteRule::Bytes {
+                    role: COMMAND,
+                    kind: ReportKind::Output,
+                    wire_len: 4,
+                    pattern: BytePattern::ZeroPadded(&[0xA5, 0x42]),
+                },
+                WriteRule::Bytes {
+                    role: COMMAND,
+                    kind: ReportKind::GetFeature,
+                    wire_len: 4,
+                    pattern: BytePattern::Exact(&[0x31, 0, 0, 0]),
+                },
+            ];
+            RULES
         }
 
         fn on_grant(&mut self, grant: &Grant, _now: Ms) -> Vec<Action> {
@@ -726,15 +1247,23 @@ mod tests {
             actions
         }
 
-        fn on_report(&mut self, collection: CollectionId, bytes: &[u8], _now: Ms) -> Vec<Action> {
+        fn on_report(
+            &mut self,
+            collection: CollectionId,
+            origin: ReportOrigin,
+            bytes: &[u8],
+            _now: Ms,
+        ) -> Vec<Action> {
             let mut s = self.script.borrow_mut();
-            s.calls.push(Call::Report(collection, bytes.to_vec()));
+            s.calls
+                .push(Call::Report(collection, origin, bytes.to_vec()));
             s.on_report.pop_front().unwrap_or_default()
         }
 
         fn on_tick(&mut self, now: Ms) -> Vec<Action> {
-            self.script.borrow_mut().calls.push(Call::Tick(now));
-            Vec::new()
+            let mut s = self.script.borrow_mut();
+            s.calls.push(Call::Tick(now));
+            s.on_tick.pop_front().unwrap_or_default()
         }
 
         fn next_deadline(&self) -> Option<Ms> {
@@ -810,6 +1339,7 @@ quirks = { query_wakes = true }
                 let script = map.get(&group.id)?;
                 Some(Box::new(FakeEngine {
                     key: group_key(group.id.0),
+                    out: coll(group.id.0),
                     script: Rc::clone(script),
                 }) as Box<dyn Engine>)
             },
@@ -834,8 +1364,10 @@ quirks = { query_wakes = true }
                 pid,
                 usage_page: 0xFF00,
                 usage: 0x0002,
+                interface: None,
                 input_len: 20,
-                output_len: 20,
+                input_report_05: None,
+                output_len: 1,
                 feature_len: 0,
                 product: "Fake Receiver".into(),
             }],
@@ -849,6 +1381,7 @@ quirks = { query_wakes = true }
     fn report(group: u32) -> HubInput {
         HubInput::Report {
             collection: coll(group),
+            origin: ReportOrigin::Input,
             bytes: vec![0x11],
         }
     }
@@ -857,7 +1390,9 @@ quirks = { query_wakes = true }
         Action::Send {
             grant,
             collection,
+            kind: ReportKind::Output,
             bytes: vec![byte],
+            deadline: None,
         }
     }
 
@@ -888,6 +1423,9 @@ quirks = { query_wakes = true }
         Capabilities {
             pushes_battery: true,
             query_wakes: false,
+            audio: false,
+            awake_signal: false,
+            charging: false,
             min_query_gap_ms: 300_000,
         }
     }
@@ -936,7 +1474,7 @@ quirks = { query_wakes = true }
         out.iter()
             .filter_map(|o| match o {
                 HubOutput::Send { bytes, .. } => Some(bytes.clone()),
-                HubOutput::StateChanged | HubOutput::DiscoveryFailed { .. } => None,
+                _ => None,
             })
             .collect()
     }
@@ -978,11 +1516,17 @@ quirks = { query_wakes = true }
             vec![
                 HubOutput::Send {
                     collection: coll(1),
+                    kind: ReportKind::Output,
                     bytes: vec![0xA1],
+                    deadline: None,
+                    set_id: None,
                 },
                 HubOutput::Send {
                     collection: coll(1),
+                    kind: ReportKind::Output,
                     bytes: vec![0xA2],
+                    deadline: None,
+                    set_id: None,
                 },
             ]
         );
@@ -1010,7 +1554,626 @@ quirks = { query_wakes = true }
         assert!(sends(&out).is_empty(), "{out:?}");
         assert_eq!(
             f.borrow().calls.last(),
-            Some(&Call::Report(coll(1), vec![0x11]))
+            Some(&Call::Report(coll(1), ReportOrigin::Input, vec![0x11]))
+        );
+    }
+
+    #[test]
+    fn rejected_requests_do_not_spend_the_one_request_budget() {
+        let f = fake();
+        let mut g = group(1, 0x046D, 0xC547);
+        g.collections[0].output_len = 4;
+        g.collections[0].feature_len = 4;
+        let mut other = g.collections[0].clone();
+        other.id = CollectionId(99);
+        g.collections.push(other);
+        let valid = [0xA5, 0x42, 0, 0];
+        let request = |collection, kind, bytes: &[u8]| Action::Send {
+            grant: THIS_GRANT,
+            collection,
+            kind,
+            bytes: bytes.to_vec(),
+            deadline: None,
+        };
+        f.borrow_mut().on_grant.push_back(vec![
+            request(CollectionId(99), ReportKind::Output, &valid),
+            request(coll(1), ReportKind::Output, &valid[..3]),
+            request(coll(1), ReportKind::SetFeature, &valid),
+            request(coll(1), ReportKind::GetFeature, &valid),
+            request(coll(1), ReportKind::Output, &[0xA5, 0x43, 0, 0]),
+            request(coll(1), ReportKind::Output, &[0xA5, 0x42, 0, 1]),
+            request(coll(1), ReportKind::Output, &valid),
+            request(coll(1), ReportKind::Output, &valid),
+        ]);
+        let mut hub = hub_with(
+            Policy {
+                discovery_budget: 1,
+                ..Policy::default()
+            },
+            &[(1, &f)],
+        );
+
+        let out = hub.handle(HubInput::GroupArrived(g), 0);
+        let refused = |kind, collection, reason| HubOutput::WriteRefused {
+            kind,
+            collection,
+            reason,
+        };
+        assert_eq!(
+            out,
+            [
+                refused(
+                    ReportKind::Output,
+                    CollectionId(99),
+                    WriteRefusal::Collection
+                ),
+                refused(ReportKind::Output, coll(1), WriteRefusal::Width),
+                refused(ReportKind::SetFeature, coll(1), WriteRefusal::Rule),
+                refused(ReportKind::GetFeature, coll(1), WriteRefusal::Rule),
+                refused(ReportKind::Output, coll(1), WriteRefusal::Rule),
+                refused(ReportKind::Output, coll(1), WriteRefusal::Rule),
+                HubOutput::Send {
+                    collection: coll(1),
+                    kind: ReportKind::Output,
+                    bytes: valid.to_vec(),
+                    deadline: None,
+                    set_id: None,
+                },
+                refused(ReportKind::Output, coll(1), WriteRefusal::Grant),
+            ]
+        );
+    }
+
+    #[test]
+    fn steelseries_allowlist_rejects_wrong_role_id_opcode_kind_width_and_padding() {
+        for (pid, interface, id, width, settle) in [
+            (0x2202, 3, 0, 65, 1_500),
+            (0x12E5, 4, 6, 64, 5_000),
+            (0x2244, 3, 1, 64, 5_000),
+        ] {
+            let mut hub = Hub::new(Catalog::builtin(), Policy::default());
+            let mut group = group(1, 0x1038, pid);
+            let command = &mut group.collections[0];
+            command.interface = Some(interface);
+            command.usage_page = 0xFFC0;
+            command.usage = 1;
+            command.input_len = width;
+            command.output_len = width;
+            command.feature_len = width; // Descriptor width alone must not admit features.
+            let events = CollectionId(99);
+            let event_collection = Collection {
+                id: events,
+                interface: Some(if id == 0 { 5 } else { interface }),
+                usage_page: 0xFF00,
+                ..command.clone()
+            };
+            group.collections.push(event_collection);
+            let gid = group.id;
+            assert!(hub.handle(HubInput::GroupArrived(group), 0).is_empty());
+            let key = hub.engines[&gid].key.clone();
+            let grant = hub
+                .scheduler
+                .request(&key, gid, Trigger::RefreshNow, 0)
+                .unwrap();
+
+            let mut valid = vec![0; usize::from(width)];
+            valid[..2].copy_from_slice(&[id, 0xB0]);
+            let mut wrong_id = valid.clone();
+            wrong_id[0] = id ^ 1;
+            let mut nonzero_pad = valid.clone();
+            *nonzero_pad.last_mut().unwrap() = 1;
+            let mut wrong_op = valid.clone();
+            wrong_op[1] = 0xB1; // Elite settings reset is never an allowed command.
+            let output = ReportKind::Output;
+            for (kind, collection, bytes, reason) in [
+                (output, events, &valid[..], WriteRefusal::Collection),
+                (output, coll(1), &valid[..2], WriteRefusal::Width),
+                (output, coll(1), &wrong_id, WriteRefusal::Rule),
+                (output, coll(1), &wrong_op, WriteRefusal::Rule),
+                (output, coll(1), &nonzero_pad, WriteRefusal::Rule),
+                (ReportKind::GetFeature, coll(1), &valid, WriteRefusal::Rule),
+                (ReportKind::SetFeature, coll(1), &valid, WriteRefusal::Rule),
+            ] {
+                assert_eq!(
+                    hub.admit_write(
+                        gid,
+                        grant.id,
+                        SendRequest {
+                            collection,
+                            kind,
+                            bytes,
+                            deadline: Some(100),
+                        },
+                        0,
+                    ),
+                    Err(reason)
+                );
+            }
+            assert_eq!(sends(&hub.handle(HubInput::Tick, settle)), [valid]);
+        }
+    }
+
+    #[test]
+    fn feature_deadline_uses_the_request_not_an_earlier_timer_and_is_capped_by_grant() {
+        for (requested, expected) in [(180, 180), (500, 200)] {
+            let f = fake();
+            f.borrow_mut().deadline = Some(105); // The same engine also has an earlier timer.
+            let request = |deadline| Action::Send {
+                grant: THIS_GRANT,
+                collection: coll(1),
+                kind: ReportKind::GetFeature,
+                bytes: vec![0x31, 0, 0, 0],
+                deadline,
+            };
+            f.borrow_mut().on_grant.push_back(vec![
+                request(None),
+                request(Some(100)),
+                request(Some(requested)),
+            ]);
+            let mut g = group(1, 0x046D, 0xC547);
+            g.collections[0].feature_len = 4;
+            let mut hub = hub_with(
+                Policy {
+                    discovery_budget: 1,
+                    discovery_ms: 100,
+                    ..Policy::default()
+                },
+                &[(1, &f)],
+            );
+            let refused = HubOutput::WriteRefused {
+                collection: coll(1),
+                kind: ReportKind::GetFeature,
+                reason: WriteRefusal::Deadline,
+            };
+            assert_eq!(
+                hub.handle(HubInput::GroupArrived(g), 100),
+                [
+                    refused.clone(),
+                    refused,
+                    HubOutput::Send {
+                        collection: coll(1),
+                        kind: ReportKind::GetFeature,
+                        bytes: vec![0x31, 0, 0, 0],
+                        deadline: Some(expected),
+                        set_id: None,
+                    }
+                ]
+            );
+            assert_eq!(hub.next_deadline(), Some(105));
+        }
+    }
+
+    #[test]
+    fn foreign_and_expired_grants_cannot_send_to_a_live_collection() {
+        let (a, b) = (fake(), fake());
+        let mut hub = hub_with(
+            Policy {
+                discovery_ms: 100,
+                discovery_budget: 1,
+                ..Policy::default()
+            },
+            &[(1, &a), (2, &b)],
+        );
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+        let Call::Grant(first) = a.borrow().calls[0].clone() else {
+            panic!("expected arrival grant");
+        };
+        b.borrow_mut()
+            .on_report
+            .push_back(vec![send(first.id, coll(2), 0xA1)]);
+        let foreign = hub.handle(report(2), 1);
+        a.borrow_mut()
+            .on_report
+            .push_back(vec![send(first.id, coll(1), 0xA1)]);
+        let original = hub.handle(report(1), 100);
+        let Call::Grant(second) = b.borrow().calls[0].clone() else {
+            panic!("expected arrival grant");
+        };
+        b.borrow_mut()
+            .on_report
+            .push_back(vec![send(second.id, coll(2), 0xA1)]);
+        let expired = hub.handle(report(2), 101);
+
+        assert!(sends(&foreign).is_empty(), "{foreign:?}");
+        assert_eq!(sends(&original), vec![vec![0xA1]]);
+        assert!(sends(&expired).is_empty(), "{expired:?}");
+    }
+
+    #[test]
+    fn ownership_changes_revoke_a_delayed_device_grant_for_both_engines() {
+        let (a, b) = (fake(), fake());
+        let key = dev("shared-unit");
+        a.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&key, None)]);
+        let mut hub = hub(&[(1, &a), (2, &b)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+        hub.handle(HubInput::RefreshNow, 1);
+        let Call::Grant(grant) = a.borrow().calls.last().unwrap().clone() else {
+            panic!("expected device refresh grant");
+        };
+        assert_eq!(grant.subject, key);
+        b.borrow_mut()
+            .on_report
+            .push_back(vec![register(&key, None)]);
+        hub.handle(report(2), 2);
+        assert_eq!(hub.keys_of(GroupId(2)), vec![key.clone()]);
+        for (id, engine) in [(1, &a), (2, &b)] {
+            engine
+                .borrow_mut()
+                .on_report
+                .push_back(vec![send(grant.id, coll(id), 0xA1)]);
+            let out = hub.handle(report(id), 3);
+            assert!(sends(&out).is_empty(), "{out:?}");
+        }
+        hub.handle(HubInput::GroupRemoved(GroupId(2)), 4);
+        assert_eq!(hub.keys_of(GroupId(1)), vec![key]);
+        a.borrow_mut()
+            .on_report
+            .push_back(vec![send(grant.id, coll(1), 0xA1)]);
+        let out = hub.handle(report(1), 5);
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    fn hidpp_frame(head: &[u8]) -> Vec<u8> {
+        let mut bytes = head.to_vec();
+        bytes.resize(20, 0);
+        bytes
+    }
+
+    fn hidpp_group(id: u32, receiver: bool) -> HidGroup {
+        let mut group = group(id, 0x046D, 0xC547);
+        group.collections[0].output_len = 20;
+        if !receiver {
+            group.collections[0].product = "Fake USB Mouse".into();
+        }
+        group
+    }
+
+    fn hidpp_receiver() -> HubInput {
+        HubInput::GroupArrived(hidpp_group(1, true))
+    }
+
+    fn hidpp_reply(hub: &mut Hub, head: &[u8]) -> Vec<HubOutput> {
+        hidpp_report(hub, 1, head)
+    }
+
+    fn hidpp_report(hub: &mut Hub, group: u32, head: &[u8]) -> Vec<HubOutput> {
+        hub.handle(
+            HubInput::Report {
+                collection: coll(group),
+                origin: ReportOrigin::Input,
+                bytes: hidpp_frame(head),
+            },
+            1,
+        )
+    }
+
+    fn hidpp_try_send(hub: &mut Hub, head: &[u8]) -> Vec<HubOutput> {
+        hidpp_group_send(hub, 1, GrantId(1), head)
+    }
+
+    fn hidpp_group_send(hub: &mut Hub, group: u32, grant: GrantId, head: &[u8]) -> Vec<HubOutput> {
+        let mut pass = Pass::default();
+        hub.apply(
+            GroupId(group),
+            vec![Action::Send {
+                grant,
+                collection: coll(group),
+                kind: ReportKind::Output,
+                bytes: hidpp_frame(head),
+                deadline: None,
+            }],
+            None,
+            1,
+            &mut pass,
+        );
+        pass.out
+    }
+
+    #[test]
+    fn hidpp_does_not_route_a_volume_collection_from_the_same_group() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        let volume = CollectionId(31);
+        let mut control = group.collections[0].clone();
+        control.id = volume;
+        (control.usage_page, control.usage) = (0x000C, 1);
+        group.collections.push(control);
+        assert!(!sends(&hub.handle(HubInput::GroupArrived(group), 0)).is_empty());
+
+        let reply = [0x11, 0xFF, 0x81, 0, 0, 0, 0];
+        let unrelated = hub.handle(
+            HubInput::Report {
+                collection: volume,
+                origin: ReportOrigin::Input,
+                bytes: hidpp_frame(&reply),
+            },
+            1,
+        );
+        assert!(sends(&unrelated).is_empty(), "{unrelated:?}");
+        assert!(!sends(&hidpp_reply(&mut hub, &reply)).is_empty());
+    }
+
+    #[test]
+    fn hidpp_feature_calls_use_the_discovered_feature_in_their_own_slot() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        for reply in [
+            &[0x10, 1, 0x41, 0, 0, 0, 0][..],
+            &[0x11, 1, 0, 0x1B, 2],
+            &[0x11, 1, 0, 0x0B, 5], // Name
+            &[0x11, 1, 0, 0x0B, 3], // Unit ID
+            &[0x11, 1, 0, 0x0B, 8], // Unified Battery
+        ] {
+            hidpp_reply(&mut hub, reply);
+        }
+        let read = [0x11, 1, 8, 0x1B];
+        assert_eq!(
+            sends(&hidpp_try_send(&mut hub, &read)),
+            [hidpp_frame(&read)]
+        );
+        for frame in [
+            [0x11, 1, 9, 0x1B, 0, 0], // Unknown feature index
+            [0x11, 1, 3, 0x1B, 0, 0], // Known feature, forbidden function
+            [0x11, 2, 8, 0x1B, 0, 0], // Same index in another slot
+            [0x11, 1, 8, 0x1B, 1, 0], // Read with unapproved parameters
+            [0x11, 1, 0, 0x0B, 0, 1], // Root lookup for an unused feature
+            [0x11, 1, 5, 0x1B, 1, 0], // Name offset without the matching name read
+        ] {
+            let out = hidpp_try_send(&mut hub, &frame);
+            assert!(sends(&out).is_empty(), "{frame:02X?}: {out:?}");
+        }
+        hidpp_reply(&mut hub, &[0x10, 1, 0x40, 2]);
+        let out = hidpp_try_send(&mut hub, &read);
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidpp_notification_set_can_only_add_its_bit_to_the_matched_read() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let get = [0x11, 0xFF, 0x81, 0];
+        let set = [0x11, 0xFF, 0x80, 0, 0xA4, 0x21, 0x44];
+        assert_eq!(sends(&hub.handle(hidpp_receiver(), 0)), [hidpp_frame(&get)]);
+        let feature_reply = hub.handle(
+            HubInput::Report {
+                collection: coll(1),
+                origin: ReportOrigin::FeatureReply,
+                bytes: hidpp_frame(&[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44]),
+            },
+            1,
+        );
+        assert!(sends(&feature_reply).is_empty(), "{feature_reply:?}");
+        let unbacked = hidpp_try_send(&mut hub, &set);
+        assert_eq!(
+            sends(&hidpp_reply(
+                &mut hub,
+                &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44]
+            )),
+            [hidpp_frame(&set)]
+        );
+        for frame in [
+            [0x11, 0xFF, 0x80, 0, 0xA4, 0x23, 0x44],
+            [0x11, 0xFF, 0x80, 0, 0xA0, 0x21, 0x44],
+            [0x11, 1, 0x80, 0, 0xA4, 0x21, 0x44],
+        ] {
+            let out = hidpp_try_send(&mut hub, &frame);
+            assert!(sends(&out).is_empty(), "{frame:02X?}: {out:?}");
+        }
+        let notify = [0x11, 0xFF, 0x80, 2, 2];
+        assert_eq!(
+            sends(&hidpp_reply(&mut hub, &[0x11, 0xFF, 0x80, 0])),
+            [hidpp_frame(&notify)]
+        );
+        assert!(sends(&unbacked).is_empty(), "{unbacked:?}");
+        for frame in [
+            set, // Read evidence is no longer current.
+            [0x11, 0xFF, 0x80, 2, 0x03, 0, 0],
+            [0x11, 0xFF, 0x81, 0x09, 0, 0, 0],
+            [0x11, 0xFF, 0x81, 0, 1, 0, 0],
+            [0x11, 1, 0x80, 2, 2, 0, 0],
+        ] {
+            let out = hidpp_try_send(&mut hub, &frame);
+            assert!(sends(&out).is_empty(), "{frame:02X?}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn hidpp_reserved_index_from_root_never_emits_a_feature_call() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        for reply in [
+            &[0x10, 1, 0x41, 0, 0, 0, 0][..],
+            &[0x11, 1, 0, 0x1B, 2],
+            &[0x11, 1, 0, 0x0B, 0x80], // A malformed Root reply for the name feature.
+            &[0x11, 1, 0, 0x0B, 0],    // No unit ID.
+        ] {
+            hidpp_reply(&mut hub, reply);
+        }
+        let out = hidpp_reply(&mut hub, &[0x11, 1, 0, 0x0B, 8]); // Unified battery.
+        assert_eq!(
+            out,
+            [HubOutput::WriteRefused {
+                collection: coll(1),
+                kind: ReportKind::Output,
+                reason: WriteRefusal::Rule,
+            }]
+        );
+    }
+
+    #[test]
+    fn hidpp_receiver_slot_rejects_complemented_feature_replies_and_errors() {
+        for foreign in [
+            &[0x11, 0xFE, 0, 0x0B, 5][..],
+            &[0x11, 0xFE, 0xFF, 0, 0x0B, 0x02],
+            &[0x10, 0xFE, 0x8F, 0, 0x0B, 0x02, 0],
+        ] {
+            let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+            hub.handle(hidpp_receiver(), 0);
+            hidpp_reply(&mut hub, &[0x10, 1, 0x41, 0, 0, 0, 0]);
+            hidpp_reply(&mut hub, &[0x11, 1, 0, 0x1B, 2]);
+            let out = hidpp_reply(&mut hub, foreign);
+            assert!(out.is_empty(), "{foreign:02X?}: {out:?}");
+            assert_eq!(
+                sends(&hidpp_reply(&mut hub, &[0x11, 1, 0, 0x0B, 5])),
+                [hidpp_frame(&[0x11, 1, 0, 0x0B, 0, 3])]
+            );
+        }
+    }
+
+    #[test]
+    fn hidpp_receiver_slot_rejects_complemented_register_replies_and_errors() {
+        for foreign in [
+            &[0x11, 0xFE, 0x81, 0, 0xA4, 0x20, 0x44][..],
+            &[0x10, 0xFE, 0x8F, 0x81, 0, 0x02, 0],
+        ] {
+            let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+            hub.handle(hidpp_receiver(), 0);
+            hidpp_reply(&mut hub, &[0x10, 1, 0x41, 0, 0, 0, 0]);
+            assert_eq!(
+                sends(&hidpp_reply(&mut hub, &[0x10, 1, 0x8F, 0, 0x1B, 1, 0])),
+                [hidpp_frame(&[0x11, 1, 0x81, 0])]
+            );
+            let out = hidpp_reply(&mut hub, foreign);
+            assert!(out.is_empty(), "{foreign:02X?}: {out:?}");
+            assert_eq!(
+                sends(&hidpp_reply(
+                    &mut hub,
+                    &[0x11, 1, 0x81, 0, 0xA4, 0x20, 0x44]
+                )),
+                [hidpp_frame(&[0x11, 1, 0x80, 0, 0xB4, 0x20, 0x44])]
+            );
+        }
+    }
+
+    #[test]
+    fn hidpp_receiver_itself_does_not_accept_the_direct_device_reply_alias() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        let out = hidpp_reply(&mut hub, &[0x11, 0, 0x81, 0, 0xA4, 0x20, 0x44]);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(
+            sends(&hidpp_reply(
+                &mut hub,
+                &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44]
+            )),
+            [hidpp_frame(&[0x11, 0xFF, 0x80, 0, 0xA4, 0x21, 0x44])]
+        );
+    }
+
+    fn hidpp_discover_unified(hub: &mut Hub, group: u32, device: u8, reply: u8, unit: [u8; 4]) {
+        let [a, b, c, d] = unit;
+        if device != 0xFF {
+            hidpp_report(hub, group, &[0x10, device, 0x41, 0, 0, 0, 0]);
+        }
+        for frame in [
+            &[0x11, reply, 0, 0x1B, 2][..],
+            &[0x11, reply, 0, 0x0B, 0], // No name feature.
+            &[0x11, reply, 0, 0x0B, 3], // Unit ID at index 3.
+            &[0x11, reply, 0, 0x0B, 8], // Unified battery at index 8.
+            &[0x11, reply, 3, 0x0B, 0, a, b, c, d],
+            &[0x11, reply, 8, 0x1B, 34, 4, 0, 0],
+        ] {
+            hidpp_report(hub, group, frame);
+        }
+    }
+
+    #[test]
+    fn hidpp_live_receiver_group_grant_cannot_read_a_device_owned_by_its_cable() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let unit = [0x12, 0x34, 0x56, 0x78];
+        let key = dev("logi:unit:12345678");
+        hub.handle(hidpp_receiver(), 0);
+        hidpp_discover_unified(&mut hub, 1, 1, 1, unit);
+        assert_eq!(hub.keys_of(GroupId(1)), std::slice::from_ref(&key));
+        let read = [0x11, 1, 8, 0x1B];
+        assert_eq!(
+            sends(&hidpp_try_send(&mut hub, &read)),
+            [hidpp_frame(&read)]
+        );
+
+        hub.handle(HubInput::GroupArrived(hidpp_group(2, false)), 1);
+        // Direct devices can answer an FF request with address 00.
+        hidpp_discover_unified(&mut hub, 2, 0xFF, 0, unit);
+        assert!(hub.keys_of(GroupId(1)).is_empty());
+        assert_eq!(hub.keys_of(GroupId(2)), [key]);
+
+        let refused = hidpp_try_send(&mut hub, &read);
+        let unknown_slot_ping = [0x11, 2, 0, 0x1B, 0, 0, 0x5A];
+        assert_eq!(
+            sends(&hidpp_try_send(&mut hub, &unknown_slot_ping)),
+            [hidpp_frame(&unknown_slot_ping)],
+            "the receiver group grant must still permit discovery of an unknown slot"
+        );
+        assert!(sends(&refused).is_empty(), "{refused:?}");
+    }
+
+    #[test]
+    fn hidpp_receiver_group_grant_can_read_its_device_under_a_hub_alias() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        hub.handle(hidpp_receiver(), 0);
+        hidpp_discover_unified(&mut hub, 1, 1, 1, [0; 4]);
+        hub.handle(HubInput::GroupArrived(hidpp_group(2, true)), 1);
+        hidpp_discover_unified(&mut hub, 2, 1, 1, [0; 4]);
+        assert_eq!(hub.keys_of(GroupId(1)), [dev("logi:C547:1")]);
+        assert_eq!(hub.keys_of(GroupId(2)), [dev("logi:C547:1#2")]);
+
+        let read = [0x11, 1, 8, 0x1B];
+        assert_eq!(
+            sends(&hidpp_group_send(&mut hub, 2, GrantId(3), &read)),
+            [hidpp_frame(&read)]
+        );
+    }
+
+    fn with_hidpp_collection(group: &mut HidGroup, id: CollectionId, short: bool) {
+        let mut collection = group.collections[0].clone();
+        collection.id = id;
+        if short {
+            collection.usage = 1;
+            collection.input_len = 7;
+            collection.output_len = 7;
+        }
+        group.collections.push(collection);
+    }
+
+    #[test]
+    fn hidpp_duplicate_short_command_collections_are_refused_without_long_fallback() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        with_hidpp_collection(&mut group, CollectionId(31), true);
+        with_hidpp_collection(&mut group, CollectionId(32), true);
+        let out = hub.handle(HubInput::GroupArrived(group), 0);
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidpp_duplicate_long_only_command_collections_are_refused() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        with_hidpp_collection(&mut group, CollectionId(31), false);
+        let out = hub.handle(HubInput::GroupArrived(group), 0);
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidpp_unique_short_command_collection_wins_over_duplicate_longs() {
+        let mut hub = Hub::new(Catalog::parse(CATALOG).unwrap(), Policy::default());
+        let mut group = hidpp_group(1, true);
+        with_hidpp_collection(&mut group, CollectionId(31), false);
+        let short = CollectionId(32);
+        with_hidpp_collection(&mut group, short, true);
+        let out = hub.handle(HubInput::GroupArrived(group), 0);
+        assert_eq!(
+            out,
+            [HubOutput::Send {
+                collection: short,
+                kind: ReportKind::Output,
+                bytes: vec![0x10, 0xFF, 0x81, 0, 0, 0, 0],
+                deadline: None,
+                set_id: None,
+            }]
         );
     }
 
@@ -1220,6 +2383,78 @@ quirks = { query_wakes = true }
         assert_eq!(grants(&f).last(), Some(&(a, Trigger::Connected)));
     }
 
+    fn system_reading(
+        presence: Presence,
+        level: Option<Level>,
+        source: crate::model::Source,
+    ) -> HubInput {
+        HubInput::System(crate::model::SystemObservation {
+            update: DeviceUpdate {
+                key: dev("bt:synthetic"),
+                name: Some("Headset".into()),
+                kind: Some(DeviceKind::Headset),
+                via: Some(Via::Bluetooth),
+                level,
+                millivolts: None,
+                charge: None,
+                presence: Some(presence),
+                source,
+            },
+            verification: Verification::SourceVerified,
+            reports_changes: true,
+        })
+    }
+
+    #[test]
+    fn system_readings_change_once_and_never_route_grants() {
+        use crate::model::Source;
+        let mut hub = hub(&[]);
+        let key = dev("bt:synthetic");
+        let first = system_reading(Presence::Online, Some(Level::Percent(80)), Source::Os);
+        assert_eq!(hub.handle(first.clone(), 10), [HubOutput::StateChanged]);
+        let initial = hub.snapshot();
+        assert!(initial[0].reports_changes);
+        assert_eq!(initial[0].verification, Verification::SourceVerified);
+        assert_eq!(initial[0].poll_min_ms, None);
+        assert!(hub.handle(first, 20).is_empty());
+        assert_eq!(hub.snapshot(), initial);
+        let second = system_reading(Presence::Online, Some(Level::Percent(65)), Source::Os);
+        assert_eq!(hub.handle(second.clone(), 30), [HubOutput::StateChanged]);
+        assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(65)));
+        assert_eq!(hub.snapshot()[0].updated_ms, 30);
+        assert!(hub.handle(second, 40).is_empty());
+        assert!(hub.handle(HubInput::Activity(key.clone()), 50).is_empty());
+        assert!(hub.handle(HubInput::RefreshNow, 60).is_empty());
+        assert!(hub.handle(HubInput::Resume, 70).is_empty());
+        assert_eq!(hub.audio_ready_at(&key), None);
+    }
+
+    #[test]
+    fn system_presence_keeps_sample_and_disappearance_expires_once() {
+        use crate::model::Source;
+        let mut hub = hub(&[]);
+        hub.handle(
+            system_reading(Presence::Online, Some(Level::Percent(80)), Source::Os),
+            10,
+        );
+        let asleep = system_reading(Presence::Asleep, None, Source::Push);
+        assert_eq!(hub.handle(asleep, 20), [HubOutput::StateChanged]);
+        let gone = HubInput::SystemGone(dev("bt:synthetic"));
+        assert_eq!(hub.handle(gone.clone(), 30), [HubOutput::StateChanged]);
+        assert!(hub.handle(gone, 50).is_empty());
+        let last = &hub.snapshot()[0];
+        assert_eq!(last.presence, Presence::Offline);
+        assert_eq!(last.level, Some(Level::Percent(80)));
+        assert_eq!((last.source, last.updated_ms), (Source::Os, 10));
+        assert_eq!(hub.next_deadline(), Some(60_030));
+        assert!(hub.handle(HubInput::Tick, 60_029).is_empty());
+        assert_eq!(
+            hub.handle(HubInput::Tick, 60_030),
+            [HubOutput::StateChanged]
+        );
+        assert!(hub.snapshot().is_empty());
+    }
+
     #[test]
     fn removal_keeps_state_for_grace_then_drops() {
         let f = fake();
@@ -1242,12 +2477,12 @@ quirks = { query_wakes = true }
         assert!(out.is_empty(), "{out:?}");
         assert!(state(&hub, &a).is_some());
         // The scheduler keeps the device through the grace.
-        assert_eq!(hub.activity_ready_at(&a), Some(100_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(100_000));
 
         let out = hub.handle(HubInput::Tick, 1_000 + 60_000);
         assert_eq!(out, vec![HubOutput::StateChanged]);
         assert!(hub.snapshot().is_empty());
-        assert_eq!(hub.activity_ready_at(&a), None, "scheduler forgot it");
+        assert_eq!(hub.audio_ready_at(&a), None, "scheduler forgot it");
     }
 
     #[test]
@@ -1514,9 +2749,210 @@ quirks = { query_wakes = true }
     fn activity_gap() -> Capabilities {
         Capabilities {
             pushes_battery: false,
+            audio: true,
             min_query_gap_ms: 100_000,
             ..pushing()
         }
+    }
+
+    #[test]
+    fn awake_signal_changes_presence_without_moving_measurement_or_interval() {
+        let f = fake();
+        let key = dev("dual-source");
+        let caps = Capabilities {
+            awake_signal: true,
+            ..activity_gap()
+        };
+        f.borrow_mut().on_grant.extend([
+            vec![register_with(&key, caps, Some(Level::Percent(60)))],
+            vec![send(THIS_GRANT, coll(1), 1)],
+        ]);
+        f.borrow_mut().on_report.extend([
+            vec![Action::Asleep(key.clone())],
+            vec![Action::Awake(key.clone())],
+            vec![Action::Awake(key.clone())],
+            vec![Action::Awake(key.clone())],
+        ]);
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 1_000);
+        hub.handle(intervals(&key, 500_000), 1_000);
+        hub.handle(report(1), 2_000);
+        assert_eq!(hub.audio_ready_at(&key), None);
+
+        assert_eq!(
+            hub.handle(report(1), 100_999),
+            [HubOutput::StateChanged],
+            "presence changes before a read is eligible"
+        );
+        let device = state(&hub, &key).unwrap();
+        assert_eq!(device.presence, Presence::Online);
+        assert_eq!(device.updated_ms, 1_000);
+        assert_eq!(device.level, Some(Level::Percent(60)));
+        assert_eq!(hub.audio_ready_at(&key), Some(101_000));
+        assert!(hub.handle(HubInput::Tick, 101_000).is_empty());
+        assert_eq!(grants(&f), [(group_key(1), Trigger::Arrival)]);
+
+        assert_eq!(sends(&hub.handle(report(1), 101_000)), [vec![1]]);
+        assert_eq!(grants(&f).last(), Some(&(key.clone(), Trigger::Awake)));
+        assert_eq!(state(&hub, &key).unwrap().updated_ms, 1_000);
+        assert_eq!(hub.audio_ready_at(&key), Some(601_000));
+
+        assert!(hub.handle(report(1), 101_001).is_empty());
+        assert_eq!(hub.audio_ready_at(&key), Some(601_000));
+        hub.handle(HubInput::Activity(key.clone()), 600_999);
+        assert_eq!(grants(&f).len(), 2);
+        hub.handle(HubInput::Activity(key.clone()), 601_000);
+        assert_eq!(grants(&f).last(), Some(&(key, Trigger::Activity)));
+    }
+
+    fn awake_only() -> Capabilities {
+        Capabilities {
+            audio: false,
+            awake_signal: true,
+            query_wakes: true,
+            ..activity_gap()
+        }
+    }
+
+    #[test]
+    fn awake_only_device_needs_a_fresh_input_even_when_the_gap_is_due() {
+        let f = fake();
+        let key = dev("wake-only");
+        f.borrow_mut().on_grant.extend([
+            vec![register_with(&key, awake_only(), None)],
+            vec![send(THIS_GRANT, coll(1), 1)],
+            vec![send(THIS_GRANT, coll(1), 2)],
+        ]);
+        f.borrow_mut()
+            .on_report
+            .extend((0..4).map(|_| vec![Action::Awake(key.clone())]));
+        let mut hub = hub(&[(1, &f)]);
+        hub.handle(logi(1), 0);
+        hub.handle(intervals(&key, 10_000), 0);
+        let device = state(&hub, &key).unwrap();
+        assert_eq!(device.poll_min_ms, Some(100_000));
+        assert!(!device.reports_changes);
+        assert_eq!(hub.audio_ready_at(&key), None);
+
+        assert!(hub.handle(report(1), 99_999).is_empty());
+        assert!(hub.handle(HubInput::Tick, 100_000).is_empty());
+        assert!(
+            hub.handle(HubInput::Activity(key.clone()), 100_000)
+                .is_empty()
+        );
+        assert_eq!(grants(&f), [(group_key(1), Trigger::Arrival)]);
+        assert_eq!(sends(&hub.handle(report(1), 100_000)), [vec![1]]);
+        assert!(hub.handle(report(1), 199_999).is_empty());
+        assert_eq!(sends(&hub.handle(report(1), 200_000)), [vec![2]]);
+    }
+
+    #[test]
+    fn only_a_routed_input_action_from_the_current_owner_can_signal_awake() {
+        let (old, current) = (fake(), fake());
+        let key = dev("shared");
+        for f in [&old, &current] {
+            f.borrow_mut().on_grant.push_back(vec![register_with(
+                &key,
+                awake_only(),
+                Some(Level::Percent(60)),
+            )]);
+        }
+        old.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Awake(key.clone())]);
+        current.borrow_mut().on_report.extend([
+            vec![Action::Asleep(key.clone())],
+            vec![
+                Action::Awake(dev("unregistered")),
+                Action::Awake(group_key(2)),
+            ],
+            vec![Action::Awake(key.clone())],
+            vec![Action::Connected(group_key(2))],
+            vec![Action::Awake(key.clone())],
+        ]);
+        current
+            .borrow_mut()
+            .on_tick
+            .push_back(vec![Action::Awake(key.clone())]);
+        current.borrow_mut().on_grant.extend([
+            vec![Action::Awake(key.clone())],
+            vec![send(THIS_GRANT, coll(2), 1)],
+        ]);
+        let mut hub = hub(&[(1, &old), (2, &current)]);
+        hub.handle(logi(1), 0);
+        let mut group = group(2, 0x046D, 0xC547);
+        group.collections[0].feature_len = 1;
+        hub.handle(HubInput::GroupArrived(group), 0);
+        hub.handle(report(2), 1_000);
+
+        for input in [
+            report(1),
+            report(2),
+            HubInput::Report {
+                collection: coll(2),
+                origin: ReportOrigin::FeatureReply,
+                bytes: vec![0x11],
+            },
+            HubInput::Tick,
+            report(2), // Nested grant triggered from Input cannot inherit its permission.
+        ] {
+            let out = hub.handle(input, 100_000);
+            assert!(out.is_empty(), "{out:?}");
+            let device = state(&hub, &key).unwrap();
+            assert_eq!(device.presence, Presence::Asleep);
+            assert_eq!(device.updated_ms, 0);
+        }
+        assert_eq!(grants(&old), [(group_key(1), Trigger::Arrival)]);
+        assert_eq!(
+            grants(&current),
+            [
+                (group_key(2), Trigger::Arrival),
+                (group_key(2), Trigger::Connected)
+            ]
+        );
+        assert_eq!(sends(&hub.handle(report(2), 100_000)), [vec![1]]);
+        assert_eq!(grants(&current).last(), Some(&(key, Trigger::Awake)));
+    }
+
+    #[test]
+    fn restored_owner_does_not_inherit_the_departing_owners_activity_sources() {
+        let (old, current) = (fake(), fake());
+        let key = dev("shared");
+        old.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&key, Some(Level::Percent(50)))]);
+        old.borrow_mut()
+            .on_report
+            .push_back(vec![Action::Awake(key.clone())]);
+        let caps = Capabilities {
+            awake_signal: true,
+            ..polled()
+        };
+        current
+            .borrow_mut()
+            .on_grant
+            .push_back(vec![register_with(&key, caps, None)]);
+        current
+            .borrow_mut()
+            .on_report
+            .push_back(vec![charge_update(&key, Charge::Charging)]);
+        let mut hub = hub(&[(1, &old), (2, &current)]);
+        hub.handle(logi(1), 0);
+        hub.handle(logi(2), 0);
+        hub.handle(report(2), 0);
+        assert_eq!(hub.next_deadline(), Some(300_000));
+
+        hub.handle(HubInput::GroupRemoved(GroupId(2)), 1);
+        let device = state(&hub, &key).unwrap();
+        assert_eq!(device.charge, Charge::Charging);
+        assert_eq!(device.poll_min_ms, None);
+        assert!(device.reports_changes);
+        assert_eq!(hub.next_deadline(), None);
+        assert_eq!(hub.audio_ready_at(&key), None);
+        assert!(hub.handle(report(1), 300_000).is_empty());
+        assert!(hub.handle(HubInput::Activity(key), 300_000).is_empty());
+        assert!(hub.handle(HubInput::Tick, 300_000).is_empty());
+        assert_eq!(grants(&old), [(group_key(1), Trigger::Arrival)]);
     }
 
     #[test]
@@ -1530,7 +2966,7 @@ quirks = { query_wakes = true }
         // The discovery that registers a device reads its battery: audio already playing
         // must not ask again at once.
         hub.handle(logi(1), 1_000);
-        assert_eq!(hub.activity_ready_at(&a), Some(101_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(101_000));
 
         hub.handle(HubInput::Activity(a.clone()), 100_999);
         hub.handle(HubInput::Activity(a.clone()), 101_000);
@@ -1579,12 +3015,12 @@ quirks = { query_wakes = true }
             .push_back(vec![Action::Asleep(poll.clone())]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
-        assert_eq!(hub.activity_ready_at(&poll), Some(100_000));
-        assert_eq!(hub.activity_ready_at(&push), None, "pushes");
-        assert_eq!(hub.activity_ready_at(&dev("unknown")), None);
+        assert_eq!(hub.audio_ready_at(&poll), Some(100_000));
+        assert_eq!(hub.audio_ready_at(&push), None, "pushes");
+        assert_eq!(hub.audio_ready_at(&dev("unknown")), None);
 
         hub.handle(report(1), 1);
-        assert_eq!(hub.activity_ready_at(&poll), None, "asleep");
+        assert_eq!(hub.audio_ready_at(&poll), None, "asleep");
     }
 
     #[test]
@@ -1645,18 +3081,20 @@ quirks = { query_wakes = true }
             })]);
         let mut hub = hub(&[(1, &f)]);
         hub.handle(logi(1), 0);
-        assert_eq!(hub.activity_ready_at(&a), Some(100_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(100_000));
 
         hub.handle(report(1), 50_000);
-        assert_eq!(hub.activity_ready_at(&a), Some(150_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(150_000));
         hub.handle(report(1), 60_000);
-        assert_eq!(hub.activity_ready_at(&a), Some(150_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(150_000));
     }
 
     /// A device asked during use, with the headset's 5-minute minimum.
     fn polled() -> Capabilities {
         Capabilities {
             pushes_battery: false,
+            audio: true,
+            charging: true,
             min_query_gap_ms: 300_000,
             ..pushing()
         }
@@ -1702,7 +3140,7 @@ quirks = { query_wakes = true }
         assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Activity)));
 
         assert_eq!(hub.handle(intervals(&a, 1_800_000), 500_000), vec![]);
-        assert_eq!(hub.activity_ready_at(&a), Some(2_200_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(2_200_000));
     }
 
     #[test]
@@ -1724,13 +3162,13 @@ quirks = { query_wakes = true }
         hub.handle(HubInput::Activity(a.clone()), 300_000);
         hub.handle(intervals(&a, 1_800_000), 300_000);
         hub.handle(report(1), 400_000);
-        assert_eq!(hub.activity_ready_at(&a), None, "asleep");
+        assert_eq!(hub.audio_ready_at(&a), None, "asleep");
 
         let t = 1_000_000;
         hub.handle(report(1), t);
-        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(t + 300_000));
         hub.handle(HubInput::Activity(a.clone()), t + 300_000);
-        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000 + 1_800_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(t + 300_000 + 1_800_000));
         assert_eq!(
             grants(&f),
             vec![
@@ -1768,10 +3206,10 @@ quirks = { query_wakes = true }
         let t = 1_000_000;
         hub.handle(report(1), t);
         assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Connected)));
-        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(t + 300_000));
         hub.handle(HubInput::Activity(a.clone()), t + 300_000);
         assert_eq!(grants(&f).last(), Some(&(a.clone(), Trigger::Activity)));
-        assert_eq!(hub.activity_ready_at(&a), Some(t + 300_000 + 1_800_000));
+        assert_eq!(hub.audio_ready_at(&a), Some(t + 300_000 + 1_800_000));
     }
 
     /// A reading of `key` with status `charge`.
@@ -1880,6 +3318,43 @@ quirks = { query_wakes = true }
     }
 
     #[test]
+    fn polled_device_without_charging_opt_in_has_no_silent_timer() {
+        let f = fake();
+        let key = dev("activity-only");
+        let caps = Capabilities {
+            awake_signal: true,
+            ..activity_gap()
+        };
+        let mut hub = registered_with_charge(&f, &key, caps, Charge::Charging);
+
+        assert_eq!(hub.next_deadline(), None);
+        assert!(hub.handle(HubInput::Tick, 100_000).is_empty());
+        assert_eq!(grants(&f), [(group_key(1), Trigger::Arrival)]);
+        hub.handle(HubInput::Activity(key.clone()), 100_000);
+        assert_eq!(grants(&f).last(), Some(&(key, Trigger::Activity)));
+    }
+
+    #[test]
+    fn charging_opt_in_does_not_expose_an_audio_interval() {
+        let f = fake();
+        let key = dev("charging-only");
+        let caps = Capabilities {
+            audio: false,
+            ..polled()
+        };
+        let mut hub = registered_with_charge(&f, &key, caps, Charge::Charging);
+
+        assert_eq!(state(&hub, &key).unwrap().poll_min_ms, None);
+        assert_eq!(hub.audio_ready_at(&key), None);
+        assert_eq!(hub.next_deadline(), Some(300_000));
+        hub.handle(HubInput::Activity(key.clone()), 300_000);
+        assert_eq!(grants(&f), [(group_key(1), Trigger::Arrival)]);
+        hub.handle(HubInput::Tick, 300_000);
+        assert_eq!(grants(&f).last(), Some(&(key, Trigger::Activity)));
+        assert_eq!(hub.next_deadline(), Some(900_000));
+    }
+
+    #[test]
     fn keys_of_lists_devices_the_group_owns() {
         let (f1, f2) = (fake(), fake());
         let (a, b) = (dev("a"), dev("b"));
@@ -1909,6 +3384,7 @@ quirks = { query_wakes = true }
         let out = hub.handle(
             HubInput::Report {
                 collection: CollectionId(77),
+                origin: ReportOrigin::Input,
                 bytes: vec![1],
             },
             5,
@@ -1938,7 +3414,14 @@ quirks = { query_wakes = true }
 
         let out = hub.handle(report(2), 5);
 
-        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(
+            out,
+            [HubOutput::WriteRefused {
+                kind: ReportKind::Output,
+                collection: coll(1),
+                reason: WriteRefusal::Collection,
+            }]
+        );
         let s = state(&hub, &a).unwrap();
         assert_eq!(s.level, Some(Level::Percent(80)));
         assert_eq!(s.presence, Presence::Online);

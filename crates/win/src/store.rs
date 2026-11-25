@@ -64,6 +64,8 @@ pub struct Store {
     /// Set when `settings.toml` may hold settings that were not loaded (unreadable, or
     /// rejected but not set aside): the next save renames it to `settings.toml.bad` first.
     keep_existing: Arc<AtomicBool>,
+    /// Set when `history.tsv` exists but could not be read ([`Store::load_history`]).
+    history_unread: AtomicBool,
 }
 
 impl Store {
@@ -92,6 +94,7 @@ impl Store {
             done,
             writer,
             keep_existing,
+            history_unread: AtomicBool::new(false),
         }
     }
 
@@ -131,6 +134,13 @@ impl Store {
         Settings::default()
     }
 
+    /// Whether a save would replace only settings that were loaded (or none): false while
+    /// `settings.toml` holds settings that could not be read or set aside, until a save has
+    /// set it aside. Automatic saves wait for this; a user's own change does not.
+    pub fn settings_loaded(&self) -> bool {
+        !self.keep_existing.load(Ordering::Relaxed)
+    }
+
     /// Queues writing `settings` to `settings.toml` (temp file, then rename); when several
     /// saves queue up between two [`Store::run`] jobs, only the latest is written.
     pub fn save_settings(&self, settings: Settings) {
@@ -140,6 +150,13 @@ impl Store {
     /// Queues appending `line` and a line break to `history.tsv`. `line` holds no line break.
     pub fn append_history(&self, line: String) {
         let _ = self.jobs.send(Job::Append(line));
+    }
+
+    /// Whether [`Store::load_history`] read the history: true when there is no file, false
+    /// when one exists but could not be read (its empty result then says nothing about which
+    /// devices have history).
+    pub fn history_loaded(&self) -> bool {
+        !self.history_unread.load(Ordering::Relaxed)
     }
 
     /// The samples of `history.tsv` from the 30 days before `now_unix_ms` (and up to a day
@@ -157,6 +174,7 @@ impl Store {
             Err(e) => {
                 if e.kind() != ErrorKind::NotFound {
                     trace::store_line(&format!("history unreadable: {e}"));
+                    self.history_unread.store(true, Ordering::Relaxed);
                 }
                 return Vec::new();
             }
@@ -380,6 +398,7 @@ mod tests {
         let dir = TempDir::new();
         let store = open(&dir);
         assert_eq!(store.load_settings(), Settings::default());
+        assert!(store.settings_loaded());
         store.stop();
         assert!(!dir.path().join("settings.toml.bad").exists());
     }
@@ -397,6 +416,8 @@ mod tests {
             let store = open(&dir);
 
             assert_eq!(store.load_settings(), Settings::default());
+            // Set aside: a save no longer replaces anything unread.
+            assert!(store.settings_loaded());
             store.stop();
             assert!(!file.exists());
             assert_eq!(
@@ -455,6 +476,8 @@ mod tests {
         // Another program holds the file without sharing it: it cannot be read.
         let held = hold(&file, 0);
         assert_eq!(store.load_settings(), Settings::default());
+        // Not loaded: only a user's own change may set the file aside.
+        assert!(!store.settings_loaded());
         drop(held);
         let saved = Settings {
             display: DisplayMode::Tray,
@@ -482,6 +505,7 @@ mod tests {
         // Readable, but not renamable while held without delete sharing.
         let held = hold(&file, FILE_SHARE_READ.0);
         assert_eq!(store.load_settings(), Settings::default());
+        assert!(!store.settings_loaded());
         drop(held);
         assert_eq!(fs::read(&file).unwrap(), garbage);
         store.save_settings(Settings::default());
@@ -741,6 +765,8 @@ mod tests {
         let dir = TempDir::new();
         let store = open(&dir);
         assert!(store.load_history(NOW).is_empty());
+        // No file: nothing to miss.
+        assert!(store.history_loaded());
         store.stop();
         assert!(!dir.path().join("history.tsv").exists());
 
@@ -750,6 +776,7 @@ mod tests {
         let store = open(&dir);
         let held = hold(&file, 0);
         assert!(store.load_history(NOW).is_empty());
+        assert!(!store.history_loaded());
         drop(held);
         store.stop();
         assert_eq!(fs::read_to_string(&file).unwrap(), text);

@@ -1,0 +1,112 @@
+# Exact USB PID/protocol rows only; no SteelSeries family fallback. `send` also
+# receives B0. `receive` selects the separate, input-only event role even when
+# that collection advertises an output capability. Windows HIDP_CAPS includes
+# the leading ID byte even for unnumbered reports.
+
+[[device]]
+name = "SteelSeries Arctis Nova 7 family"
+vid = 0x1038
+pids = [0x2202, 0x2206, 0x220A, 0x223A, 0x227A, 0x22A4]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl steelseries_arctis_nova_7/7p.hpp (PIDs, 0–4, command); Linux hid-steelseries-arctis.c (quarter steps, if 3/5); Linux-Arctis-Manager nova_7.yaml (event selector)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 }
+steelseries = "nova7-steps"
+
+[[device]]
+name = "SteelSeries Arctis Nova 7 family"
+vid = 0x1038
+pids = [0x227E, 0x2258, 0x229E, 0x22AD, 0x22A1, 0x22A5, 0x22A7, 0x22A9, 0x2298, 0x22AB]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl steelseries_arctis_nova_7/7p.hpp (PIDs, percent, command); Linux-Arctis-Manager nova_7_gen2.yaml (also WoW upgrade 22AB), base_arctis_nova_7_gen2.yaml (B0 layout, events); HaloBattery Nova 7 22A1"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 }
+steelseries = "nova7-percent"
+
+[[device]]
+name = "SteelSeries Arctis Nova 5 family"
+vid = 0x1038
+pids = [0x2232, 0x2253, 0x2264]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl steelseries_arctis_nova_5.hpp (PIDs, command, offsets); Linux-Arctis-Manager nova_5.yaml; Arctis-Sound-Manager #348/#364 (if 5 pushes); CachyOS #628 (5X percent offset)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 }
+steelseries = "nova5-percent"
+
+[[device]]
+name = "SteelSeries Arctis Nova 3 Wireless family"
+vid = 0x1038
+pids = [0x2269, 0x226D]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl steelseries_arctis_nova_3p_wireless.hpp (PIDs, command, percent offset); Linux-Arctis-Manager arctis_nova_3_wireless.yaml (event selector); HaloBattery #149 (3P status)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 }
+steelseries = "nova5-percent"
+
+[[device]]
+name = "SteelSeries Arctis 7+ family"
+vid = 0x1038
+pids = [0x220E, 0x2212, 0x2216, 0x2236]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl steelseries_arctis_7_plus.hpp (PIDs, if 3 command, 0–4); Linux-Arctis-Manager arctis_7_plus.yaml (B0 and events; if 3 implementation vs GG if 5)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 }
+steelseries = "arctis7-plus"
+
+[[device]]
+name = "SteelSeries Arctis GameBuds"
+vid = 0x1038
+pids = [0x230A]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl steelseries_arctis_gamebuds.hpp (PID, if 3 command, lower active-bud percent); Linux-Arctis-Manager base_arctis_gamebuds_dongle.yaml (if 5 and RF B5/B7 layouts)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 }
+steelseries = "game-buds"
+
+[[device]]
+name = "SteelSeries Arctis Nova Pro Wireless"
+vid = 0x1038
+pids = [0x12E0, 0x12E5, 0x225D]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "Linux-Arctis-Manager nova_pro_wireless.yaml (PIDs, if 4), base_arctis_nova_pro_wireless.yaml (06 B0, steps, 07 events); arctis-omni-linux Protocol; HaloBattery #41 (12E5 Windows selectors)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 4 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 4, output_len = 64 }
+steelseries = "station06-steps"
+
+[[device]]
+name = "SteelSeries Arctis Nova Pro Omni"
+vid = 0x1038
+pids = [0x2290]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl #584 (01 B0 on FFC0 if 3); arctis-omni-linux Protocol (percent, 07 events); Linux-Arctis-Manager nova_pro_omni.yaml (PID and selectors)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 3 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 64 }
+steelseries = "station01-percent"
+
+[[device]]
+name = "SteelSeries Arctis Nova Elite"
+vid = 0x1038
+pids = [0x2244, 0x2246, 0x2270]
+kind = "headset"
+engine = "steelseries"
+status = "source-verified"
+source = "HeadsetControl #481 and HaloBattery protocols.md (2244, Windows 01 B0 percent and 07 pushes); Linux-Arctis-Manager nova_elite.yaml (selectors, 2270); Arctis-Sound-Manager nova_elite.yaml and #110 (2246 PC-mode rear ports)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 3 }
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 64 }
+steelseries = "station01-percent"

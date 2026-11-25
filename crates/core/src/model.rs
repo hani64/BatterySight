@@ -14,6 +14,7 @@ pub enum DeviceKind {
     Mouse,
     Keyboard,
     Headset,
+    Speaker,
     Controller,
     Other,
 }
@@ -87,9 +88,11 @@ pub struct DeviceState {
     pub updated_ms: Ms,
     pub source: Source,
     pub verification: Verification,
-    /// The engine's minimum gap between battery checks while the device is in use, for a
-    /// device asked during use; `None` for one that pushes its battery or is never asked.
+    /// The engine's minimum for battery checks driven by audio or a device's awake
+    /// signal, when an interval setting is available.
     pub poll_min_ms: Option<Ms>,
+    /// Whether the device reports battery changes on its own.
+    pub reports_changes: bool,
 }
 
 /// Partial change to a [`DeviceState`]; `None` fields leave the current value untouched.
@@ -104,6 +107,14 @@ pub struct DeviceUpdate {
     pub charge: Option<Charge>,
     pub presence: Option<Presence>,
     pub source: Source,
+}
+
+/// A reading from a system source that does not participate in HID grant routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemObservation {
+    pub update: DeviceUpdate,
+    pub verification: Verification,
+    pub reports_changes: bool,
 }
 
 impl DeviceState {
@@ -153,6 +164,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::SourceVerified,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 

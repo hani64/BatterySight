@@ -1,0 +1,2405 @@
+//! Replays synthesized vendor frames through the real catalog, selection and hub.
+
+use batterysight_core::catalog::Catalog;
+use batterysight_core::engine::FeatureSetId;
+use batterysight_core::engines::rapoo::RapooEngine;
+use batterysight_core::hid::{
+    Collection, CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin,
+};
+use batterysight_core::hub::{Hub, HubInput, HubOutput};
+use batterysight_core::model::{Charge, DeviceKind, Level, Presence, Source, Verification, Via};
+use batterysight_core::scheduler::Policy;
+use batterysight_core::time::Ms;
+
+const RX: CollectionId = CollectionId(1);
+const OTHER: CollectionId = CollectionId(2);
+
+// Source layouts: pspfreak/rapoo-mouse-battery (FF00:0002, 19 bytes), Rapoo A HUB
+// VT_CH584 manifest and EB.handleReport (FF00:000F, offsets with report ID),
+// and OpenMouse's VT9 Pro receiver (FF00:0002, 7 bytes, beside a 10-byte sibling).
+const NORDIC: [u8; 19] = [
+    0x07, 0x20, 3, 0x40, 6, 0x40, 6, 2, 65, 0, 1, 1, 0, 0x13, 0x46, 0, 0, 0, 0xCC,
+];
+const CH584: [u8; 19] = [
+    0x08, 0x20, 3, 0x40, 6, 0x40, 6, 1, 42, 0, 1, 1, 0, 0x11, 0x4A, 0, 0, 0, 0xCC,
+];
+const LEGACY: [u8; 7] = [0xBB, 0xB0, 0x51, 0x20, 3, 1, 98];
+
+fn collection(pid: u16, usage: u16, len: u16) -> Collection {
+    Collection {
+        id: RX,
+        vid: 0x24AE,
+        pid,
+        usage_page: 0xFF00,
+        usage,
+        interface: Some(1),
+        input_len: len,
+        input_report_05: None,
+        output_len: len,
+        feature_len: 0,
+        product: String::new(),
+    }
+}
+
+fn group(rx: Collection) -> HidGroup {
+    HidGroup {
+        id: GroupId(1),
+        collections: vec![rx],
+    }
+}
+
+fn feed(hub: &mut Hub, input: HubInput, now: Ms) -> Vec<HubOutput> {
+    let out = hub.handle(input, now);
+    assert!(
+        out.iter().all(|event| *event == HubOutput::StateChanged),
+        "passive engine emitted {out:?} at {now}"
+    );
+    out
+}
+
+fn report(hub: &mut Hub, bytes: &[u8], now: Ms) -> Vec<HubOutput> {
+    feed(
+        hub,
+        HubInput::Report {
+            collection: RX,
+            origin: ReportOrigin::Input,
+            bytes: bytes.to_vec(),
+        },
+        now,
+    )
+}
+
+fn hub() -> Hub {
+    Hub::new(Catalog::builtin(), Policy::default())
+}
+
+fn replay(rx: Collection, bytes: &[u8], name: &str, level: u8, via: Via) {
+    let mut hub = hub();
+    assert!(feed(&mut hub, HubInput::GroupArrived(group(rx)), 0).is_empty());
+    assert!(hub.snapshot().is_empty());
+    assert_eq!(report(&mut hub, bytes, 10), [HubOutput::StateChanged]);
+    let snap = hub.snapshot();
+    assert_eq!(snap.len(), 1);
+    let state = &snap[0];
+    assert_eq!(state.name, name);
+    assert_eq!(state.kind, DeviceKind::Mouse);
+    assert_eq!(state.via, via);
+    assert_eq!(state.level, Some(Level::Percent(level)));
+    assert_eq!(state.charge, Charge::Unknown);
+    assert_eq!(state.presence, Presence::Online);
+    assert_eq!(state.source, Source::Push);
+    assert_eq!(state.updated_ms, 10);
+    assert_eq!(state.verification, Verification::SourceVerified);
+    assert!(state.reports_changes);
+    assert_eq!(state.poll_min_ms, None);
+}
+
+#[test]
+fn rapoo_vt7_nordic_07_receiver_and_cable() {
+    replay(
+        collection(0x1413, 2, 19),
+        &NORDIC,
+        "Rapoo VT7",
+        65,
+        Via::Receiver,
+    );
+    let mut wired = NORDIC;
+    wired[1] = 0x22;
+    replay(collection(0x4613, 2, 19), &wired, "Rapoo VT7", 65, Via::Usb);
+}
+
+#[test]
+fn rapoo_vt2_pro_max_nordic_07_short_status() {
+    // renanleonel/windows-taskbar-battery src/rapoo.rs: VT2 Pro Max capture.
+    replay(
+        collection(0x1423, 2, 13),
+        &NORDIC[..13],
+        "Rapoo VT2 Pro Max",
+        65,
+        Via::Receiver,
+    );
+}
+
+#[test]
+fn rapoo_vt9_pro_v2_nordic_07_receiver_and_cable() {
+    // k997/rapoo readme.md: 18 data bytes, plus the report ID on Windows.
+    let mut status = NORDIC;
+    status[13] = 0xA9;
+    replay(
+        collection(0x14A9, 2, 19),
+        &status,
+        "Rapoo VT9 Pro V2",
+        65,
+        Via::Receiver,
+    );
+    status[1] = 0x22;
+    replay(
+        collection(0x46A9, 2, 19),
+        &status,
+        "Rapoo VT9 Pro V2",
+        65,
+        Via::Usb,
+    );
+}
+
+#[test]
+fn rapoo_vt1_se_ch584_08_receiver_and_cable() {
+    replay(
+        collection(0x1A11, 0x0F, 19),
+        &CH584,
+        "Rapoo VT1 SE",
+        42,
+        Via::Receiver,
+    );
+    let mut wired = CH584;
+    wired[1] = 0x22;
+    replay(
+        collection(0x4A11, 0x0F, 19),
+        &wired,
+        "Rapoo VT1 SE",
+        42,
+        Via::Usb,
+    );
+}
+
+#[test]
+fn rapoo_vt7_se_ch584_08_receiver_and_cable() {
+    let mut status = CH584;
+    status[13] = 0;
+    replay(
+        collection(0x1A00, 0x0F, 19),
+        &status,
+        "Rapoo VT7 SE",
+        42,
+        Via::Receiver,
+    );
+    status[1] = 0x22;
+    replay(
+        collection(0x4A00, 0x0F, 19),
+        &status,
+        "Rapoo VT7 SE",
+        42,
+        Via::Usb,
+    );
+}
+
+#[test]
+fn rapoo_vt9_pro_legacy_bb_b0() {
+    replay(
+        collection(0x1205, 2, 7),
+        &LEGACY,
+        "Rapoo VT9 Pro (1st gen)",
+        98,
+        Via::Receiver,
+    );
+}
+
+#[test]
+fn rapoo_vt9_pro_185a_legacy_bb_b0() {
+    // wuxx7/rapoo-vt9pro-battery rapoo_proto.py: 0x42 mode, not 0x51.
+    let mut status = LEGACY;
+    status[2] = 0x42;
+    replay(
+        collection(0x185A, 2, 7),
+        &status,
+        "Rapoo VT9 Pro",
+        98,
+        Via::Receiver,
+    );
+}
+
+#[test]
+fn rapoo_vt3_pro_legacy_unknown_level_does_not_replace_last_percent() {
+    // PyFlat RapooProtocol.cs documents 0x7F only with state 2.
+    let mut hub = hub();
+    feed(
+        &mut hub,
+        HubInput::GroupArrived(group(collection(0x1215, 2, 7))),
+        0,
+    );
+    let unavailable = [0xBB, 0xB0, 0x51, 0x20, 3, 2, 0x7F];
+    assert_eq!(report(&mut hub, &LEGACY, 1), [HubOutput::StateChanged]);
+    assert!(report(&mut hub, &[0xBB, 0xB0, 0x51, 0x20, 3, 1, 0x7F], 2).is_empty());
+    let out = report(&mut hub, &unavailable, 3);
+    let online = hub.snapshot();
+    assert_eq!(online[0].updated_ms, 1, "presence is not a new measurement");
+    assert_eq!(online[0].presence, Presence::Online);
+    assert_eq!(online[0].level, Some(Level::Percent(98)));
+    assert_eq!(online[0].charge, Charge::Unknown);
+    assert!(out.is_empty(), "no snapshot change while already online");
+    assert_eq!(hub.next_deadline(), Some(60_003));
+    assert!(feed(&mut hub, HubInput::Tick, 60_002).is_empty());
+    assert_eq!(
+        feed(&mut hub, HubInput::Tick, 60_003),
+        [HubOutput::StateChanged]
+    );
+    assert_eq!(hub.snapshot()[0].presence, Presence::Asleep);
+    assert_eq!(
+        report(&mut hub, &unavailable, 60_004),
+        [HubOutput::StateChanged]
+    );
+    assert_eq!(
+        hub.snapshot(),
+        online,
+        "wake without a new battery measurement"
+    );
+    assert_eq!(hub.next_deadline(), Some(120_004));
+
+    let mut unread = Hub::new(Catalog::builtin(), Policy::default());
+    feed(
+        &mut unread,
+        HubInput::GroupArrived(group(collection(0x1215, 2, 7))),
+        0,
+    );
+    assert_eq!(
+        report(&mut unread, &unavailable, 1),
+        [HubOutput::StateChanged]
+    );
+    let initial = unread.snapshot();
+    assert_eq!(initial[0].presence, Presence::Online);
+    assert_eq!(initial[0].level, None);
+    assert_eq!(unread.next_deadline(), Some(60_001));
+}
+
+#[test]
+fn rapoo_rearrival_heartbeat_keeps_the_cached_sample_age() {
+    let mut hub = hub();
+    let rx = collection(0x1215, 2, 7);
+    feed(&mut hub, HubInput::GroupArrived(group(rx.clone())), 0);
+    assert_eq!(report(&mut hub, &LEGACY, 1), [HubOutput::StateChanged]);
+    feed(&mut hub, HubInput::GroupRemoved(GroupId(1)), 50);
+    let mut returned = group(rx);
+    returned.id = GroupId(2);
+    feed(&mut hub, HubInput::GroupArrived(returned), 60);
+    // The receiver's first frame after re-enumeration is the 7F heartbeat.
+    report(&mut hub, &[0xBB, 0xB0, 0x51, 0x20, 3, 2, 0x7F], 70);
+    let state = hub.snapshot().remove(0);
+    assert_eq!(state.level, Some(Level::Percent(98)));
+    assert_eq!((state.updated_ms, state.source), (1, Source::Push));
+    assert_eq!(state.presence, Presence::Online);
+}
+
+#[test]
+fn rapoo_vt3_pro_legacy_bb_b0_receiver_and_cable() {
+    // PyFlat RapooProtocol.cs: exact 7-byte collection and both USB IDs.
+    let mut status = LEGACY;
+    status[5] = 2;
+    replay(
+        collection(0x1215, 2, 7),
+        &status,
+        "Rapoo VT3 Pro",
+        98,
+        Via::Receiver,
+    );
+    replay(
+        collection(0x4415, 2, 7),
+        &status,
+        "Rapoo VT3 Pro",
+        98,
+        Via::Usb,
+    );
+}
+
+#[test]
+fn rapoo_rejects_wrong_roles_and_models() {
+    let cases = [
+        (
+            "consumer page",
+            Collection {
+                usage_page: 0x000C,
+                ..collection(0x1205, 2, 7)
+            },
+        ),
+        ("mailbox usage", collection(0x1205, 0x0E, 7)),
+        ("same-usage legacy sibling", collection(0x1205, 2, 10)),
+        ("office model", collection(0x1870, 2, 7)),
+        ("conflicting PID", collection(0x1417, 2, 7)),
+        ("unverified legacy model", collection(0x1233, 2, 7)),
+        (
+            "foreign VID",
+            Collection {
+                vid: 0x1234,
+                ..collection(0x1205, 2, 7)
+            },
+        ),
+    ];
+    let hub = hub();
+    for (label, rx) in cases {
+        assert!(
+            hub.select_group(&group(rx), |_, _| None).is_none(),
+            "{label}"
+        );
+    }
+    assert!(
+        hub.select_group(&group(collection(0x1A11, 2, 19)), |_, _| None)
+            .is_none()
+    );
+    let mut g = group(collection(0x1205, 2, 7));
+    g.collections.push(Collection {
+        id: OTHER,
+        ..g.collections[0].clone()
+    });
+    assert!(
+        hub.select_group(&g, |_, _| None).is_none(),
+        "ambiguous exact RX"
+    );
+}
+
+#[test]
+fn rapoo_passive_selection_requires_only_the_preselected_receive_path() {
+    let catalog = Catalog::builtin();
+    let entry = catalog
+        .devices()
+        .iter()
+        .find(|entry| entry.vid == 0x24AE && entry.pids.contains(&0x1205))
+        .unwrap();
+    let mut g = group(collection(0x1205, 2, 7));
+    g.collections.push(Collection {
+        id: OTHER,
+        ..collection(0x1205, 2, 10)
+    });
+    assert!(RapooEngine::new(&g, entry).is_some());
+    let mut hub = Hub::new(catalog, Policy::default());
+    let selection = hub
+        .select_group(&g, |_, _| None)
+        .expect("select passive RX");
+    assert_eq!(selection.command_report_id(), None);
+    assert!(selection.opens(RX));
+    assert!(selection.reads(RX));
+    assert!(
+        !selection.sends(RX),
+        "output-capable descriptor must still open read-only"
+    );
+    assert!(!selection.opens(OTHER));
+    assert!(!selection.sends(OTHER));
+    assert!(selection.ready(&g));
+    assert!(!selection.ready(&HidGroup {
+        id: g.id,
+        collections: vec![g.collections[1].clone()],
+    }));
+
+    feed(&mut hub, HubInput::MatchedGroupArrived(g, selection), 0);
+    for (collection, origin) in [
+        (OTHER, ReportOrigin::Input),
+        (RX, ReportOrigin::FeatureReply),
+    ] {
+        assert!(
+            feed(
+                &mut hub,
+                HubInput::Report {
+                    collection,
+                    origin,
+                    bytes: LEGACY.to_vec(),
+                },
+                1,
+            )
+            .is_empty()
+        );
+        assert!(hub.snapshot().is_empty());
+    }
+    assert_eq!(report(&mut hub, &LEGACY, 2), [HubOutput::StateChanged]);
+}
+
+#[test]
+fn rapoo_rejects_cross_model_malformed_and_cybercafe_frames() {
+    for (rx, frame, wrong_id, offset) in [
+        (collection(0x1413, 2, 19), &NORDIC[..], 0x08, 8),
+        (collection(0x1A11, 0x0F, 19), &CH584[..], 0x07, 8),
+        (collection(0x1205, 2, 7), &LEGACY[..], 0xBC, 6),
+    ] {
+        let mut hub = hub();
+        feed(&mut hub, HubInput::GroupArrived(group(rx)), 0);
+        assert_eq!(report(&mut hub, frame, 100), [HubOutput::StateChanged]);
+        let before = hub.snapshot();
+        let mut other_id = frame.to_vec();
+        other_id[0] = wrong_id;
+        let mut too_large = frame.to_vec();
+        too_large.push(0);
+        let mut out_of_range = frame.to_vec();
+        out_of_range[offset] = 101;
+        let mut bad_status = frame.to_vec();
+        bad_status[offset - 1] = 0xFF;
+        for invalid in [
+            &other_id[..],
+            &too_large,
+            &frame[..frame.len() - 1],
+            &out_of_range,
+            &bad_status,
+            &[],
+        ] {
+            assert!(
+                report(&mut hub, invalid, 5_099).is_empty(),
+                "{invalid:02X?}"
+            );
+        }
+        for event in [0xB1, 0xB2, 0xB3] {
+            let mut invalid = frame.to_vec();
+            invalid[1] = event;
+            assert!(
+                report(&mut hub, &invalid, 5_099).is_empty(),
+                "{invalid:02X?}"
+            );
+        }
+        if offset == 8 {
+            let mut foreign = frame.to_vec();
+            foreign[13..15].copy_from_slice(&0x466Du16.to_le_bytes());
+            assert!(
+                report(&mut hub, &foreign, 5_099).is_empty(),
+                "foreign embedded model PID"
+            );
+            foreign.copy_from_slice(frame);
+            foreign[1] = 0xB0; // Cybercafe status wrapper is not the cataloged retail body.
+            assert!(report(&mut hub, &foreign, 5_099).is_empty());
+        }
+        assert_eq!(hub.snapshot(), before);
+        assert_eq!(hub.next_deadline(), Some(60_100));
+    }
+}
+
+#[test]
+fn rapoo_refresh_preserves_last_reading_and_natural_reports_wake_after_idle() {
+    let mut hub = hub();
+    feed(
+        &mut hub,
+        HubInput::GroupArrived(group(collection(0x1413, 2, 19))),
+        0,
+    );
+    assert!(feed(&mut hub, HubInput::RefreshNow, 1).is_empty());
+    assert!(feed(&mut hub, HubInput::Resume, 5_001).is_empty());
+    assert!(hub.snapshot().is_empty());
+    assert_eq!(hub.next_deadline(), None);
+
+    assert_eq!(report(&mut hub, &NORDIC, 10_000), [HubOutput::StateChanged]);
+    let online = hub.snapshot();
+    assert_eq!(online[0].presence, Presence::Online);
+    assert_eq!(hub.next_deadline(), Some(70_000));
+    assert!(feed(&mut hub, HubInput::RefreshNow, 10_001).is_empty());
+    assert!(feed(&mut hub, HubInput::Tick, 15_001).is_empty());
+    assert!(feed(&mut hub, HubInput::Activity(online[0].key.clone()), 69_998).is_empty());
+    assert!(feed(&mut hub, HubInput::Tick, 69_999).is_empty());
+    assert_eq!(hub.snapshot(), online);
+    assert_eq!(hub.next_deadline(), Some(70_000));
+
+    assert_eq!(
+        feed(&mut hub, HubInput::Tick, 70_000),
+        [HubOutput::StateChanged]
+    );
+    let asleep = hub.snapshot();
+    assert_eq!(asleep[0].presence, Presence::Asleep);
+    assert_eq!(asleep[0].level, Some(Level::Percent(65)));
+    assert_eq!(asleep[0].updated_ms, 10_000);
+    assert_eq!(hub.next_deadline(), None);
+    assert!(feed(&mut hub, HubInput::RefreshNow, 70_001).is_empty());
+    assert!(feed(&mut hub, HubInput::Resume, 75_001).is_empty());
+    assert!(feed(&mut hub, HubInput::Tick, 75_001).is_empty());
+    assert_eq!(hub.snapshot(), asleep);
+
+    let mut wake = NORDIC;
+    wake[8] = 0;
+    assert_eq!(report(&mut hub, &wake, 75_002), [HubOutput::StateChanged]);
+    let fresh = hub.snapshot();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].presence, Presence::Online);
+    assert_eq!(fresh[0].level, Some(Level::Percent(0)));
+    assert_eq!(fresh[0].updated_ms, 75_002);
+    assert_eq!(hub.next_deadline(), Some(135_002));
+}
+
+fn steelseries_group(pid: u16, interface: u8, width: u16) -> HidGroup {
+    let command = Collection {
+        id: RX,
+        vid: 0x1038,
+        pid,
+        interface: Some(interface),
+        usage_page: 0xFFC0,
+        usage: 1,
+        input_len: width,
+        input_report_05: None,
+        output_len: width,
+        feature_len: 0,
+        product: String::new(),
+    };
+    let event = Collection {
+        id: OTHER,
+        interface: Some(if width == 65 { 5 } else { interface }),
+        usage_page: 0xFF00,
+        output_len: 0,
+        ..command.clone()
+    };
+    HidGroup {
+        id: GroupId(1),
+        collections: vec![command, event],
+    }
+}
+
+fn steelseries_input(
+    hub: &mut Hub,
+    collection: CollectionId,
+    bytes: &[u8],
+    now: Ms,
+) -> Vec<HubOutput> {
+    hub.handle(
+        HubInput::Report {
+            collection,
+            origin: ReportOrigin::Input,
+            bytes: bytes.to_vec(),
+        },
+        now,
+    )
+}
+
+fn steelseries_sent(out: Vec<HubOutput>, expected: Option<(u8, usize)>) {
+    let sends: Vec<_> = out
+        .into_iter()
+        .filter(|output| *output != HubOutput::StateChanged)
+        .collect();
+    let wanted: Vec<_> = expected
+        .into_iter()
+        .map(|(id, width)| {
+            let mut bytes = vec![0; width];
+            bytes[..2].copy_from_slice(&[id, 0xB0]);
+            HubOutput::Send {
+                collection: RX,
+                kind: ReportKind::Output,
+                bytes,
+                deadline: None,
+                set_id: None,
+            }
+        })
+        .collect();
+    assert_eq!(sends, wanted);
+}
+
+fn steelseries_state(hub: &Hub, presence: Presence, level: Option<u8>, charge: Charge) {
+    let states = hub.snapshot();
+    assert_eq!(states.len(), 1, "only the headset, never a spare or case");
+    let state = &states[0];
+    assert_eq!(state.kind, DeviceKind::Headset);
+    assert_eq!(state.via, Via::Receiver);
+    assert_eq!(state.presence, presence);
+    assert_eq!(state.level, level.map(Level::Percent));
+    assert_eq!(state.charge, charge);
+    assert_eq!(state.verification, Verification::SourceVerified);
+    assert!(state.reports_changes);
+    assert_eq!(state.poll_min_ms, None);
+}
+
+#[test]
+fn steelseries_nova_status_uses_exact_pid_scale_and_windows_report_id() {
+    // Linux hid-steelseries-arctis.c's separate Nova 7 scales and GG capture
+    // in Linux-Arctis-Manager nova_7_gen2.yaml; Nova 5X offset: CachyOS #628.
+    for (pid, frame, level, charge) in [
+        (0x2202, [0, 0xB0, 3, 3, 1, 0], 75, Charge::Charging),
+        (0x22A1, [0, 0xB0, 3, 3, 3, 0], 3, Charge::Discharging),
+        (0x2253, [0, 0xB0, 3, 3, 97, 3], 97, Charge::Discharging),
+    ] {
+        let mut hub = hub();
+        let group = steelseries_group(pid, 3, 65);
+        let selected = hub
+            .select_group(&group, |_, _| panic!("no metadata gate"))
+            .expect("a supported PID has an exact selection");
+        assert_eq!(selected.command_report_id(), Some(0));
+        assert!(selected.reads(RX) && selected.sends(RX));
+        assert!(selected.reads(OTHER) && !selected.sends(OTHER));
+        steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+        assert!(steelseries_input(&mut hub, RX, &frame[1..], 1).is_empty());
+        assert!(steelseries_input(&mut hub, OTHER, &frame, 2).is_empty());
+        steelseries_sent(steelseries_input(&mut hub, RX, &frame, 3), None);
+        steelseries_state(&hub, Presence::Online, Some(level), charge);
+        assert_eq!(hub.snapshot()[0].source, Source::Push);
+        assert!(hub.snapshot()[0].name.starts_with("SteelSeries "));
+    }
+}
+
+#[test]
+fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
+    let mut hub = hub();
+    let request = Some((0, 65));
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x2232, 3, 65)), 0),
+        None,
+    );
+    let due = hub.next_deadline().expect("initial settle");
+    assert!((1_000..=2_000).contains(&due));
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 2), None);
+    steelseries_sent(hub.handle(HubInput::Resume, 3), None);
+    steelseries_sent(hub.handle(HubInput::Tick, due - 1), None);
+    steelseries_sent(hub.handle(HubInput::Tick, due), request);
+    // The first up notification, even after settling, is not a down→up edge.
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], due + 1),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 0, 80, 3], due + 2),
+        None,
+    );
+    assert_eq!(hub.snapshot()[0].source, Source::Query);
+    assert_eq!(hub.next_deadline(), None);
+
+    // Arctis-Sound-Manager #348, a Nova 5; trailing 02 is not the state byte.
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 79, 2], 2_100),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1, 2], 2_101),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(79), Charge::Charging);
+    // Link edges are presence only: the 79% keeps its age and source.
+    let sampled = |hub: &Hub, at: Ms| {
+        let state = &hub.snapshot()[0];
+        assert_eq!((state.updated_ms, state.source), (at, Source::Push));
+    };
+    sampled(&hub, 2_101);
+    let key = hub.snapshot()[0].key.clone();
+    hub.handle(HubInput::SetIntervals([(key.clone(), 1)].into()), 2_102);
+    steelseries_sent(hub.handle(HubInput::Tick, 900_000), None);
+    steelseries_sent(hub.handle(HubInput::Activity(key), 900_001), None);
+    assert_eq!(hub.next_deadline(), None);
+
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_002),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 900_003),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    sampled(&hub, 2_101);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 2], 900_004),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_005),
+        request,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_006),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(79), Charge::Unknown);
+    sampled(&hub, 2_101);
+    steelseries_sent(hub.handle(HubInput::Tick, 910_000), None);
+    steelseries_sent(hub.handle(HubInput::Resume, 910_001), request);
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 910_002), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 910_003),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    sampled(&hub, 2_101);
+    // The dongle can answer an explicit read even when its radio link is down.
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 910_004), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 0, 65, 2], 910_005),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(65), Charge::NotCharging);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 910_006),
+        None,
+    );
+    // A B0 reply that reports the headset down carries no usable level.
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 2, 0, 40, 2], 920_000),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(65), Charge::Unknown);
+    let state = &hub.snapshot()[0];
+    assert_eq!((state.updated_ms, state.source), (910_005, Source::Query));
+}
+
+#[test]
+fn steelseries_rearrival_link_up_before_b0_keeps_the_cached_sample_age() {
+    let mut hub = hub();
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x2232, 3, 65)), 0),
+        None,
+    );
+    let due = hub.next_deadline().expect("initial settle");
+    steelseries_sent(hub.handle(HubInput::Tick, due), Some((0, 65)));
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 0, 80, 3], due + 1),
+        None,
+    );
+    steelseries_sent(hub.handle(HubInput::GroupRemoved(GroupId(1)), 10_000), None);
+    let mut returned = steelseries_group(0x2232, 3, 65);
+    returned.id = GroupId(2);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(returned), 10_010), None);
+    // B9 link-up arrives before the B0 reply re-establishes a level.
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 10_020),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(80), Charge::Discharging);
+    let state = &hub.snapshot()[0];
+    assert_eq!((state.updated_ms, state.source), (due + 1, Source::Query));
+}
+
+#[test]
+fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
+    // Linux-Arctis-Manager base_arctis_gamebuds_dongle.yaml (Windows fields),
+    // HeadsetControl steelseries_arctis_gamebuds.hpp (lower active-bud level).
+    let mut hub = hub();
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x230A, 3, 65)), 0),
+        None,
+    );
+    steelseries_sent(hub.handle(HubInput::Tick, 2_000), Some((0, 65)));
+    assert!(steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 3, 2, 2, 0, 0], 2_001).is_empty());
+    // On this PID B9 and BB are transparency and microphone mute, not link/charge.
+    assert!(steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3], 2_002).is_empty());
+    assert!(steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1], 2_003).is_empty());
+    let request = Some((0, 65));
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 3, 3, 2], 2_004),
+        request,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 3, 3, 3], 2_005),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 0, 0, 3, 3, 83, 32], 2_006),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(32), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 3, 3, 3, 2], 2_007),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(83), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 82, 0], 2_008),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(82), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 3, 3, 2, 2], 2_009),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(82), Charge::Unknown);
+    assert_eq!(
+        hub.snapshot()[0].updated_ms,
+        2_008,
+        "a dock-out is not a reading"
+    );
+    let offline = hub.snapshot();
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 0, 2, 3], 2_010),
+        request,
+    );
+    assert_eq!(
+        hub.snapshot(),
+        offline,
+        "no sample for the newly linked right bud"
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 57], 2_011),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(57), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 0, 3, 3], 2_012),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(57), Charge::Unknown);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 56], 2_013),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(0), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_stations_keep_numbered_framing_and_only_track_headset() {
+    // arctis-omni-linux README Protocol; Linux-Arctis-Manager
+    // base_arctis_nova_pro_wireless.yaml; HeadsetControl #481 (Elite push).
+    for (pid, interface, rid, raw, level, push_raw, push_level) in [
+        (0x12E5, 4, 0x06, 5, 62, 7, 87),
+        (0x2244, 3, 0x01, 99, 99, 95, 95),
+    ] {
+        let mut hub = hub();
+        let group = steelseries_group(pid, interface, 64);
+        let selection = hub.select_group(&group, |_, _| None).expect("station role");
+        assert_eq!(selection.command_report_id(), Some(rid));
+        assert!(selection.reads(RX) && selection.sends(RX));
+        assert!(selection.reads(OTHER) && !selection.sends(OTHER));
+        steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+        let due = hub.next_deadline().expect("station must settle");
+        assert!(due >= 5_000);
+        steelseries_sent(hub.handle(HubInput::Tick, due - 1), None);
+        steelseries_sent(hub.handle(HubInput::Tick, due), Some((rid, 64)));
+        let frame = [rid, 0xB0, 0, 0, 1, 0, raw, 0xFF, 8, 1, 2, 10, 3, 0, 8, 2];
+        assert!(steelseries_input(&mut hub, OTHER, &frame, due + 1).is_empty());
+        assert!(steelseries_input(&mut hub, RX, &[0x07, 0x19, 0, 0], due + 2).is_empty());
+        steelseries_sent(steelseries_input(&mut hub, RX, &frame, due + 3), None);
+        steelseries_state(&hub, Presence::Online, Some(level), Charge::Charging);
+        assert_eq!(hub.snapshot()[0].source, Source::Query);
+        steelseries_sent(
+            steelseries_input(&mut hub, OTHER, &[0x07, 0xB7, push_raw, 3, 4], due + 4),
+            None,
+        );
+        steelseries_state(
+            &hub,
+            Presence::Online,
+            Some(push_level),
+            Charge::NotCharging,
+        );
+        let mut charged = frame;
+        charged[6] = push_raw;
+        charged[15] = 4;
+        steelseries_sent(steelseries_input(&mut hub, RX, &charged, due + 5), None);
+        steelseries_state(&hub, Presence::Online, Some(push_level), Charge::Full);
+        steelseries_sent(
+            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 4], due + 6),
+            None,
+        );
+        steelseries_state(&hub, Presence::Offline, Some(push_level), Charge::Unknown);
+        steelseries_sent(
+            steelseries_input(&mut hub, OTHER, &[0x07, 0xB5, 0, 0, 8], due + 7),
+            Some((rid, 64)),
+        );
+        steelseries_sent(
+            steelseries_input(&mut hub, RX, &[0x07, 0xB5, 0, 0, 8], due + 8),
+            None,
+        );
+        steelseries_sent(hub.handle(HubInput::Tick, 1_000_000), None);
+        assert_eq!(hub.next_deadline(), None);
+    }
+}
+
+#[test]
+fn steelseries_rejects_malformed_or_foreign_frames_and_unmatched_roles() {
+    let mut hub = hub();
+    for (label, pid, interface, width) in [
+        ("unknown PID", 0x22FF, 3, 65),
+        ("station bootloader", 0x2245, 3, 64),
+        ("wired GameDAC", 0x12CB, 4, 64),
+        ("wrong interface", 0x2202, 4, 65),
+        ("wrong width", 0x2202, 3, 64),
+    ] {
+        assert!(
+            hub.select_group(&steelseries_group(pid, interface, width), |_, _| None)
+                .is_none(),
+            "{label}"
+        );
+    }
+    let mut group = steelseries_group(0x2202, 3, 65);
+    group.collections.push(Collection {
+        id: CollectionId(3),
+        ..group.collections[0].clone()
+    });
+    assert!(hub.select_group(&group, |_, _| None).is_none());
+    group.collections[2] = Collection {
+        id: CollectionId(3),
+        ..group.collections[1].clone()
+    };
+    assert!(hub.select_group(&group, |_, _| None).is_none());
+
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x2202, 3, 65)), 0),
+        None,
+    );
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 4, 3, 0], 1),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(100), Charge::Discharging);
+    let original = hub.snapshot();
+    for (collection, bytes) in [
+        (RX, &[0, 0xB0, 3, 1, 3][..]), // Missing the fifth payload byte.
+        (RX, &[0, 0xB0, 3, 5, 1, 0]),
+        (RX, &[0, 0xB0, 9, 2, 1, 0]),
+        (RX, &[0, 0xB0, 3, 2, 4, 0]),
+        (RX, &[0, 0xB1, 3, 2, 1, 0]),
+        (RX, &[1, 0xB0, 3, 2, 1, 0]),
+        (RX, &[0, 0xB9, 2]), // Events are not accepted on regular Nova command paths.
+        (OTHER, &[0, 0xB7, 5]),
+        (OTHER, &[0, 0xB9]),
+        (OTHER, &[0, 0xBB, 0xFF]),
+        (OTHER, &[0, 0xB5, 0, 0, 2, 2]), // Bluetooth event, not the 2.4 GHz link.
+    ] {
+        assert!(
+            steelseries_input(&mut hub, collection, bytes, 2).is_empty(),
+            "{bytes:02x?}"
+        );
+    }
+    assert!(
+        hub.handle(
+            HubInput::Report {
+                collection: RX,
+                origin: ReportOrigin::FeatureReply,
+                bytes: vec![0, 0xB0, 3, 2, 1, 0],
+            },
+            2,
+        )
+        .is_empty()
+    );
+    assert_eq!(hub.snapshot(), original);
+
+    for (pid, interface, rid, bad_level) in [(0x12E5, 4, 6, 9), (0x2290, 3, 1, 101)] {
+        let mut hub = self::hub();
+        hub.handle(
+            HubInput::GroupArrived(steelseries_group(pid, interface, 64)),
+            0,
+        );
+        let good = [rid, 0xB0, 0, 0, 1, 0, 4, 8, 8, 1, 2, 10, 3, 0, 8, 8];
+        steelseries_sent(steelseries_input(&mut hub, RX, &good, 1), None);
+        let original = hub.snapshot();
+        assert_eq!(original.len(), 1);
+        assert!(steelseries_input(&mut hub, RX, &good[..15], 2).is_empty());
+        for (offset, byte) in [
+            (0, 7),
+            (1, 0xB1),
+            (6, bad_level),
+            (6, 0xFF),
+            (14, 3),
+            (15, 3),
+        ] {
+            let mut bad = good;
+            bad[offset] = byte;
+            assert!(
+                steelseries_input(&mut hub, RX, &bad, 2).is_empty(),
+                "{bad:02x?}"
+            );
+        }
+        for bytes in [
+            &[0x07, 0xB7, 4, 0][..],
+            &[0x07, 0xB7, bad_level, 0, 4],
+            &[0x07, 0xB5, 0, 0],
+            &[0x07, 0xB5, 0, 0, 0xFF],
+            &[0x01, 0xB7, 4, 0, 2],
+        ] {
+            assert!(
+                steelseries_input(&mut hub, OTHER, bytes, 2).is_empty(),
+                "{bytes:02x?}"
+            );
+        }
+        assert_eq!(hub.snapshot(), original);
+    }
+}
+
+#[test]
+fn steelseries_7_plus_passively_reads_both_documented_event_paths() {
+    // LAM arctis_7_plus.yaml kept if 3 from real hardware; GG declares if 5.
+    let mut hub = hub();
+    let group = steelseries_group(0x2212, 3, 65);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 1_500), Some((0, 65)));
+    let push = [0, 0xB7, 3];
+    steelseries_sent(steelseries_input(&mut hub, RX, &push, 1_501), None);
+    steelseries_state(&hub, Presence::Online, Some(75), Charge::Unknown);
+    let push = [0, 0xB7, 2];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &push, 1_502), None);
+    steelseries_state(&hub, Presence::Online, Some(50), Charge::Unknown);
+    steelseries_sent(hub.handle(HubInput::Tick, 999_999), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn steelseries_an_expired_arrival_grant_is_not_retried() {
+    let mut hub = hub();
+    let group = steelseries_group(0x12E5, 4, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    // The synthetic loop missed the default 10-second discovery grant.
+    steelseries_sent(hub.handle(HubInput::Tick, 10_001), None);
+    assert_eq!(hub.next_deadline(), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 100_000), None);
+    steelseries_sent(hub.handle(HubInput::RefreshNow, 100_001), Some((6, 64)));
+}
+
+#[test]
+fn steelseries_station_unknown_push_charge_never_rearms_the_radio_edge() {
+    let mut hub = hub();
+    let group = steelseries_group(0x12E5, 4, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    let request = Some((6, 64));
+    steelseries_sent(hub.handle(HubInput::Tick, 5_000), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[7, 0xB5, 0, 0, 4], 5_001),
+        None,
+    );
+    let up = [7, 0xB5, 0, 0, 8];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &up, 5_002), request);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[7, 0xB7, 4, 0, 1], 5_003),
+        None,
+    );
+    steelseries_sent(steelseries_input(&mut hub, RX, &up, 5_004), None);
+    steelseries_state(&hub, Presence::Online, Some(50), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_station_passive_b7_updates_an_existing_reading_without_radio_evidence() {
+    // HeadsetControl PR #584: Omni can interleave 07 B7 reports with B0 replies.
+    let mut hub = hub();
+    let group = steelseries_group(0x2290, 3, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 5_000), Some((1, 64)));
+
+    let unknown = [7, 0xB7, 79, 0, 1];
+    let charging = [7, 0xB7, 80, 0, 2];
+    assert!(steelseries_input(&mut hub, OTHER, &unknown, 5_001).is_empty());
+    assert!(hub.snapshot().is_empty());
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &charging, 5_002), None);
+    steelseries_state(&hub, Presence::Online, Some(80), Charge::Charging);
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &unknown, 5_003), None);
+    steelseries_state(&hub, Presence::Online, Some(79), Charge::Unknown);
+
+    let up = [7, 0xB5, 0, 0, 8];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &up, 5_004), None);
+    let down = [7, 0xB5, 0, 0, 4];
+    steelseries_sent(steelseries_input(&mut hub, OTHER, &down, 5_005), None);
+    assert!(steelseries_input(&mut hub, OTHER, &charging, 5_006).is_empty());
+    assert!(steelseries_input(&mut hub, OTHER, &unknown, 5_007).is_empty());
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_station_b0_reports_link_up_even_when_charge_is_unknown() {
+    let mut hub = hub();
+    let group = steelseries_group(0x2290, 3, 64);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+    steelseries_sent(hub.handle(HubInput::Tick, 5_000), Some((1, 64)));
+    let linked = [1, 0xB0, 1, 0, 1, 0, 91, 0, 8, 1, 2, 10, 3, 0, 8, 1];
+    steelseries_sent(steelseries_input(&mut hub, RX, &linked, 5_001), None);
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[7, 0xB5, 0, 0, 8], 5_002),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(91), Charge::Unknown);
+}
+
+#[test]
+fn steelseries_dongle_replays_charge_before_level_but_not_across_disconnect() {
+    for disconnect in [false, true] {
+        let mut hub = hub();
+        let group = steelseries_group(0x2232, 3, 65);
+        steelseries_sent(hub.handle(HubInput::GroupArrived(group), 0), None);
+        steelseries_sent(hub.handle(HubInput::Tick, 1_500), Some((0, 65)));
+        // ASM #348/#364: BB and B7 are independent notifications.
+        assert!(steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1, 2], 1_501).is_empty());
+        assert!(
+            hub.snapshot().is_empty(),
+            "charging alone must not register"
+        );
+        if disconnect {
+            assert!(steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 1_502).is_empty());
+            steelseries_sent(
+                steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 1_503),
+                Some((0, 65)),
+            );
+        }
+        steelseries_sent(
+            steelseries_input(&mut hub, OTHER, &[0, 0xB7, 80, 2], 1_504),
+            None,
+        );
+        let charge = if disconnect {
+            Charge::Unknown
+        } else {
+            Charge::Charging
+        };
+        steelseries_state(&hub, Presence::Online, Some(80), charge);
+    }
+}
+
+fn hyperx_group(pid: u16, page: u16, usage: u16, width: u16) -> HidGroup {
+    let command = Collection {
+        id: RX,
+        vid: 0x03F0,
+        pid,
+        usage_page: page,
+        usage,
+        interface: Some(3),
+        input_len: width,
+        input_report_05: None,
+        output_len: width,
+        feature_len: 0,
+        product: String::new(),
+    };
+    let consumer = Collection {
+        id: OTHER,
+        usage_page: 0x000C,
+        usage: 1,
+        input_len: 2,
+        output_len: 0,
+        ..command.clone()
+    };
+    HidGroup {
+        id: GroupId(1),
+        collections: vec![consumer, command],
+    }
+}
+
+fn hyperx_packet(width: usize, prefix: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; width];
+    bytes[..prefix.len()].copy_from_slice(prefix);
+    bytes
+}
+
+fn hyperx_sent(out: Vec<HubOutput>, width: usize, prefix: &[u8]) {
+    let sends: Vec<_> = out
+        .into_iter()
+        .filter(|output| *output != HubOutput::StateChanged)
+        .collect();
+    let expected: Vec<_> = (!prefix.is_empty())
+        .then(|| HubOutput::Send {
+            collection: RX,
+            kind: ReportKind::Output,
+            bytes: hyperx_packet(width, prefix),
+            deadline: None,
+            set_id: None,
+        })
+        .into_iter()
+        .collect();
+    assert_eq!(sends, expected);
+}
+
+fn hyperx_input(hub: &mut Hub, now: Ms, width: usize, prefix: &[u8], expected: &[u8]) {
+    let out = hub.handle(
+        HubInput::Report {
+            collection: RX,
+            origin: ReportOrigin::Input,
+            bytes: hyperx_packet(width, prefix),
+        },
+        now,
+    );
+    hyperx_sent(out, width, expected);
+}
+
+// A94's Cloud III selector, HBM #13's Windows power bursts, and HaloBattery
+// #155's 0995 capture.
+#[test]
+fn hyperx_hx66_replays_only_one_shots_and_passive_changes() {
+    for (pid, name) in [
+        (0x05B7, "HyperX Cloud III Wireless"),
+        (0x0C9D, "HyperX Cloud III Wireless"),
+        (0x0FCC, "HyperX Cloud III Wireless"),
+        (0x0995, "HyperX Cloud II Core Wireless"),
+    ] {
+        let mut hub = hub();
+        let group = hyperx_group(pid, 0xFF13, 1, 62);
+        let selected = hub
+            .select_group(&group, |_, _| panic!("no metadata gate"))
+            .unwrap();
+        assert_eq!(selected.command_report_id(), Some(0x66));
+        assert!(selected.reads(RX) && selected.sends(RX) && !selected.opens(OTHER));
+        hyperx_sent(
+            hub.handle(HubInput::GroupArrived(group), 0),
+            62,
+            &[0x66, 0x82],
+        );
+
+        // A power-on burst and foreign query replies cannot advance our link request.
+        hyperx_input(&mut hub, 1, 62, &[0x66, 0x0D, 0x0F, 0x51, 73], &[]);
+        hyperx_input(&mut hub, 2, 62, &[0x66, 0x0F, 1], &[]);
+        hyperx_input(&mut hub, 3, 62, &[0x66, 0x0B, 1], &[]);
+        hyperx_input(&mut hub, 4, 62, &[0x66, 0x89, 0x0F, 0x54, 75], &[]);
+        hyperx_input(&mut hub, 5, 62, &[0x66, 0x82, 2], &[]);
+        hyperx_input(&mut hub, 6, 62, &[0x66, 0x82, 1], &[0x66, 0x89]);
+        hyperx_input(&mut hub, 7, 62, &[0x66, 0x82, 1], &[]);
+        hyperx_input(&mut hub, 8, 62, &[0x66, 0x8A, 0], &[]);
+        hyperx_input(
+            &mut hub,
+            9,
+            62,
+            &[0x66, 0x89, 0x0F, 0x54, 75],
+            &[0x66, 0x8A],
+        );
+        hyperx_input(&mut hub, 10, 62, &[0x66, 0x8A, 0], &[]);
+        let state = &hub.snapshot()[0];
+        assert_eq!(state.name, name);
+        assert_eq!(state.verification, Verification::SourceVerified);
+        assert_eq!(state.kind, DeviceKind::Headset);
+        assert_eq!(state.via, Via::Receiver);
+        assert_eq!(state.source, Source::Query);
+        assert_eq!(state.level, Some(Level::Percent(75)));
+        assert_eq!(state.millivolts, Some(3924));
+        assert_eq!(state.presence, Presence::Online);
+        assert_eq!(state.charge, Charge::NotCharging);
+        assert!(state.reports_changes);
+        assert_eq!(state.poll_min_ms, None);
+        let key = state.key.clone();
+
+        hyperx_input(&mut hub, 11, 62, &[0x66, 0x0C, 1], &[]);
+        hyperx_input(&mut hub, 12, 62, &[0x66, 0x0A, 1], &[]);
+        assert_eq!(hub.snapshot()[0].charge, Charge::Charging);
+        let last_reading = hub.snapshot().remove(0);
+        let assert_presence = |hub: &Hub, presence: Presence, charge: Charge| {
+            let state = &hub.snapshot()[0];
+            assert_eq!(state.presence, presence);
+            assert_eq!(state.charge, charge);
+            assert_eq!(state.level, last_reading.level);
+            assert_eq!(state.millivolts, last_reading.millivolts);
+            assert_eq!(state.updated_ms, last_reading.updated_ms);
+            assert_eq!(state.source, last_reading.source);
+        };
+        assert_eq!(hub.next_deadline(), None);
+        assert_eq!(hub.audio_ready_at(&key), None);
+        hyperx_sent(hub.handle(HubInput::Tick, 600_012), 62, &[]);
+        hyperx_sent(hub.handle(HubInput::Activity(key), 600_013), 62, &[]);
+        hyperx_input(&mut hub, 600_014, 62, &[0x66, 0x0B, 0], &[]);
+        hyperx_input(&mut hub, 600_015, 62, &[0x66, 0x0D, 0, 0, 0], &[]);
+        hyperx_input(&mut hub, 600_016, 62, &[0x66, 0x0F, 0], &[]);
+        assert_presence(&hub, Presence::Offline, Charge::Unknown);
+        hyperx_input(&mut hub, 600_017, 62, &[0x66, 0x0F, 1], &[]);
+        hyperx_input(&mut hub, 600_018, 62, &[0x66, 0x0B, 1], &[]);
+        assert_presence(&hub, Presence::Online, Charge::Unknown);
+
+        hyperx_sent(hub.handle(HubInput::Resume, 600_019), 62, &[0x66, 0x82]);
+        hyperx_input(&mut hub, 600_020, 62, &[0x66, 0x82, 1], &[0x66, 0x89]);
+        hyperx_input(&mut hub, 600_021, 62, &[0x66, 0x89, 0, 0, 0], &[]);
+        assert_presence(&hub, Presence::Offline, Charge::Unknown);
+        // A real up echo may continue its existing grant, but isn't a reading.
+        hyperx_sent(hub.handle(HubInput::RefreshNow, 600_022), 62, &[0x66, 0x82]);
+        hyperx_input(&mut hub, 600_023, 62, &[0x66, 0x82, 1], &[0x66, 0x89]);
+        assert_presence(&hub, Presence::Online, Charge::Unknown);
+        hyperx_sent(hub.handle(HubInput::Resume, 620_024), 62, &[0x66, 0x82]);
+        hyperx_input(&mut hub, 620_025, 62, &[0x66, 0x82, 0], &[]);
+        assert_presence(&hub, Presence::Offline, Charge::Unknown);
+    }
+}
+
+// HeadsetControl Alpha requests and HHS #26's interleaved 25 and 0B with
+// trailing payload.
+#[test]
+fn hyperx_alpha_keeps_audible_reads_after_a_push_without_charging_checks() {
+    let mut hub = hub();
+    let group = hyperx_group(0x098D, 0xFF43, 0x0202, 31);
+    let selected = hub
+        .select_group(&group, |_, _| panic!("no metadata gate"))
+        .unwrap();
+    assert_eq!(selected.command_report_id(), Some(0x21));
+    assert!(selected.reads(RX) && selected.sends(RX) && !selected.opens(OTHER));
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(group), 0),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+    hyperx_input(&mut hub, 1, 31, &[0x21, 0xBB, 0x25, 94], &[]);
+    hyperx_input(&mut hub, 2, 31, &[0x21, 0xBB, 0x24, 2], &[]);
+    hyperx_input(&mut hub, 3, 31, &[0x21, 0xBC, 3, 2], &[]);
+    hyperx_input(&mut hub, 4, 31, &[0x21, 0xBB, 0x0C, 0], &[]);
+    hyperx_input(&mut hub, 5, 31, &[0x21, 0xBB, 3, 0], &[]);
+    assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(94)));
+    assert_eq!(hub.snapshot()[0].source, Source::Push);
+    hyperx_input(&mut hub, 6, 31, &[0x21, 0xBB, 3, 2], &[0x21, 0xBB, 0x0C]);
+    hyperx_input(&mut hub, 7, 31, &[0x21, 0xBB, 0x26, 1], &[]);
+    hyperx_input(&mut hub, 8, 31, &[0x21, 0xBB, 0x23, 1], &[]);
+    hyperx_input(&mut hub, 9, 31, &[0x21, 0xBB, 0x0B, 85], &[]);
+    hyperx_input(
+        &mut hub,
+        10,
+        31,
+        &[0x21, 0xBB, 0x0C, 0],
+        &[0x21, 0xBB, 0x0B],
+    );
+    hyperx_input(
+        &mut hub,
+        11,
+        31,
+        &[0x21, 0xBB, 0x0B, 85, 0x0F, 0xFE, 1],
+        &[],
+    );
+    hyperx_input(&mut hub, 12, 31, &[0x21, 0xBB, 0x26, 1], &[]);
+    let state = &hub.snapshot()[0];
+    assert_eq!(state.name, "HyperX Cloud Alpha Wireless");
+    assert_eq!(state.verification, Verification::SourceVerified);
+    assert_eq!(state.level, Some(Level::Percent(85)));
+    assert_eq!(state.charge, Charge::Charging);
+    assert_eq!(state.millivolts, None);
+    assert!(!state.reports_changes);
+    assert_eq!(state.poll_min_ms, Some(300_000));
+    let key = state.key.clone();
+    assert_eq!(hub.audio_ready_at(&key), Some(300_011));
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_sent(
+        hub.handle(HubInput::Activity(key.clone()), 300_010),
+        31,
+        &[],
+    );
+    hyperx_sent(hub.handle(HubInput::Tick, 300_011), 31, &[]);
+    hyperx_sent(
+        hub.handle(HubInput::Activity(key.clone()), 300_011),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+    hyperx_input(
+        &mut hub,
+        300_012,
+        31,
+        &[0x21, 0xBB, 3, 2],
+        &[0x21, 0xBB, 0x0C],
+    );
+    hyperx_input(
+        &mut hub,
+        300_013,
+        31,
+        &[0x21, 0xBB, 0x0C, 1],
+        &[0x21, 0xBB, 0x0B],
+    );
+    hyperx_input(&mut hub, 300_014, 31, &[0x21, 0xBB, 0x0B, 84], &[]);
+    assert_eq!(hub.audio_ready_at(&key), Some(900_014));
+    hub.handle(HubInput::SetIntervals([(key.clone(), 1)].into()), 300_015);
+    assert_eq!(hub.audio_ready_at(&key), Some(600_014));
+    hyperx_sent(
+        hub.handle(HubInput::Activity(key.clone()), 600_013),
+        31,
+        &[],
+    );
+    hyperx_sent(hub.handle(HubInput::Tick, 600_014), 31, &[]);
+    hyperx_sent(
+        hub.handle(HubInput::Activity(key.clone()), 600_014),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+    hyperx_input(&mut hub, 600_015, 31, &[0x21, 0xBB, 3, 1], &[]);
+    assert_eq!(hub.snapshot()[0].presence, Presence::Offline);
+    assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(84)));
+    assert_eq!(hub.snapshot()[0].charge, Charge::Unknown);
+    assert_eq!(hub.audio_ready_at(&key), None);
+    hyperx_sent(
+        hub.handle(HubInput::Activity(key.clone()), 900_014),
+        31,
+        &[],
+    );
+    hyperx_input(&mut hub, 900_015, 31, &[0x21, 0xBB, 0x24, 2], &[]);
+    hyperx_sent(
+        hub.handle(HubInput::Activity(key.clone()), 900_016),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+    hyperx_input(&mut hub, 900_017, 31, &[0x21, 0xBB, 0x24, 1], &[]);
+    hyperx_input(&mut hub, 900_018, 31, &[0x21, 0xBB, 3, 2], &[]);
+    assert_eq!(hub.audio_ready_at(&key), None);
+    hyperx_sent(hub.handle(HubInput::Resume, 900_019), 31, &[0x21, 0xBB, 3]);
+    hyperx_input(&mut hub, 900_020, 31, &[0x21, 0xBB, 3, 1], &[]);
+    hyperx_sent(
+        hub.handle(HubInput::RefreshNow, 900_021),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+}
+
+#[test]
+fn hyperx_wrong_windows_roles_widths_and_unsupported_protocols_do_not_open() {
+    let hub = hub();
+    for group in [
+        hyperx_group(0x098D, 0xFF43, 0x0202, 64),
+        hyperx_group(0x098D, 0xFF13, 1, 31),
+        hyperx_group(0x1743, 0xFF43, 0x0202, 31),
+        hyperx_group(0x1765, 0xFF43, 0x0202, 31),
+        hyperx_group(0x0995, 0xFF13, 1, 64),
+        hyperx_group(0x069F, 0xFF13, 1, 62),
+        hyperx_group(0x069F, 0xFF13, 1, 64),
+        hyperx_group(0x0795, 0xFF13, 1, 62),
+        hyperx_group(0x0696, 0xFF13, 1, 62),
+        hyperx_group(0x06BE, 0xFF13, 1, 62),
+    ] {
+        assert!(
+            hub.select_group(&group, |_, _| panic!("no metadata gate"))
+                .is_none()
+        );
+    }
+    let alpha = hyperx_group(0x098D, 0xFF43, 0x0202, 31);
+    for wrong in [
+        Collection {
+            vid: 0x0951,
+            ..alpha.collections[1].clone()
+        },
+        Collection {
+            interface: Some(2),
+            ..alpha.collections[1].clone()
+        },
+        Collection {
+            input_len: 64,
+            ..alpha.collections[1].clone()
+        },
+        Collection {
+            output_len: 0,
+            ..alpha.collections[1].clone()
+        },
+    ] {
+        assert!(
+            hub.select_group(&group(wrong), |_, _| panic!("no metadata gate"))
+                .is_none()
+        );
+    }
+    let mut ambiguous = alpha;
+    ambiguous.collections.push(Collection {
+        id: CollectionId(3),
+        ..ambiguous.collections[1].clone()
+    });
+    assert!(
+        hub.select_group(&ambiguous, |_, _| panic!("no metadata gate"))
+            .is_none()
+    );
+}
+
+#[test]
+fn hyperx_foreign_short_late_and_over_budget_replies_never_send() {
+    let alpha = || hyperx_group(0x098D, 0xFF43, 0x0202, 31);
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(alpha()), 0),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+    for (collection, origin, width) in [
+        (OTHER, ReportOrigin::Input, 31),
+        (RX, ReportOrigin::FeatureReply, 31),
+        (RX, ReportOrigin::Input, 4),
+        (RX, ReportOrigin::Input, 64),
+    ] {
+        hyperx_sent(
+            hub.handle(
+                HubInput::Report {
+                    collection,
+                    origin,
+                    bytes: hyperx_packet(width, &[0x21, 0xBB, 3, 2]),
+                },
+                1,
+            ),
+            31,
+            &[],
+        );
+    }
+    hyperx_input(&mut hub, 20_000, 31, &[0x21, 0xBB, 3, 2], &[]);
+    assert!(hub.snapshot().is_empty());
+    hyperx_sent(hub.handle(HubInput::Tick, 20_001), 31, &[]);
+
+    let mut hub = Hub::new(
+        Catalog::builtin(),
+        Policy {
+            discovery_budget: 1,
+            ..Policy::default()
+        },
+    );
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(alpha()), 0),
+        31,
+        &[0x21, 0xBB, 3],
+    );
+    hyperx_input(&mut hub, 1, 31, &[0x21, 0xBB, 3, 2], &[]);
+    hyperx_input(&mut hub, 2, 31, &[0x21, 0xBB, 0x0C, 1], &[]);
+}
+
+fn hyperx_universal_group(pid: u16, page: u16, usage: u16) -> HidGroup {
+    let mut group = hyperx_group(pid, page, usage, 64);
+    group.collections[1].interface = Some(2);
+    group
+}
+
+fn hyperx_universal_alpha() -> HidGroup {
+    hyperx_universal_group(0x08BE, 0xFF13, 0xFF00)
+}
+
+// NGENUITY Haste 2 capture (ngenuity-linux-cli); Windows Alpha 2 capture
+// (HaloBattery #26) and HeadsetControl Alpha 2. All battery payloads are synthetic.
+#[test]
+fn hyperx_universal_valid_wake_push_cancels_grace_without_enabling_interval_reads() {
+    for (pid, page, usage, kind) in [
+        (0x08BE, 0xFF13, 0xFF00, DeviceKind::Headset),
+        (0x0F98, 0xFF00, 1, DeviceKind::Mouse),
+    ] {
+        let mut hub = hub();
+        let group = hyperx_universal_group(pid, page, usage);
+        let selected = hub
+            .select_group(&group, |_, _| panic!("no metadata gate"))
+            .expect("documented dedicated universal collection");
+        assert_eq!(selected.command_report_id(), Some(0x50));
+        assert!(selected.reads(RX) && selected.sends(RX) && !selected.opens(OTHER));
+        hyperx_sent(hub.handle(HubInput::GroupArrived(group), 0), 64, &[]);
+        hyperx_sent(hub.handle(HubInput::Resume, 1), 64, &[]);
+        hyperx_sent(hub.handle(HubInput::RefreshNow, 2), 64, &[]);
+        hyperx_input(&mut hub, 3, 64, &[0x51, 2, 35, 0], &[]);
+        assert!(hub.snapshot().is_empty());
+        assert_eq!(hub.next_deadline(), None);
+        hyperx_input(&mut hub, 10, 64, &[0xFB, 0x0A, 1], &[]);
+        assert_eq!(hub.next_deadline(), Some(2010));
+        hyperx_input(
+            &mut hub,
+            2009,
+            64,
+            &[0x51, 2, 74, 1, 26, 0, 0x9C, 0x0F],
+            &[],
+        );
+        let reading = hub.snapshot().remove(0);
+        assert_eq!(reading.kind, kind);
+        assert_eq!(reading.verification, Verification::SourceVerified);
+        assert_eq!(reading.via, Via::Receiver);
+        assert_eq!(reading.presence, Presence::Online);
+        assert_eq!(reading.source, Source::Push);
+        assert_eq!(reading.level, Some(Level::Percent(74)));
+        assert_eq!(reading.millivolts, Some(3996));
+        assert_eq!(reading.charge, Charge::Charging);
+        assert!(!reading.reports_changes);
+        assert_eq!(reading.poll_min_ms, None);
+        assert_eq!(hub.audio_ready_at(&reading.key), None);
+        assert_eq!(hub.next_deadline(), None);
+        hyperx_sent(hub.handle(HubInput::Tick, 2010), 64, &[]);
+        hub.handle(
+            HubInput::SetIntervals([(reading.key.clone(), 1)].into()),
+            2011,
+        );
+        hyperx_sent(hub.handle(HubInput::RefreshNow, 600_000), 64, &[]);
+        hyperx_sent(hub.handle(HubInput::Resume, 600_001), 64, &[]);
+        hyperx_sent(
+            hub.handle(HubInput::Activity(reading.key), 600_002),
+            64,
+            &[],
+        );
+        hyperx_sent(hub.handle(HubInput::Tick, 600_003), 64, &[]);
+    }
+}
+
+#[test]
+fn hyperx_universal_sends_only_one_exact_fallback_after_a_valid_edge_without_a_push() {
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    for (collection, origin, width, prefix) in [
+        (OTHER, ReportOrigin::Input, 64, &[0xFB, 0x0A, 1][..]),
+        (RX, ReportOrigin::FeatureReply, 64, &[0xFB, 0x0A, 1]),
+        (RX, ReportOrigin::Input, 63, &[0xFB, 0x0A, 1]),
+        (RX, ReportOrigin::Input, 65, &[0xFB, 0x0A, 1]),
+        (RX, ReportOrigin::Input, 64, &[0xFB, 0x4A, 1]),
+        (RX, ReportOrigin::Input, 64, &[0xFB, 0x0A, 2]),
+        (RX, ReportOrigin::Input, 64, &[0x53, 1, 1]),
+        (RX, ReportOrigin::Input, 64, &[0x66, 0x0B, 1]),
+    ] {
+        hyperx_sent(
+            hub.handle(
+                HubInput::Report {
+                    collection,
+                    origin,
+                    bytes: hyperx_packet(width, prefix),
+                },
+                1,
+            ),
+            64,
+            &[],
+        );
+        assert_eq!(hub.next_deadline(), None);
+    }
+    hyperx_input(&mut hub, 2, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 1000, 64, &[0xFB, 0x0A, 1], &[]);
+    assert_eq!(hub.next_deadline(), Some(2002));
+
+    // A different echo/target, invalid level/status, and ACKs are not battery samples.
+    for (index, frame) in [
+        &[0x51, 3, 78, 0][..],
+        &[0x51, 0x42, 78, 0],
+        &[0x51, 0x82, 78, 0],
+        &[0x51, 0xC2, 78, 0],
+        &[0x51, 2, 101, 0],
+        &[0x51, 2, 78, 4],
+        &[
+            0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x50, 0x42, 0,
+        ],
+        &[0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x52, 1, 0],
+        &[0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x50, 2, 3],
+        &[0xFF, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x50, 2, 0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        hyperx_input(&mut hub, 1500 + index as Ms, 64, frame, &[]);
+        assert_eq!(hub.next_deadline(), Some(2002));
+        assert!(hub.snapshot().is_empty());
+    }
+    hyperx_sent(hub.handle(HubInput::Tick, 2001), 64, &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 2002), 64, &[0x50, 2]);
+    hyperx_input(&mut hub, 2003, 64, &[0x51, 0x42, 78, 0], &[]);
+    hyperx_input(&mut hub, 2004, 64, &[0x51, 3, 78, 0], &[]);
+    hyperx_input(&mut hub, 2005, 64, &[0x51, 2, 78, 4], &[]);
+    assert!(hub.snapshot().is_empty());
+    hyperx_input(
+        &mut hub,
+        2006,
+        64,
+        &[0x51, 2, 78, 2, 26, 0, 0x80, 0x0F],
+        &[],
+    );
+    let state = &hub.snapshot()[0];
+    assert_eq!(state.level, Some(Level::Percent(78)));
+    assert_eq!(state.charge, Charge::Full);
+    assert_eq!(state.source, Source::Query);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_input(&mut hub, 4000, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 4001, 64, &[0x51, 2, 99, 0], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 6000), 64, &[]);
+    assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(78)));
+}
+
+#[test]
+fn hyperx_universal_down_cancels_grace_and_pending_reply_without_refreshing_the_sample() {
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    hyperx_input(&mut hub, 1, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 2, 64, &[0x51, 2, 67, 1, 26, 0, 0x21, 0x0F], &[]);
+    let reading = hub.snapshot().remove(0);
+    hyperx_input(&mut hub, 3, 64, &[0xFB, 0x0A, 0], &[]);
+    let assert_last_sample = |hub: &Hub, presence| {
+        let state = &hub.snapshot()[0];
+        assert_eq!(state.presence, presence);
+        assert_eq!(state.charge, Charge::Unknown);
+        assert_eq!(state.level, reading.level);
+        assert_eq!(state.millivolts, reading.millivolts);
+        assert_eq!(state.updated_ms, reading.updated_ms);
+        assert_eq!(state.source, reading.source);
+    };
+    assert_last_sample(&hub, Presence::Offline);
+    hyperx_input(&mut hub, 4, 64, &[0xFB, 0x0A, 1], &[]);
+    assert_last_sample(&hub, Presence::Online);
+    hyperx_input(&mut hub, 2003, 64, &[0xFB, 0x0A, 0], &[]);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_sent(hub.handle(HubInput::Tick, 2004), 64, &[]);
+    hyperx_input(&mut hub, 2005, 64, &[0x51, 2, 86, 1], &[]);
+    assert_last_sample(&hub, Presence::Offline);
+
+    hyperx_input(&mut hub, 3000, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 5000), 64, &[0x50, 2]);
+    hyperx_input(&mut hub, 5001, 64, &[0xFB, 0x0A, 0], &[]);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_input(&mut hub, 5002, 64, &[0x51, 2, 86, 1], &[]);
+    assert_last_sample(&hub, Presence::Offline);
+
+    hyperx_input(&mut hub, 6000, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 8000), 64, &[0x50, 2]);
+    hyperx_input(&mut hub, 9001, 64, &[0x51, 2, 86, 1], &[]);
+    assert_last_sample(&hub, Presence::Online);
+    hyperx_input(&mut hub, 9900, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 12_000), 64, &[]);
+}
+
+fn hyperx_universal_status_down_cancels_wake(after_fallback: bool) {
+    let mut hub = hub();
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    hyperx_input(&mut hub, 10, 64, &[0xFB, 0x0A, 1], &[]);
+    hyperx_input(&mut hub, 11, 64, &[0x51, 2, 74, 1, 26, 0, 0x9C, 0x0F], &[]);
+    let mut expected = hub.snapshot().remove(0);
+    hyperx_input(&mut hub, 12, 64, &[0xFB, 0x0A, 0], &[]);
+    hyperx_input(&mut hub, 13, 64, &[0xFB, 0x0A, 1], &[]);
+
+    for (collection, origin, width, frame) in [
+        (OTHER, ReportOrigin::Input, 64, [0x53, 1, 0]),
+        (RX, ReportOrigin::FeatureReply, 64, [0x53, 1, 0]),
+        (RX, ReportOrigin::Input, 63, [0x53, 1, 0]),
+        (RX, ReportOrigin::Input, 65, [0x53, 1, 0]),
+        (RX, ReportOrigin::Input, 64, [0x53, 0x41, 0]),
+        (RX, ReportOrigin::Input, 64, [0x53, 2, 0]),
+        (RX, ReportOrigin::Input, 64, [0x53, 1, 2]),
+        (RX, ReportOrigin::Input, 64, [0x53, 1, 1]),
+    ] {
+        hyperx_sent(
+            hub.handle(
+                HubInput::Report {
+                    collection,
+                    origin,
+                    bytes: hyperx_packet(width, &frame),
+                },
+                1013,
+            ),
+            64,
+            &[],
+        );
+        assert_eq!(hub.next_deadline(), Some(2013));
+        assert_eq!(hub.snapshot()[0].presence, Presence::Online);
+    }
+
+    let down = if after_fallback {
+        hyperx_sent(hub.handle(HubInput::Tick, 2013), 64, &[0x50, 2]);
+        2014
+    } else {
+        2012
+    };
+    // ngenuity-linux-cli Universal §3.3 and HeadsetControl Alpha 2:
+    // a target-zero 53 01 00 reports asleep/off, even on a shared HID handle.
+    hyperx_input(&mut hub, down, 64, &[0x53, 1, 0], &[]);
+    hyperx_sent(hub.handle(HubInput::Tick, 2015), 64, &[]);
+    hyperx_input(&mut hub, 2016, 64, &[0x53, 1, 1], &[]);
+    hyperx_input(
+        &mut hub,
+        2017,
+        64,
+        &[0x51, 2, 92, 1, 26, 0, 0x88, 0x0F],
+        &[],
+    );
+    assert_eq!(hub.next_deadline(), None);
+    expected.presence = Presence::Offline;
+    expected.charge = Charge::Unknown;
+    assert_eq!(hub.snapshot(), [expected]);
+}
+
+#[test]
+fn hyperx_universal_exact_asleep_status_cancels_grace() {
+    hyperx_universal_status_down_cancels_wake(false);
+}
+
+#[test]
+fn hyperx_universal_exact_asleep_status_cancels_pending_reply() {
+    hyperx_universal_status_down_cancels_wake(true);
+}
+
+#[test]
+fn hyperx_universal_zero_budget_never_retries_or_sends() {
+    let mut hub = Hub::new(
+        Catalog::builtin(),
+        Policy {
+            discovery_budget: 0,
+            ..Policy::default()
+        },
+    );
+    hyperx_sent(
+        hub.handle(HubInput::GroupArrived(hyperx_universal_alpha()), 0),
+        64,
+        &[],
+    );
+    hyperx_input(&mut hub, 1, 64, &[0xFB, 0x0A, 1], &[]);
+    assert_eq!(hub.next_deadline(), Some(2001));
+    hyperx_sent(hub.handle(HubInput::Tick, 2001), 64, &[]);
+    assert_eq!(hub.next_deadline(), None);
+    hyperx_input(&mut hub, 2002, 64, &[0x51, 2, 85, 0], &[]);
+    assert!(hub.snapshot().is_empty());
+    hyperx_sent(hub.handle(HubInput::Tick, 20_000), 64, &[]);
+}
+
+#[test]
+fn hyperx_universal_denies_wrong_roles_and_unverified_targets() {
+    let hub = hub();
+    let alpha = hyperx_universal_alpha();
+    let command = &alpha.collections[1];
+    for wrong in [
+        Collection {
+            interface: Some(0),
+            ..command.clone()
+        },
+        Collection {
+            usage: 1,
+            ..command.clone()
+        },
+        Collection {
+            usage_page: 0xFF00,
+            ..command.clone()
+        },
+        Collection {
+            input_len: 63,
+            ..command.clone()
+        },
+        Collection {
+            output_len: 65,
+            ..command.clone()
+        },
+        Collection {
+            pid: 0x0ABE,
+            ..command.clone()
+        },
+    ] {
+        assert!(
+            hub.select_group(&group(wrong), |_, _| panic!("no metadata gate"))
+                .is_none()
+        );
+    }
+    let mut ambiguous = alpha;
+    ambiguous.collections.push(Collection {
+        id: CollectionId(3),
+        ..ambiguous.collections[1].clone()
+    });
+    assert!(
+        hub.select_group(&ambiguous, |_, _| panic!("no metadata gate"))
+            .is_none()
+    );
+    for (pid, page, usage, interface) in [
+        (0x0AC1, 0xFF90, 0xFF00, 3),
+        (0x0CC1, 0xFF90, 0xFF00, 3),
+        (0x0BC1, 0xFF90, 0xFF00, 3),
+        (0x06C1, 0xFF90, 0xFF00, 3),
+        (0x01BF, 0xFF90, 0xFF00, 3),
+        (0x01C5, 0xFF90, 0xFF00, 3),
+        (0x0D97, 0xFF00, 1, 2),
+        (0x0AB5, 0xFF00, 1, 2),
+        (0x0DA0, 0xFF00, 1, 2),
+    ] {
+        let mut group = hyperx_universal_group(pid, page, usage);
+        group.collections[1].interface = Some(interface);
+        assert!(
+            hub.select_group(&group, |_, _| panic!("no metadata gate"))
+                .is_none()
+        );
+    }
+}
+
+// PML xlite_v4_wireless.py and issue #21: report 5 on MI_01. The test TLC's
+// usage and width are synthetic; only the report's documented bytes carry meaning.
+const SONIX_UP: &[u8] = &[0x05, 0x08, 0x01, 0x01];
+const SONIX_DOWN: &[u8] = &[0x05, 0x08, 0x02, 0x01];
+const SONIX_PUSH: &[u8] = &[0x05, 0x07, 0x01, 0x51, 0x01];
+const SONIX_PULSE: &[u8] = &[0x05, 0x0D, 0x64];
+// HaloBattery PR #213 and research §8.2: report ID, status, echo and wire byte 6.
+const SONIX_OK: &[u8] = &[0, 1, 0x08, 0x81, 1, 0, 0, 24];
+const SONIX_PENDING: &[u8] = &[0, 2, 0x08, 0x81, 1];
+const SONIX_ASLEEP: &[u8] = &[0, 5, 0x08, 0x81, 1];
+const SONIX_FOREIGN: &[u8] = &[0, 1, 0x08, 0x81, 2, 0, 0, 99];
+
+fn sonix_group(pid: u16) -> HidGroup {
+    let rx = Collection {
+        id: RX,
+        vid: 0x3710,
+        pid,
+        usage_page: 0xFF01,
+        usage: 1,
+        interface: Some(1),
+        input_len: 8,
+        input_report_05: Some(true),
+        output_len: 0,
+        feature_len: 0,
+        product: String::new(),
+    };
+    let tx = Collection {
+        id: OTHER,
+        interface: Some(3),
+        usage_page: 0xFFFF,
+        input_len: 0,
+        feature_len: 65,
+        input_report_05: None,
+        ..rx.clone()
+    };
+    HidGroup {
+        id: GroupId(1),
+        collections: vec![rx, tx],
+    }
+}
+
+fn sonix_report(
+    hub: &mut Hub,
+    now: Ms,
+    collection: CollectionId,
+    origin: ReportOrigin,
+    width: usize,
+    prefix: &[u8],
+) -> Vec<HubOutput> {
+    hub.handle(
+        HubInput::Report {
+            collection,
+            origin,
+            bytes: hyperx_packet(width, prefix),
+        },
+        now,
+    )
+}
+
+fn sonix_input(hub: &mut Hub, now: Ms, prefix: &[u8]) -> Vec<HubOutput> {
+    sonix_report(hub, now, RX, ReportOrigin::Input, 8, prefix)
+}
+
+fn sonix_mailbox(hub: &mut Hub, now: Ms, prefix: &[u8]) -> Vec<HubOutput> {
+    sonix_report(hub, now, OTHER, ReportOrigin::FeatureReply, 65, prefix)
+}
+
+fn sonix_send(out: Vec<HubOutput>, expected: Option<(ReportKind, Ms)>) -> Option<FeatureSetId> {
+    let sent: Vec<_> = out
+        .into_iter()
+        .filter(|e| *e != HubOutput::StateChanged)
+        .collect();
+    let Some((kind, at)) = expected else {
+        assert!(sent.is_empty(), "unexpected operation: {sent:?}");
+        return None;
+    };
+    let mut bytes = vec![0; 65];
+    if kind == ReportKind::SetFeature {
+        bytes[2..5].copy_from_slice(&[8, 0x81, 1]);
+        bytes[63] = 0x8A;
+    }
+    let [
+        HubOutput::Send {
+            collection,
+            kind: sent_kind,
+            bytes: sent_bytes,
+            deadline,
+            set_id,
+        },
+    ] = sent.as_slice()
+    else {
+        panic!("expected one {kind:?}, got {sent:?}");
+    };
+    assert_eq!(
+        (*collection, *sent_kind, sent_bytes, *deadline),
+        (OTHER, kind, &bytes, Some(at))
+    );
+    assert_eq!(set_id.is_some(), kind == ReportKind::SetFeature);
+    *set_id
+}
+
+fn sonix_complete_set(hub: &mut Hub, at: Ms, collection: CollectionId, id: FeatureSetId) {
+    sonix_send(
+        hub.handle(HubInput::FeatureSetComplete { collection, id }, at),
+        None,
+    );
+}
+
+fn sonix_ready_mailbox(hub: &mut Hub, at: Ms, response: &[u8], deadline: Ms) -> FeatureSetId {
+    let out = sonix_mailbox(hub, at, response);
+    let id = sonix_send(out, Some((ReportKind::SetFeature, deadline))).unwrap();
+    sonix_complete_set(hub, at, OTHER, id);
+    id
+}
+
+fn sonix_arrival(hub: &mut Hub, pid: u16, deadline: Ms) {
+    sonix_send(
+        hub.handle(HubInput::GroupArrived(sonix_group(pid)), 0),
+        Some((ReportKind::GetFeature, deadline)),
+    );
+}
+
+fn sonix_snapshot(hub: &Hub, percent: u8, charge: Charge, source: Source) {
+    let states = hub.snapshot();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].level, Some(Level::Percent(percent)));
+    assert_eq!(states[0].charge, charge);
+    assert_eq!(states[0].source, source);
+    assert_eq!(states[0].via, Via::Receiver);
+    assert_eq!(states[0].verification, Verification::SourceVerified);
+}
+
+#[test]
+fn sonix_link_edge_grace_is_not_a_pulse_and_a_push_suppresses_it() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_input(&mut hub, 2_000, SONIX_PULSE), None);
+    sonix_send(sonix_input(&mut hub, 2_010, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 2_020, SONIX_PULSE), None);
+    sonix_send(sonix_input(&mut hub, 2_500, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 4_009), None);
+    sonix_send(sonix_input(&mut hub, 4_009, SONIX_PUSH), None);
+    sonix_send(hub.handle(HubInput::Tick, 4_010), None);
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    assert_eq!(hub.snapshot()[0].presence, Presence::Online);
+
+    sonix_send(sonix_input(&mut hub, 5_000, SONIX_DOWN), None);
+    sonix_send(sonix_input(&mut hub, 65_000, SONIX_PULSE), None);
+    assert_ne!(hub.snapshot()[0].presence, Presence::Online);
+    sonix_send(sonix_input(&mut hub, 70_000, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 71_000, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 71_999), None);
+    sonix_send(
+        hub.handle(HubInput::Tick, 72_000),
+        Some((ReportKind::GetFeature, 73_000)),
+    );
+    sonix_send(hub.handle(HubInput::Tick, 73_000), None);
+    sonix_send(sonix_input(&mut hub, 74_000, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 80_000), None);
+}
+
+#[test]
+fn sonix_awake_uses_shared_interval_and_requires_a_fresh_linked_pulse() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_input(&mut hub, 2_000, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 2_100, SONIX_PUSH), None);
+    let state = hub.snapshot().pop().unwrap();
+    assert_eq!(state.poll_min_ms, Some(60_000));
+    let key = state.key;
+    let interval = |ms| HubInput::SetIntervals([(key.clone(), ms)].into());
+    sonix_send(hub.handle(interval(1_000), 2_100), None);
+    sonix_send(sonix_input(&mut hub, 62_099, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_100), None);
+    sonix_send(hub.handle(HubInput::Activity(key.clone()), 62_100), None);
+    sonix_send(
+        sonix_report(
+            &mut hub,
+            62_100,
+            RX,
+            ReportOrigin::FeatureReply,
+            8,
+            SONIX_PULSE,
+        ),
+        None,
+    );
+    sonix_send(
+        sonix_input(&mut hub, 62_100, SONIX_PULSE),
+        Some((ReportKind::GetFeature, 63_100)),
+    );
+    sonix_send(sonix_input(&mut hub, 62_101, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::RefreshNow, 62_102), None);
+    sonix_send(hub.handle(HubInput::Tick, 63_100), None);
+    sonix_send(hub.handle(interval(180_000), 63_100), None);
+    sonix_send(sonix_input(&mut hub, 242_101, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Tick, 242_102), None);
+    sonix_send(
+        sonix_input(&mut hub, 242_102, SONIX_PULSE),
+        Some((ReportKind::GetFeature, 243_102)),
+    );
+}
+
+#[test]
+fn sonix_busy_get_first_and_awake_reply_after_four_operations() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_input(&mut hub, 2_000, SONIX_UP), None);
+    sonix_send(sonix_input(&mut hub, 2_100, SONIX_PUSH), None);
+    let deadline = 63_100;
+    let get = Some((ReportKind::GetFeature, deadline));
+    sonix_send(sonix_input(&mut hub, 62_100, SONIX_PULSE), get);
+    sonix_send(sonix_mailbox(&mut hub, 62_100, &[0, 2, 1, 0x84, 4]), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_119), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_120), get);
+    sonix_send(sonix_mailbox(&mut hub, 62_120, SONIX_PENDING), None);
+    sonix_send(hub.handle(HubInput::Tick, 62_140), get);
+    sonix_ready_mailbox(&mut hub, 62_140, SONIX_FOREIGN, deadline);
+    sonix_send(sonix_mailbox(&mut hub, 62_141, SONIX_OK), None);
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    sonix_send(hub.handle(HubInput::Tick, 62_160), get);
+    sonix_send(sonix_mailbox(&mut hub, 62_160, SONIX_OK), None);
+    sonix_snapshot(&hub, 24, Charge::Charging, Source::Query);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_resends_once_only_after_matching_pending_and_a_stable_reset() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    let get = Some((ReportKind::GetFeature, 1_000));
+    let initial = sonix_ready_mailbox(&mut hub, 0, SONIX_FOREIGN, 1_000);
+    for (at, mailbox) in [
+        (20, SONIX_FOREIGN),
+        (40, SONIX_FOREIGN),
+        (60, SONIX_FOREIGN),
+        (80, SONIX_PENDING),
+        (100, SONIX_FOREIGN),
+        (120, SONIX_FOREIGN),
+    ] {
+        sonix_send(hub.handle(HubInput::Tick, at), get);
+        sonix_send(sonix_mailbox(&mut hub, at, mailbox), None);
+    }
+    sonix_send(hub.handle(HubInput::Tick, 140), get);
+    let out = sonix_mailbox(&mut hub, 140, SONIX_FOREIGN);
+    let resend = sonix_send(out, Some((ReportKind::SetFeature, 1_000))).unwrap();
+    sonix_complete_set(&mut hub, 140, OTHER, initial);
+    sonix_send(hub.handle(HubInput::Tick, 160), None);
+    sonix_complete_set(&mut hub, 160, OTHER, resend);
+    for at in (180..1_000).step_by(20) {
+        sonix_send(hub.handle(HubInput::Tick, at), get);
+        sonix_send(
+            sonix_mailbox(
+                &mut hub,
+                at,
+                if at == 180 {
+                    SONIX_PENDING
+                } else {
+                    SONIX_FOREIGN
+                },
+            ),
+            None,
+        );
+    }
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_send(sonix_mailbox(&mut hub, 1_001, SONIX_OK), None);
+    sonix_send(hub.handle(HubInput::Tick, 600_000), None);
+    assert_eq!(hub.next_deadline(), None);
+    assert!(hub.snapshot().iter().all(|s| s.level.is_none()));
+}
+
+#[test]
+fn sonix_rejects_wrong_echo_width_role_and_level_then_05_is_final() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
+    sonix_ready_mailbox(&mut hub, 0, SONIX_OK, 1_000);
+    for (at, reply) in [
+        (20, SONIX_OK), // unchanged preflight latch is not a fresh reply
+        (40, SONIX_FOREIGN),
+        (60, &[0, 1, 0x08, 0x81, 1, 0, 0, 101][..]),
+        (80, &[0, 5, 0x08, 0x85, 1][..]),
+    ] {
+        sonix_send(
+            hub.handle(HubInput::Tick, at),
+            Some((ReportKind::GetFeature, 1_000)),
+        );
+        sonix_send(sonix_mailbox(&mut hub, at, reply), None);
+        sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    }
+    sonix_send(
+        hub.handle(HubInput::Tick, 100),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    for (collection, origin, width, bytes) in [
+        (RX, ReportOrigin::FeatureReply, 65, SONIX_OK),
+        (OTHER, ReportOrigin::Input, 65, SONIX_OK),
+        (OTHER, ReportOrigin::FeatureReply, 64, SONIX_OK),
+    ] {
+        sonix_send(
+            sonix_report(&mut hub, 100, collection, origin, width, bytes),
+            None,
+        );
+    }
+    sonix_send(sonix_mailbox(&mut hub, 120, SONIX_ASLEEP), None);
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    assert_eq!(hub.snapshot()[0].presence, Presence::Asleep);
+    sonix_send(hub.handle(HubInput::Tick, 140), None);
+    sonix_send(sonix_mailbox(&mut hub, 141, SONIX_OK), None);
+    sonix_send(sonix_input(&mut hub, 90_000, SONIX_PULSE), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_down_cancels_and_the_earlier_grant_expiry_caps_operations() {
+    let mut hub = Hub::new(
+        Catalog::builtin(),
+        Policy {
+            discovery_ms: 70,
+            ..Policy::default()
+        },
+    );
+    sonix_arrival(&mut hub, 0x5402, 70);
+    sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
+    sonix_ready_mailbox(&mut hub, 0, &[], 70);
+    sonix_send(
+        hub.handle(HubInput::Tick, 20),
+        Some((ReportKind::GetFeature, 70)),
+    );
+    sonix_send(sonix_input(&mut hub, 21, SONIX_DOWN), None);
+    sonix_send(sonix_mailbox(&mut hub, 22, SONIX_OK), None);
+    sonix_send(hub.handle(HubInput::Tick, 70), None);
+    assert_eq!(hub.snapshot()[0].level, Some(Level::Percent(81)));
+    assert_ne!(hub.snapshot()[0].presence, Presence::Online);
+
+    sonix_send(sonix_input(&mut hub, 100, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 2_100), None);
+    sonix_send(hub.handle(HubInput::Tick, 100_000), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_validates_read_and_write_roles_per_pid_without_substitution() {
+    let hub = hub();
+    let select = |g: &HidGroup| hub.select_group(g, |_, _| panic!("no product gate"));
+    for pid in [0x5402, 0x5403, 0x5404] {
+        let mut g = sonix_group(pid);
+        let chosen = select(&g).expect("documented battery command collection");
+        assert_eq!(chosen.reads(RX), pid != 0x5404);
+        assert!(!chosen.reads(OTHER));
+        assert!(!chosen.sends(RX));
+        assert!(chosen.sends(OTHER));
+        assert_eq!(chosen.command_report_id(), Some(0));
+        g.collections[1].interface = Some(2);
+        assert!(select(&g).is_none());
+    }
+    let mut g = sonix_group(0x5402);
+    g.collections.push(Collection {
+        id: CollectionId(3),
+        ..g.collections[1].clone()
+    });
+    assert!(select(&g).is_none());
+    let mut g = sonix_group(0x5402);
+    g.collections.push(Collection {
+        id: CollectionId(3),
+        ..g.collections[0].clone()
+    });
+    assert!(select(&g).is_none());
+    for (page, width, has_report_05) in [
+        (0xFF01, 8, None),
+        (0xFF01, 8, Some(false)),
+        (1, 8, Some(true)),
+        (0xFF01, 4, Some(true)),
+    ] {
+        let mut g = sonix_group(0x5402);
+        g.collections[0].usage_page = page;
+        g.collections[0].input_len = width;
+        g.collections[0].input_report_05 = has_report_05;
+        assert!(select(&g).is_none());
+    }
+    let mut g = sonix_group(0x5402);
+    g.collections.push(Collection {
+        id: CollectionId(3),
+        input_report_05: None,
+        ..g.collections[0].clone()
+    });
+    assert!(select(&g).is_none());
+    let g = sonix_group(0x5402);
+    let selected = select(&g).unwrap();
+    assert!(!selected.ready(&group(g.collections[0].clone())));
+    assert!(!selected.ready(&group(g.collections[1].clone())));
+    for pid in [
+        0x5405, 0x5406, 0x5504, 0x3401, 0x3402, 0x3406, 0x3409, 0x3410,
+    ] {
+        assert!(select(&sonix_group(pid)).is_none());
+    }
+}
+
+#[test]
+fn sonix_feinmann_has_only_battery_one_shots_not_a_poll_interval() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5404, 1_000);
+    sonix_ready_mailbox(&mut hub, 0, &[], 1_000);
+    sonix_send(
+        hub.handle(HubInput::Tick, 20),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
+    sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
+    assert_eq!(hub.snapshot()[0].poll_min_ms, None);
+    sonix_send(sonix_input(&mut hub, 3_000, SONIX_UP), None);
+    sonix_send(hub.handle(HubInput::Tick, 5_000), None);
+    sonix_send(sonix_input(&mut hub, 70_000, SONIX_PULSE), None);
+    sonix_send(
+        hub.handle(HubInput::Resume, 70_000),
+        Some((ReportKind::GetFeature, 71_000)),
+    );
+}
+
+#[test]
+fn sonix_slow_or_missing_set_completion_does_not_start_a_get() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    let out = sonix_mailbox(&mut hub, 0, &[]);
+    let id = sonix_send(out, Some((ReportKind::SetFeature, 1_000))).unwrap();
+    sonix_send(hub.handle(HubInput::Tick, 20), None);
+    sonix_send(hub.handle(HubInput::Tick, 450), None);
+    sonix_complete_set(&mut hub, 450, RX, id);
+    sonix_send(hub.handle(HubInput::Tick, 470), None);
+    sonix_complete_set(&mut hub, 500, OTHER, id);
+    sonix_send(hub.handle(HubInput::Tick, 519), None);
+    sonix_send(
+        hub.handle(HubInput::Tick, 520),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    sonix_send(sonix_mailbox(&mut hub, 520, SONIX_OK), None);
+    sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
+    sonix_send(
+        hub.handle(HubInput::RefreshNow, 600),
+        Some((ReportKind::GetFeature, 1_600)),
+    );
+    let out = sonix_mailbox(&mut hub, 600, &[]);
+    let new = sonix_send(out, Some((ReportKind::SetFeature, 1_600))).unwrap();
+    sonix_complete_set(&mut hub, 601, OTHER, id);
+    sonix_send(hub.handle(HubInput::Tick, 621), None);
+    sonix_send(sonix_input(&mut hub, 625, SONIX_DOWN), None);
+    sonix_complete_set(&mut hub, 626, OTHER, new);
+    sonix_send(hub.handle(HubInput::Tick, 1_600), None);
+    sonix_complete_set(&mut hub, 1_601, OTHER, new);
+    sonix_send(hub.handle(HubInput::Tick, 10_000), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_missing_successful_set_completion_times_out_without_a_get() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    let out = sonix_mailbox(&mut hub, 0, &[]);
+    let id = sonix_send(out, Some((ReportKind::SetFeature, 1_000))).unwrap();
+    sonix_send(hub.handle(HubInput::Tick, 999), None);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_complete_set(&mut hub, 1_000, OTHER, id);
+    sonix_send(hub.handle(HubInput::Tick, 1_020), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_ignores_a_retained_05_but_ends_on_a_new_05() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
+    sonix_ready_mailbox(&mut hub, 0, SONIX_ASLEEP, 1_000);
+    for (at, reply, want) in [
+        (20, SONIX_ASLEEP, Presence::Online),
+        (40, SONIX_PENDING, Presence::Online),
+        (60, SONIX_ASLEEP, Presence::Asleep),
+    ] {
+        sonix_send(
+            hub.handle(HubInput::Tick, at),
+            Some((ReportKind::GetFeature, 1_000)),
+        );
+        sonix_send(sonix_mailbox(&mut hub, at, reply), None);
+        assert_eq!(hub.snapshot()[0].presence, want);
+    }
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_successful_arrival_reply_validates_link_without_an_edge() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_ready_mailbox(&mut hub, 0, &[], 1_000);
+    sonix_send(
+        hub.handle(HubInput::Tick, 20),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
+    sonix_send(hub.handle(HubInput::Tick, 2_020), None);
+    sonix_send(sonix_input(&mut hub, 60_019, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Tick, 60_020), None);
+    sonix_send(
+        sonix_input(&mut hub, 60_020, SONIX_PULSE),
+        Some((ReportKind::GetFeature, 61_020)),
+    );
+}
+
+#[test]
+fn sonix_resend_requires_the_same_preflight_answer_not_just_a_foreign_echo() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_ready_mailbox(&mut hub, 0, SONIX_FOREIGN, 1_000);
+    const OTHER_ANSWER: &[u8] = &[0, 1, 0x08, 0x81, 2, 0, 0, 42];
+    for (at, reply) in [
+        (20, SONIX_PENDING),
+        (40, OTHER_ANSWER),
+        (60, OTHER_ANSWER),
+        (80, OTHER_ANSWER),
+        (100, SONIX_FOREIGN),
+        (120, SONIX_FOREIGN),
+    ] {
+        sonix_send(
+            hub.handle(HubInput::Tick, at),
+            Some((ReportKind::GetFeature, 1_000)),
+        );
+        sonix_send(sonix_mailbox(&mut hub, at, reply), None);
+    }
+    sonix_send(
+        hub.handle(HubInput::Tick, 140),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    sonix_ready_mailbox(&mut hub, 140, SONIX_FOREIGN, 1_000);
+}
+
+#[test]
+fn sonix_link_only_rearrival_does_not_replace_the_cached_battery_sample() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(sonix_input(&mut hub, 10, SONIX_PUSH), None);
+    sonix_send(hub.handle(HubInput::GroupRemoved(GroupId(1)), 50), None);
+    let mut returned = sonix_group(0x5402);
+    returned.id = GroupId(2);
+    sonix_send(
+        hub.handle(HubInput::GroupArrived(returned), 60),
+        Some((ReportKind::GetFeature, 1_060)),
+    );
+    sonix_send(sonix_input(&mut hub, 70, SONIX_UP), None);
+    let state = hub.snapshot().remove(0);
+    assert_eq!(state.level, Some(Level::Percent(81)));
+    assert_eq!(state.updated_ms, 10);
+    assert_eq!(state.source, Source::Push);
+    assert_eq!(state.presence, Presence::Online);
+    assert_eq!(state.charge, Charge::Unknown);
+}

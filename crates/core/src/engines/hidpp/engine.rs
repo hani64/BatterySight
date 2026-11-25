@@ -23,9 +23,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
-use crate::catalog::Catalog;
-use crate::engine::{Action, Engine};
-use crate::hid::{Collection, CollectionId, HidGroup};
+use crate::catalog::Quirks;
+use crate::engine::{Action, Engine, HidppDestination, WriteRule};
+use crate::hid::{Collection, CollectionId, CollectionRole, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{DeviceKey, DeviceKind, DeviceUpdate, Presence, Source, Via};
 use crate::scheduler::{Capabilities, Grant, GrantId, REDISCOVERIES, Trigger};
 use crate::time::Ms;
@@ -33,10 +33,12 @@ use crate::time::Ms;
 use super::battery::{self, Reading};
 use super::curves::{self, ChargeTrack, VoltageCurve};
 use super::discovery::{
-    self, Decoder, ERR_CONNECT_FAIL, ERR_RESOURCE_ERROR, ERR_UNKNOWN_DEVICE, Found, Next,
-    REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
+    self, Decoder, ERR_CONNECT_FAIL, ERR_RESOURCE_ERROR, ERR_UNKNOWN_DEVICE, Found,
+    IdentityFeatures, Next, REG_BATTERY_CHARGE, REG_BATTERY_STATUS, Request, Step,
 };
-use super::frame::{LONG, Reply, SHORT, SW_ID};
+use super::frame::{FIRST_REGISTER_SUB_ID, LONG, Reply, ReplyAddress, SHORT, SW_ID};
+
+pub(crate) const COMMAND_ROLE: CollectionRole = discovery::COMMAND;
 
 /// Timeout of a request to the receiver itself.
 /// Source: Solaar `base.py` `_RECEIVER_REQUEST_TIMEOUT` (0.9 s).
@@ -56,8 +58,6 @@ pub const ACTIVITY_GAP_MS: Ms = 300_000;
 /// not the 0x0005 lookup that followed, while another HID++ client set it up, and broadcast
 /// its battery 1 to 13 s later (owner capture 2026-11-24).
 const REDISCOVERY_DELAYS_MS: [Ms; REDISCOVERIES as usize] = [2_000, 10_000, 60_000];
-/// HID++ 1.0 sub ids from 0x80 up are register access and errors, never a feature reply.
-const FIRST_REGISTER_SUB_ID: u8 = 0x80;
 
 const LOGITECH: u16 = 0x046D;
 
@@ -122,6 +122,7 @@ struct Device {
     decoder: Decoder,
     /// Battery feature index (HID++ 2.0 only).
     battery_fi: u8,
+    identity: IdentityFeatures,
     /// The device's charge so far, for a charging curve.
     charge: ChargeTrack,
 }
@@ -179,14 +180,6 @@ pub struct HidppEngine {
     retry_at: Option<Ms>,
 }
 
-fn is_short(c: &Collection) -> bool {
-    c.vid == LOGITECH && (c.usage_page, c.usage) == SHORT_USAGE && c.output_len == SHORT_LEN
-}
-
-fn is_long(c: &Collection) -> bool {
-    c.vid == LOGITECH && LONG_USAGES.contains(&(c.usage_page, c.usage)) && c.output_len == LONG_LEN
-}
-
 fn update(key: DeviceKey, presence: Presence, source: Source) -> DeviceUpdate {
     DeviceUpdate {
         key,
@@ -211,33 +204,36 @@ fn reading_update(key: DeviceKey, r: &Reading, source: Source) -> DeviceUpdate {
 }
 
 impl HidppEngine {
-    /// A Logitech group with a short or long HID++ collection.
-    pub fn accepts(group: &HidGroup) -> bool {
-        group.collections.iter().any(Self::reads)
+    fn report_shape(c: &Collection) -> Option<(u8, u16)> {
+        if c.vid != LOGITECH {
+            return None;
+        }
+        let usage = (c.usage_page, c.usage);
+        if usage == SHORT_USAGE {
+            Some((SHORT, SHORT_LEN))
+        } else if LONG_USAGES.contains(&usage) {
+            Some((LONG, LONG_LEN))
+        } else {
+            None
+        }
     }
 
-    /// A short or long HID++ collection: the only collections the engine reads or writes.
-    pub fn reads(c: &Collection) -> bool {
-        is_short(c) || is_long(c)
+    /// Report ID for a Logitech HID++ collection with its documented command width.
+    pub(crate) fn command_report(c: &Collection) -> Option<u8> {
+        let (report_id, width) = Self::report_shape(c)?;
+        (c.output_len == width).then_some(report_id)
     }
 
-    /// # Panics
-    /// If [`HidppEngine::accepts`] rejects `group`.
-    pub fn new(group: &HidGroup, catalog: &Catalog) -> Self {
-        // Requests go out short when the device has a short collection;
-        // long-only devices get long frames for everything.
-        let (report_id, out) = match group.collections.iter().find(|c| is_short(c)) {
-            Some(c) => (SHORT, c),
-            None => (
-                LONG,
-                group
-                    .collections
-                    .iter()
-                    .find(|c| is_long(c))
-                    .expect("HidppEngine::new needs a group it accepts"),
-            ),
-        };
-        let quirks = catalog.device(out.vid, out.pid).map(|d| &d.quirks);
+    pub(crate) fn receives(c: &Collection) -> bool {
+        Self::report_shape(c).is_some_and(|(_, width)| c.input_len == width)
+    }
+
+    pub(crate) fn from_selection(
+        group: &HidGroup,
+        (report_id, out): (u8, &Collection),
+        receive: &[CollectionId],
+        quirks: Option<&Quirks>,
+    ) -> Self {
         let curve = quirks
             .and_then(|q| q.voltage_curve.as_deref())
             .and_then(curves::curve_by_name)
@@ -245,7 +241,7 @@ impl HidppEngine {
         let fallback_kind = if group
             .collections
             .iter()
-            .any(|c| c.usage_page == HEADSET_PAGE)
+            .any(|c| c.usage_page == HEADSET_PAGE && receive.contains(&c.id))
         {
             DeviceKind::Headset
         } else {
@@ -327,6 +323,11 @@ impl HidppEngine {
         discovery::request(c.step, &c.found)
     }
 
+    fn conversation_for(&self, index: u8, grant: GrantId) -> Option<&Conversation> {
+        let c = &self.in_flight.get(&index)?.conversation;
+        (c.grant == grant).then_some(c)
+    }
+
     /// Sends the request for `c`'s step to `index`. Without budget left the
     /// conversation ends quietly: the device did nothing wrong.
     fn issue(&mut self, index: u8, c: Conversation, now: Ms, actions: &mut Vec<Action>) {
@@ -342,7 +343,9 @@ impl HidppEngine {
         actions.push(Action::Send {
             grant: c.grant,
             collection: self.out,
+            kind: ReportKind::Output,
             bytes: request.bytes(self.report_id, index),
+            deadline: None,
         });
         let deadline = now.saturating_add(Ms::from(self.timeout(index)));
         self.in_flight.insert(
@@ -552,6 +555,7 @@ impl HidppEngine {
                 key: key.clone(),
                 decoder,
                 battery_fi,
+                identity: found.identity,
                 charge,
             },
         );
@@ -560,6 +564,9 @@ impl HidppEngine {
             caps: Capabilities {
                 pushes_battery: !self.no_in_use_push,
                 query_wakes: self.query_wakes,
+                audio: self.no_in_use_push,
+                awake_signal: false,
+                charging: self.no_in_use_push,
                 min_query_gap_ms: if self.no_in_use_push {
                     ACTIVITY_GAP_MS
                 } else {
@@ -739,6 +746,56 @@ impl Engine for HidppEngine {
         self.group_key.clone()
     }
 
+    fn allowed_writes(&self) -> &'static [WriteRule] {
+        discovery::WRITE_RULES
+    }
+
+    fn collection_role(&self, collection: CollectionId) -> Option<CollectionRole> {
+        (collection == self.out).then_some(COMMAND_ROLE)
+    }
+
+    fn hidpp_destination(&self, index: u8) -> Option<HidppDestination<'_>> {
+        if self.receiver && index == DIRECT {
+            return Some(HidppDestination::Receiver);
+        }
+        if self.is_direct(index) || (self.receiver && RECEIVER_SLOTS.contains(&index)) {
+            return Some(HidppDestination::Device(
+                self.devices.get(&index).map(|device| &device.key),
+            ));
+        }
+        None
+    }
+
+    fn feature_id_for_index(&self, index: u8, feature_index: u8) -> Option<u16> {
+        if feature_index == 0 {
+            return Some(0);
+        }
+        if let Some(f) = self.in_flight.get(&index)
+            && !f.conversation.known
+            && f.conversation.step != Step::Read
+        {
+            let found = &f.conversation.found;
+            return found.identity.resolve(feature_index, found.battery);
+        }
+        let d = self.devices.get(&index)?;
+        d.identity
+            .resolve(feature_index, Some((d.decoder, d.battery_fi)))
+    }
+
+    fn hidpp_name_offset(&self, grant: GrantId, index: u8) -> Option<u8> {
+        let c = self.conversation_for(index, grant)?;
+        (c.step == Step::Name)
+            .then(|| c.found.name_offset())
+            .flatten()
+    }
+
+    fn hidpp_notification_read(&self, grant: GrantId, index: u8) -> Option<[u8; 3]> {
+        match self.conversation_for(index, grant)?.step {
+            Step::SetNotifications(read) | Step::SetReg00(read) => Some(read),
+            _ => None,
+        }
+    }
+
     fn on_grant(&mut self, grant: &Grant, now: Ms) -> Vec<Action> {
         self.budgets.retain(|_, b| now <= b.expires_ms);
         self.budgets.insert(
@@ -785,16 +842,29 @@ impl Engine for HidppEngine {
         actions
     }
 
-    fn on_report(&mut self, _collection: CollectionId, bytes: &[u8], now: Ms) -> Vec<Action> {
+    fn on_report(
+        &mut self,
+        _collection: CollectionId,
+        origin: ReportOrigin,
+        bytes: &[u8],
+        now: Ms,
+    ) -> Vec<Action> {
+        if origin != ReportOrigin::Input {
+            return Vec::new();
+        }
         let mut actions = Vec::new();
         // Replies may come on either collection of the group.
-        let answer =
-            self.in_flight
-                .iter()
-                .find_map(|(&index, f)| match f.request.reply(bytes, index) {
-                    Reply::NotMine => None,
-                    reply => Some((index, reply)),
-                });
+        let answer = self.in_flight.iter().find_map(|(&index, f)| {
+            let from = if self.is_direct(index) {
+                ReplyAddress::Direct
+            } else {
+                ReplyAddress::Exact(index)
+            };
+            match f.request.reply(bytes, from) {
+                Reply::NotMine => None,
+                reply => Some((index, reply)),
+            }
+        });
         match answer {
             Some((index, reply)) => {
                 if let Some(f) = self.in_flight.remove(&index) {
@@ -886,6 +956,8 @@ impl Engine for HidppEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Catalog;
+    use crate::engines;
     use crate::hid::{Collection, GroupId};
     use crate::model::{
         Charge, CoarseLevel, DeviceKind, DeviceUpdate, Level, Presence, Source, Via,
@@ -931,6 +1003,14 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         Catalog::parse(CATALOG).unwrap()
     }
 
+    impl HidppEngine {
+        fn new(group: &HidGroup, catalog: &Catalog) -> Self {
+            engines::select(group, catalog)
+                .and_then(|selection| selection.hidpp(group, catalog))
+                .unwrap()
+        }
+    }
+
     fn coll(
         id: CollectionId,
         page: u16,
@@ -945,7 +1025,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             pid,
             usage_page: page,
             usage,
+            interface: None,
             input_len: len,
+            input_report_05: None,
             output_len: len,
             feature_len: 0,
             product: product.into(),
@@ -1008,6 +1090,10 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         }
     }
 
+    fn input(e: &mut HidppEngine, collection: CollectionId, bytes: &[u8], now: Ms) -> Vec<Action> {
+        e.on_report(collection, ReportOrigin::Input, bytes, now)
+    }
+
     fn sent(actions: &[Action]) -> Vec<Vec<u8>> {
         actions
             .iter()
@@ -1030,6 +1116,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         Capabilities {
             pushes_battery: true,
             query_wakes: false,
+            audio: false,
+            awake_signal: false,
+            charging: false,
             min_query_gap_ms: 0,
         }
     }
@@ -1051,7 +1140,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     /// Feeds each reply and checks it triggers exactly the paired request.
     fn run(e: &mut HidppEngine, script: &[(Vec<u8>, Vec<u8>)], now: Ms) {
         for (i, (reply, want)) in script.iter().enumerate() {
-            let actions = e.on_report(LONG_C, reply, now);
+            let actions = input(e, LONG_C, reply, now);
             assert_eq!(sent(&actions), vec![want.clone()], "step {i}: {actions:?}");
         }
     }
@@ -1069,9 +1158,19 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let gk = e.group_key();
         let a = e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
         assert_eq!(sent(&a), vec![s(&[0x10, 0xFF, 0x81, 0x00])]);
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]),
+            1,
+        );
         assert_eq!(sent(&a), vec![notify_devices()]);
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x8F, 0x80, 0x02, 0x02]), 1);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 0xFF, 0x8F, 0x80, 0x02, 0x02]),
+            1,
+        );
         let pings: Vec<Vec<u8>> = (1..=6)
             .map(|i| s(&[0x10, i, 0x00, 0x1B, 0x00, 0x00, 0x5A]))
             .collect();
@@ -1084,9 +1183,14 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = HidppEngine::new(&receiver_group(), &catalog());
         let gk = e.group_key();
         e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]),
+            1,
+        );
         assert_eq!(sent(&a), vec![notify_devices()]);
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x02]), 2);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x02]), 2);
         assert!(a.is_empty(), "{a:?}");
         assert_eq!(e.next_deadline(), None);
         e
@@ -1125,11 +1229,11 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn mouse_engine() -> HidppEngine {
         let mut e = receiver_pinging();
         for i in 2..=6 {
-            let a = e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            let a = input(&mut e, SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
             assert!(a.is_empty(), "{a:?}");
         }
         run(&mut e, &mouse_script(), 3);
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 4);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 4);
         assert!(matches!(a.as_slice(), [Action::Register { .. }]), "{a:?}");
         assert_eq!(e.next_deadline(), None);
         e
@@ -1163,7 +1267,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             vec![l(&[0x11, 0xFF, 0x00, 0x1B, 0x00, 0x00, 0x5A])]
         );
         run(&mut e, &headset_script(), 1);
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 2);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]),
+            2,
+        );
         (e, a)
     }
 
@@ -1198,25 +1307,26 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     #[test]
     fn accepts_logitech_hidpp_groups_only() {
-        assert!(HidppEngine::accepts(&receiver_group()));
-        assert!(HidppEngine::accepts(&headset_group()));
+        let catalog = catalog();
+        assert!(engines::wants(&receiver_group(), &catalog));
+        assert!(engines::wants(&headset_group(), &catalog));
 
         let mut other_vendor = receiver_group();
         for c in &mut other_vendor.collections {
             c.vid = 0x1532;
         }
-        assert!(!HidppEngine::accepts(&other_vendor));
+        assert!(!engines::wants(&other_vendor, &catalog));
 
         let mut wrong_len = receiver_group();
         wrong_len.collections[0].output_len = 20;
         wrong_len.collections[1].output_len = 7;
-        assert!(!HidppEngine::accepts(&wrong_len));
+        assert!(!engines::wants(&wrong_len, &catalog));
 
         let mut mouse_only = receiver_group();
         for c in &mut mouse_only.collections {
             (c.usage_page, c.usage) = (0x0001, 0x0002);
         }
-        assert!(!HidppEngine::accepts(&mouse_only));
+        assert!(!engines::wants(&mouse_only, &catalog));
     }
 
     #[test]
@@ -1261,12 +1371,15 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                 vec![Action::Send {
                     grant: GrantId(1),
                     collection: SHORT_C,
+                    kind: ReportKind::Output,
                     bytes: s(&[0x10, 0xFF, 0x81, 0x00]),
+                    deadline: None,
                 }]
             );
             assert_eq!(e.next_deadline(), Some(1_000));
 
-            let a = e.on_report(
+            let a = input(
+                &mut e,
                 SHORT_C,
                 &s(&[&[0x10, 0xFF, 0x81, 0x00][..], &flags].concat()),
                 1,
@@ -1277,7 +1390,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
                         sent(&a),
                         vec![s(&[&[0x10, 0xFF, 0x80, 0x00][..], &params].concat())]
                     );
-                    let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
+                    let a = input(&mut e, SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
                     assert_eq!(sent(&a), vec![notify_devices()], "{flags:?}");
                 }
                 None => assert_eq!(sent(&a), vec![notify_devices()], "{flags:?}"),
@@ -1290,7 +1403,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = receiver_pinging();
         run(&mut e, &mouse_script(), 2);
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 3);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 3);
 
         assert_eq!(
             a,
@@ -1316,13 +1429,13 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     /// Feeds the 0x41 `link` for slot 1, discovers the mouse and returns its `Register` wpid.
     fn link_up_registers(e: &mut HidppEngine, link: [u8; 7], now: Ms) -> Option<u16> {
         let gk = e.group_key();
-        let a = e.on_report(SHORT_C, &link, now);
+        let a = input(e, SHORT_C, &link, now);
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
         let a = e.on_grant(&grant(2, &gk, Trigger::Connected), now + 1);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
         run(e, &mouse_script(), now + 2);
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), now + 3);
+        let a = input(e, LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), now + 3);
 
         let [Action::Register { key, wpid, .. }] = a.as_slice() else {
             panic!("{a:?}");
@@ -1353,7 +1466,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let wpid = link_up_registers(&mut e, [0x10, 1, 0x41, 0x11, 0xA2, 0x93, 0x40], 3);
         assert_eq!(wpid, Some(0x4093));
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00], 10);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00],
+            10,
+        );
         assert_eq!(a, vec![Action::Unregister(mouse_key())]);
 
         // A new pairing on the slot whose 0x41 carries no wireless PID.
@@ -1385,7 +1503,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         ]);
         run(&mut e, &script, 2);
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 3);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 3);
 
         let [Action::Register { initial, .. }] = a.as_slice() else {
             panic!("{a:?}");
@@ -1400,7 +1518,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let send = |bytes| Action::Send {
             grant: GrantId(5),
             collection: LONG_C,
+            kind: ReportKind::Output,
             bytes,
+            deadline: None,
         };
         let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
         assert_eq!(
@@ -1410,11 +1530,16 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         // A direct device gets the device timeout.
         assert_eq!(e.next_deadline(), Some(4_000));
         for (i, (reply, want)) in headset_script().into_iter().enumerate() {
-            let a = e.on_report(LONG_C, &reply, 1);
+            let a = input(&mut e, LONG_C, &reply, 1);
             assert_eq!(a, vec![send(want)], "step {i}");
         }
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 2);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]),
+            2,
+        );
 
         assert_eq!(
             a,
@@ -1438,7 +1563,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
 
     #[test]
     fn headset_without_curve_quirk_uses_default_curve() {
-        let plain = Catalog::parse("").unwrap();
+        let (family, _) = CATALOG.split_once("[[device]]").unwrap();
+        let plain = Catalog::parse(family).unwrap();
         let (_, a) = headset_with(&plain);
         let [Action::Register { initial, .. }] = a.as_slice() else {
             panic!("{a:?}");
@@ -1478,6 +1604,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             Capabilities {
                 pushes_battery: false,
                 query_wakes: false,
+                audio: true,
+                awake_signal: false,
+                charging: true,
                 min_query_gap_ms: 300_000,
             }
         );
@@ -1485,7 +1614,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         // An activity grant reads the battery once, like a refresh.
         let a = e.on_grant(&grant(6, &headset_key(), Trigger::Activity), 100);
         assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x08, 0x0B])]);
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]), 110);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]),
+            110,
+        );
         let [Action::Update(update)] = a.as_slice() else {
             panic!("{a:?}");
         };
@@ -1499,7 +1633,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn ping_resource_error_registers_nothing_and_does_not_retry() {
         let mut e = receiver_pinging();
 
-        let a = e.on_report(SHORT_C, &s(&[0x10, 2, 0x8F, 0x00, 0x1B, 0x09]), 2);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 2, 0x8F, 0x00, 0x1B, 0x09]), 2);
         assert!(a.is_empty(), "{a:?}");
 
         // The other pings time out: skipped during discovery, nothing retried.
@@ -1522,10 +1656,11 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             ([0x10, 0x00, 0x00], s(&[0x10, 1, 0x81, 0x0D])),
         ] {
             let mut e = receiver_pinging();
-            let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 0x00, 0x1B, 0x01]), 2);
+            let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x8F, 0x00, 0x1B, 0x01]), 2);
             assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x81, 0x00])]);
 
-            let a = e.on_report(
+            let a = input(
+                &mut e,
                 SHORT_C,
                 &s(&[&[0x10, 1, 0x81, 0x00][..], &flags].concat()),
                 3,
@@ -1550,11 +1685,11 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             ),
         ];
         for (reply, want) in script {
-            let a = e.on_report(SHORT_C, &reply, 2);
+            let a = input(&mut e, SHORT_C, &reply, 2);
             assert_eq!(sent(&a), vec![want]);
         }
 
-        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x81, 0x07, 5, 0x00]), 3);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x81, 0x07, 5, 0x00]), 3);
 
         let key = DeviceKey("logi:C547:1".into());
         assert_eq!(
@@ -1576,7 +1711,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         );
 
         // Register notifications of a known HID++ 1.0 device.
-        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x0D, 60, 0x00, 0x40]), 4);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x0D, 60, 0x00, 0x40]), 4);
         let [Action::Update(u)] = a.as_slice() else {
             panic!("{a:?}");
         };
@@ -1594,7 +1729,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn battery_broadcast_updates_without_send() {
         let mut e = mouse_engine();
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x00, 40, 4, 0, 0]), 10);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 1, 6, 0x00, 40, 4, 0, 0]), 10);
 
         assert_eq!(
             a,
@@ -1611,7 +1746,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn adc_broadcast_offline_marks_asleep_keeps_level() {
         let mut e = headset_engine();
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x00, 0x0E, 0xF4, 0x0F]), 10);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x08, 0x00, 0x0E, 0xF4, 0x0F]),
+            10,
+        );
 
         // No Update: the level stays what it was, only presence changes.
         assert_eq!(a, vec![Action::Asleep(headset_key())]);
@@ -1620,14 +1760,19 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     #[test]
     fn truncated_adc_broadcast_is_ignored() {
         let mut e = headset_engine();
-        let a = e.on_report(LONG_C, &[0x11, 0xFF, 0x08, 0x00, 0x0E, 0xF4], 10);
+        let a = input(&mut e, LONG_C, &[0x11, 0xFF, 0x08, 0x00, 0x0E, 0xF4], 10);
         assert!(a.is_empty(), "{a:?}");
     }
 
     #[test]
     fn direct_device_broadcast_on_index_zero_updates() {
         let mut e = headset_engine();
-        let a = e.on_report(LONG_C, &l(&[0x11, 0x00, 0x08, 0x00, 0x0F, 0x83, 0x03]), 10);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0x00, 0x08, 0x00, 0x0F, 0x83, 0x03]),
+            10,
+        );
         assert_eq!(
             a,
             vec![Action::Update(DeviceUpdate {
@@ -1647,7 +1792,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = headset_engine();
         let mut push = |mv: u16, flags: u8| {
             let [hi, lo] = mv.to_be_bytes();
-            e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x00, hi, lo, flags]), 10)
+            input(
+                &mut e,
+                LONG_C,
+                &l(&[0x11, 0xFF, 0x08, 0x00, hi, lo, flags]),
+                10,
+            )
         };
         let level = |a: Vec<Action>| match a.as_slice() {
             [Action::Update(u)] => u.level,
@@ -1669,7 +1819,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             let mut e = headset_engine();
             let push = |e: &mut HidppEngine, mv: u16| {
                 let [hi, lo] = mv.to_be_bytes();
-                let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x08, 0x00, hi, lo, 0x03]), 10);
+                let a = input(e, LONG_C, &l(&[0x11, 0xFF, 0x08, 0x00, hi, lo, 0x03]), 10);
                 match a.as_slice() {
                     [Action::Update(u)] => u.level,
                     _ => panic!("{a:?}"),
@@ -1678,7 +1828,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             assert_eq!(push(&mut e, 4258), Some(Level::Percent(84)));
             e.on_grant(&grant(2, &headset_key(), Trigger::RefreshNow), 100);
             let a = match &reply {
-                Some(r) => e.on_report(LONG_C, r, 110),
+                Some(r) => input(&mut e, LONG_C, r, 110),
                 None => e.on_tick(4_100),
             };
             assert_eq!(a, vec![Action::Asleep(headset_key())], "{reply:02X?}");
@@ -1754,7 +1904,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         );
         assert_eq!(e.next_deadline(), None);
 
-        let a = e.on_report(
+        let a = input(
+            e,
             LONG_C,
             &l(&[0x11, 0xFF, 0x06, 0x00, 0x0E, 0xF4, 0x01]),
             5_000,
@@ -1775,7 +1926,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     #[test]
     fn direct_device_failed_first_read_registers_asleep() {
         let mut e = headset_off_until_read();
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0xFF, 0x06, 0x0B, 0x05]), 2);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 0xFF, 0xFF, 0x06, 0x0B, 0x05]), 2);
         check_off_headset_registered_then_updated(&mut e, &a);
     }
 
@@ -1791,7 +1942,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn direct_device_asleep_errors_on_first_read_register_asleep() {
         for code in [0x04, 0x08, 0x09] {
             let mut e = headset_off_until_read();
-            let a = e.on_report(LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x06, 0x0B, code]), 2);
+            let a = input(&mut e, LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x06, 0x0B, code]), 2);
             assert!(
                 matches!(
                     a.as_slice(),
@@ -1815,7 +1966,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let a = e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
         assert_eq!(sent(&a), vec![headset_ping()]);
         let (ping_reply, lookup) = headset_script().remove(0);
-        let a = e.on_report(LONG_C, &ping_reply, 1);
+        let a = input(&mut e, LONG_C, &ping_reply, 1);
         assert_eq!(sent(&a), vec![lookup]);
         e
     }
@@ -1829,7 +1980,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             l(&[0x11, 0xFF, 0x00, 0x0F]),
             l(&[0x11, 0xFF, 0x06, 0x00, 0x0E, 0xB2, 0x01]),
         ] {
-            assert!(e.on_report(LONG_C, &f, 2).is_empty());
+            assert!(input(&mut e, LONG_C, &f, 2).is_empty());
         }
         assert_eq!(e.next_deadline(), Some(4_001));
 
@@ -1860,7 +2011,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert_eq!(sent(&a), vec![headset_ping()]);
 
         run(&mut e, &headset_script(), 6_002);
-        let a = e.on_report(
+        let a = input(
+            &mut e,
             LONG_C,
             &l(&[0x11, 0xFF, 0x08, 0x0B, 0x0E, 0xF4, 0x01]),
             6_003,
@@ -1913,7 +2065,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut script = headset_script();
         script.truncate(6);
         run(&mut e, &script, 1);
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x0B, 0x00]), 2);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 0xFF, 0x00, 0x0B, 0x00]), 2);
         assert!(a.is_empty(), "{a:?}");
         assert_eq!(e.next_deadline(), None);
 
@@ -1927,7 +2079,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn unreachable_error_ends_direct_discovery_with_a_retry() {
         let mut e = headset_stalled();
         // HID++ 1.0 error 0x08 (unknown device) to the 0x0005 lookup.
-        let a = e.on_report(LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x00, 0x0B, 0x08]), 2);
+        let a = input(&mut e, LONG_C, &s(&[0x10, 0xFF, 0x8F, 0x00, 0x0B, 0x08]), 2);
         assert_eq!(
             a,
             vec![Action::DiscoveryFailed {
@@ -1963,11 +2115,11 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         ] {
             let mut e = receiver_pinging();
             for i in 2..=6 {
-                e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+                input(&mut e, SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
             }
             run(&mut e, &mouse_script(), 3);
             let a = match reply {
-                Some(r) => e.on_report(LONG_C, &r, 4),
+                Some(r) => input(&mut e, LONG_C, &r, 4),
                 None => e.on_tick(3 + 4_000),
             };
             assert!(a.is_empty(), "tick {tick}: {a:?}");
@@ -1979,10 +2131,20 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn link_lost_notification_marks_asleep() {
         let mut e = mouse_engine();
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x40, 0x00, 0x00], 10);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x40, 0x00, 0x00],
+            10,
+        );
         assert_eq!(a, vec![Action::Asleep(mouse_key())]);
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x03, 0x41, 0x04, 0x40, 0x00, 0x00], 11);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x03, 0x41, 0x04, 0x40, 0x00, 0x00],
+            11,
+        );
         assert!(a.is_empty(), "unknown index: {a:?}");
     }
 
@@ -1991,11 +2153,21 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = mouse_engine();
         let gk = e.group_key();
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 10);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00],
+            10,
+        );
         assert_eq!(a, vec![Action::Connected(mouse_key())]);
 
         // Unknown index: a new pairing (or a device asleep at startup).
-        let a = e.on_report(SHORT_C, &[0x10, 0x02, 0x41, 0x04, 0x00, 0x00, 0x00], 11);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x02, 0x41, 0x04, 0x00, 0x00, 0x00],
+            11,
+        );
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
 
         let a = e.on_grant(&grant(9, &gk, Trigger::Connected), 12);
@@ -2004,7 +2176,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             vec![Action::Send {
                 grant: GrantId(9),
                 collection: SHORT_C,
+                kind: ReportKind::Output,
                 bytes: s(&[0x10, 2, 0x00, 0x1B, 0x00, 0x00, 0x5A]),
+                deadline: None,
             }]
         );
         assert_eq!(e.next_deadline(), Some(4_012));
@@ -2016,7 +2190,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let a = e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 6, 0x1B])]);
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 55, 4, 1, 0]), 110);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 1, 6, 0x1B, 55, 4, 1, 0]), 110);
 
         assert_eq!(
             a,
@@ -2040,7 +2214,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             let mut e = mouse_engine();
             e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
 
-            let a = e.on_report(LONG_C, &reply, 110);
+            let a = input(&mut e, LONG_C, &reply, 110);
 
             assert_eq!(a, vec![Action::Asleep(mouse_key())], "{reply:02X?}");
         }
@@ -2052,11 +2226,21 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let gk = e.group_key();
         e.on_grant(&grant(5, &gk, Trigger::Arrival), 0);
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x1D, 0x04, 0x02, 0x5A]), 10);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x00, 0x1D, 0x04, 0x02, 0x5A]),
+            10,
+        );
         assert!(a.is_empty(), "{a:?}");
         assert_eq!(e.next_deadline(), Some(4_000));
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 20);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x00, 0x1B, 0x04, 0x02, 0x5A]),
+            20,
+        );
         assert_eq!(sent(&a), vec![l(&[0x11, 0xFF, 0x00, 0x0B, 0x00, 0x05])]);
     }
 
@@ -2088,7 +2272,9 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             vec![Action::Send {
                 grant: GrantId(2),
                 collection: SHORT_C,
+                kind: ReportKind::Output,
                 bytes: read,
+                deadline: None,
             }]
         );
         assert_eq!(e.next_deadline(), Some(8_100));
@@ -2135,14 +2321,19 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         // after 443, 937 and 1 288 ms.
         let mut e = receiver_pinging();
         for i in 2..=6 {
-            e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            input(&mut e, SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
         }
         let late = 1 + 1_288;
         assert!(e.on_tick(late).is_empty());
         assert_eq!(e.next_deadline(), Some(4_001));
 
         run(&mut e, &mouse_script(), late);
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), late + 1);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]),
+            late + 1,
+        );
 
         assert!(
             matches!(a.as_slice(), [Action::Register { key, .. }] if *key == mouse_key()),
@@ -2154,7 +2345,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn silent_receiver_slot_ping_is_dropped_after_4_s() {
         let mut e = receiver_pinging();
         for i in 2..=6 {
-            e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            input(&mut e, SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
         }
         assert!(e.on_tick(4_000).is_empty());
         assert_eq!(e.next_deadline(), Some(4_001));
@@ -2162,7 +2353,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         assert!(e.on_tick(4_001).is_empty());
         assert_eq!(e.next_deadline(), None);
         // A reply after the timeout is a sign of life: rediscover through a Connected grant.
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 4_002);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]),
+            4_002,
+        );
         assert_eq!(a, vec![Action::Connected(e.group_key())]);
     }
 
@@ -2191,18 +2387,25 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let gk = e.group_key();
         e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
 
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]),
+            1,
+        );
 
         assert_eq!(
             a,
             vec![Action::Send {
                 grant: GrantId(1),
                 collection: SHORT_C,
+                kind: ReportKind::Output,
                 bytes: notify_devices(),
+                deadline: None,
             }]
         );
         // The acknowledgement asks nothing more: the receiver now reports its slots.
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x02]), 2);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x02]), 2);
         assert!(a.is_empty(), "{a:?}");
         assert_eq!(e.next_deadline(), None);
     }
@@ -2212,16 +2415,26 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = receiver_notified();
         let gk = e.group_key();
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 3);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40],
+            3,
+        );
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
         // Paired, link not established: nothing to do until it links.
-        let a = e.on_report(SHORT_C, &[0x10, 0x02, 0x41, 0x04, 0x40, 0x8A, 0x40], 4);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x02, 0x41, 0x04, 0x40, 0x8A, 0x40],
+            4,
+        );
         assert!(a.is_empty(), "{a:?}");
 
         let a = e.on_grant(&grant(2, &gk, Trigger::Connected), 5);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
         run(&mut e, &mouse_script(), 6);
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 7);
+        let a = input(&mut e, LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 7);
         assert!(
             matches!(a.as_slice(), [Action::Register { key, .. }] if *key == mouse_key()),
             "{a:?}"
@@ -2237,15 +2450,30 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             let mut e = HidppEngine::new(&receiver_group(), &catalog());
             let gk = e.group_key();
             e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
-            e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
-            let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x8F, 0x80, 0x02, code]), 2);
+            input(
+                &mut e,
+                SHORT_C,
+                &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]),
+                1,
+            );
+            let a = input(
+                &mut e,
+                SHORT_C,
+                &s(&[0x10, 0xFF, 0x8F, 0x80, 0x02, code]),
+                2,
+            );
             assert_eq!(sent(&a), pings, "{code:#04x}");
         }
         // Timeout: same fallback.
         let mut e = HidppEngine::new(&receiver_group(), &catalog());
         let gk = e.group_key();
         e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
-        e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 1);
+        input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]),
+            1,
+        );
         assert!(e.on_tick(1_000).is_empty());
         assert_eq!(sent(&e.on_tick(1_001)), pings);
     }
@@ -2254,29 +2482,39 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn late_slot_reply_counts_as_link_up() {
         let mut e = receiver_notified();
         let gk = e.group_key();
-        e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 3);
+        input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40],
+            3,
+        );
         let a = e.on_grant(&grant(2, &gk, Trigger::Connected), 10);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
         assert!(e.on_tick(10 + 4_000).is_empty(), "ping dropped quietly");
 
         // The mouse answers 4.5 s after the ping.
         let late = l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]);
-        let a = e.on_report(LONG_C, &late, 10 + 4_500);
+        let a = input(&mut e, LONG_C, &late, 10 + 4_500);
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
         // Already pending: a second late frame asks nothing more.
-        assert!(e.on_report(LONG_C, &late, 10 + 4_501).is_empty());
+        assert!(input(&mut e, LONG_C, &late, 10 + 4_501).is_empty());
 
         let a = e.on_grant(&grant(3, &gk, Trigger::Connected), 10 + 4_502);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
         run(&mut e, &mouse_script(), 10 + 4_503);
-        let a = e.on_report(LONG_C, &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]), 10 + 4_504);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 1, 6, 0x1B, 34, 4, 0, 0]),
+            10 + 4_504,
+        );
         assert!(
             matches!(a.as_slice(), [Action::Register { key, .. }] if *key == mouse_key()),
             "{a:?}"
         );
 
         // Registered: further late frames from the slot are ignored.
-        assert!(e.on_report(LONG_C, &late, 10 + 4_505).is_empty());
+        assert!(input(&mut e, LONG_C, &late, 10 + 4_505).is_empty());
     }
 
     #[test]
@@ -2285,7 +2523,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let late = l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]);
         let mut e = receiver_notified();
         let gk = e.group_key();
-        e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 3);
+        input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40],
+            3,
+        );
         assert_eq!(
             sent(&e.on_grant(&grant(2, &gk, Trigger::Connected), 10)),
             vec![ping.clone()]
@@ -2293,7 +2536,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         e.on_tick(10 + 4_000);
 
         // First late reply: one rediscovery.
-        let a = e.on_report(LONG_C, &late, 4_100);
+        let a = input(&mut e, LONG_C, &late, 4_100);
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
         assert_eq!(
             sent(&e.on_grant(&grant(3, &gk, Trigger::Connected), 4_101)),
@@ -2302,18 +2545,23 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         e.on_tick(4_101 + 4_000);
 
         // Its ping timed out too: a second late reply asks nothing more.
-        let a = e.on_report(LONG_C, &late, 8_200);
+        let a = input(&mut e, LONG_C, &late, 8_200);
         assert!(a.is_empty(), "{a:?}");
 
         // A real 0x41 for the slot re-arms it.
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40], 8_201);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x93, 0x40],
+            8_201,
+        );
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
         assert_eq!(
             sent(&e.on_grant(&grant(4, &gk, Trigger::Connected), 8_202)),
             vec![ping]
         );
         e.on_tick(8_202 + 4_000);
-        let a = e.on_report(LONG_C, &late, 12_300);
+        let a = input(&mut e, LONG_C, &late, 12_300);
         assert_eq!(a, vec![Action::Connected(gk)]);
     }
 
@@ -2325,7 +2573,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             l(&[0x11, 1, 6, 0x00, 40, 4, 0, 0]),
             l(&[0x11, 1, 0x00, 0x1D, 0x04, 0x02, 0x5A]),
         ] {
-            let a = e.on_report(LONG_C, &frame, 3);
+            let a = input(&mut e, LONG_C, &frame, 3);
             assert!(a.is_empty(), "{frame:02X?}: {a:?}");
         }
     }
@@ -2334,7 +2582,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn placeholder_unit_id_falls_back_to_pid_and_index() {
         let mut e = headset_off_until_read();
 
-        let a = e.on_report(LONG_C, &l(&[0x11, 0xFF, 0x06, 0x0B, 0x0E, 0xF4, 0x01]), 2);
+        let a = input(
+            &mut e,
+            LONG_C,
+            &l(&[0x11, 0xFF, 0x06, 0x0B, 0x0E, 0xF4, 0x01]),
+            2,
+        );
 
         let [Action::Register { key, initial, .. }] = a.as_slice() else {
             panic!("{a:?}");
@@ -2348,10 +2601,20 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = mouse_engine();
         let gk = e.group_key();
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00], 10);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00],
+            10,
+        );
         assert_eq!(a, vec![Action::Unregister(mouse_key())]);
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 11);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00],
+            11,
+        );
         assert_eq!(a, vec![Action::Connected(gk.clone())]);
         let a = e.on_grant(&grant(9, &gk, Trigger::Connected), 12);
         assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x1B, 0x00, 0x00, 0x5A])]);
@@ -2362,7 +2625,12 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = mouse_engine();
         e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
 
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00], 110);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00],
+            110,
+        );
 
         assert_eq!(a, vec![Action::Unregister(mouse_key())]);
         assert_eq!(e.next_deadline(), None);
@@ -2374,11 +2642,21 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let gk = e.group_key();
         e.on_grant(&grant(1, &gk, Trigger::Arrival), 0);
 
-        let a = e.on_report(SHORT_C, &[0x10, 0xFF, 0x40, 0x02, 0x00, 0x00, 0x00], 1);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0xFF, 0x40, 0x02, 0x00, 0x00, 0x00],
+            1,
+        );
 
         assert!(a.is_empty(), "{a:?}");
         assert_eq!(e.next_deadline(), Some(1_000));
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]), 2);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 0xFF, 0x81, 0x00, 0x00, 0x01, 0x00]),
+            2,
+        );
         assert_eq!(sent(&a), vec![notify_devices()]);
     }
 
@@ -2388,11 +2666,16 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = mouse_engine();
         e.on_grant(&grant(2, &mouse_key(), Trigger::RefreshNow), 100);
 
-        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 6, 0x1B, 0x08]), 110);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x8F, 6, 0x1B, 0x08]), 110);
 
         assert_eq!(a, vec![Action::Asleep(mouse_key())]);
         // Still known: link-up is a Connected on the device, not a rediscovery.
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 120);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00],
+            120,
+        );
         assert_eq!(a, vec![Action::Connected(mouse_key())]);
     }
 
@@ -2402,10 +2685,15 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         let mut e = hidpp10_engine();
         e.on_grant(&grant(3, &key, Trigger::Connected), 100);
 
-        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 0x81, 0x00, 0x08]), 110);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x8F, 0x81, 0x00, 0x08]), 110);
 
         assert_eq!(a, vec![Action::Asleep(key.clone())]);
-        let a = e.on_report(SHORT_C, &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00], 120);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &[0x10, 0x01, 0x41, 0x04, 0x00, 0x00, 0x00],
+            120,
+        );
         assert_eq!(a, vec![Action::Connected(key)]);
     }
 
@@ -2413,15 +2701,20 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
     fn hidpp10_engine() -> HidppEngine {
         let mut e = receiver_pinging();
         for i in 2..=6 {
-            e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+            input(&mut e, SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
         }
         for reply in [
             s(&[0x10, 1, 0x8F, 0x00, 0x1B, 0x01]),
             s(&[0x10, 1, 0x81, 0x00, 0x10]),
         ] {
-            e.on_report(SHORT_C, &reply, 3);
+            input(&mut e, SHORT_C, &reply, 3);
         }
-        let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x81, 0x0D, 50, 0x00, 0x00]), 4);
+        let a = input(
+            &mut e,
+            SHORT_C,
+            &s(&[0x10, 1, 0x81, 0x0D, 50, 0x00, 0x00]),
+            4,
+        );
         assert!(matches!(a.as_slice(), [Action::Register { .. }]), "{a:?}");
         assert_eq!(e.next_deadline(), None);
         e
@@ -2447,7 +2740,8 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             let a = e.on_grant(&grant(3, &key, Trigger::Connected), 100);
             assert_eq!(sent(&a), vec![get.clone()]);
 
-            let a = e.on_report(
+            let a = input(
+                &mut e,
                 SHORT_C,
                 &s(&[&[0x10, 1, 0x81, 0x00][..], &flags].concat()),
                 110,
@@ -2455,13 +2749,18 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             match write {
                 Some(set) => {
                     assert_eq!(sent(&a), vec![set], "{flags:?}");
-                    let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x80, 0x00]), 120);
+                    let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x80, 0x00]), 120);
                     assert_eq!(sent(&a), vec![read.clone()], "{flags:?}");
                 }
                 None => assert_eq!(sent(&a), vec![read.clone()], "{flags:?}"),
             }
 
-            let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x81, 0x0D, 55, 0x00, 0x40]), 130);
+            let a = input(
+                &mut e,
+                SHORT_C,
+                &s(&[0x10, 1, 0x81, 0x0D, 55, 0x00, 0x40]),
+                130,
+            );
             assert_eq!(
                 a,
                 vec![Action::Update(DeviceUpdate {
@@ -2489,12 +2788,17 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         for code in [0x04, 0x08, 0x09] {
             let mut e = receiver_pinging();
             for i in 2..=6 {
-                e.on_report(SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
+                input(&mut e, SHORT_C, &s(&[0x10, i, 0x8F, 0x00, 0x1B, 0x08]), 2);
             }
-            let a = e.on_report(LONG_C, &l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]), 3);
+            let a = input(
+                &mut e,
+                LONG_C,
+                &l(&[0x11, 1, 0x00, 0x1B, 0x04, 0x02, 0x5A]),
+                3,
+            );
             assert_eq!(sent(&a), vec![s(&[0x10, 1, 0x00, 0x0B, 0x00, 0x05])]);
 
-            let a = e.on_report(SHORT_C, &s(&[0x10, 1, 0x8F, 0x00, 0x0B, code]), 4);
+            let a = input(&mut e, SHORT_C, &s(&[0x10, 1, 0x8F, 0x00, 0x0B, code]), 4);
 
             assert!(a.is_empty(), "{code:#04x}: {a:?}");
             assert_eq!(e.next_deadline(), None, "{code:#04x}");
@@ -2510,10 +2814,10 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
             ..grant(1, &gk, Trigger::Arrival)
         };
         e.on_grant(&small, 0);
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00]), 1);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 0xFF, 0x81, 0x00]), 1);
         assert_eq!(sent(&a).len(), 1);
 
-        let a = e.on_report(SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
+        let a = input(&mut e, SHORT_C, &s(&[0x10, 0xFF, 0x80, 0x00]), 2);
 
         assert!(
             a.is_empty(),
@@ -2535,7 +2839,7 @@ quirks = { voltage_curve = "pro-x-wireless-ghub" }
         for mut e in engines {
             for (t, f) in (100..).zip(&frames) {
                 let c = if f.len() == 7 { SHORT_C } else { LONG_C };
-                let a = e.on_report(c, f, t);
+                let a = input(&mut e, c, f, t);
                 assert!(sent(&a).is_empty(), "{f:02X?} -> {a:?}");
             }
             assert!(e.on_tick(1_000_000).is_empty());

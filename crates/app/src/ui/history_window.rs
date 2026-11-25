@@ -94,7 +94,8 @@ pub struct Device {
 
 /// The devices to list: the snapshot's in the user's order, hidden and offline ones
 /// included, then devices with readings in the history that are not in the snapshot, by
-/// key (their names are not kept); session breaks alone do not list a device.
+/// their last seen name ([`Settings::names`]), else by key; session breaks alone do not
+/// list a device.
 pub fn devices(
     states: &[DeviceState],
     settings: &Settings,
@@ -118,7 +119,7 @@ pub fn devices(
     rest.sort();
     list.extend(rest.into_iter().map(|key| Device {
         key: key.clone(),
-        name: key.0.clone(),
+        name: settings.names.get(key).unwrap_or(&key.0).clone(),
     }));
     list
 }
@@ -787,6 +788,7 @@ mod tests {
             source: Source::Query,
             verification: Verification::HardwareTested,
             poll_min_ms: None,
+            reports_changes: false,
         }
     }
 
@@ -824,8 +826,21 @@ mod tests {
             .into_iter()
             .map(|d| d.name)
             .collect();
-        // Devices not connected now are listed by key.
+        // Devices not connected now, whose names were never seen, are listed by key.
         assert_eq!(names, ["K400", "G305", "PRO X", "y", "z"]);
+
+        // With a remembered name, by that name; a connected device by its current one.
+        settings
+            .names
+            .insert(DeviceKey("z".into()), "Galaxy Buds2".into());
+        settings
+            .names
+            .insert(DeviceKey("a".into()), "Old name".into());
+        let names: Vec<String> = devices(&states, &settings, &history)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, ["K400", "G305", "PRO X", "y", "Galaxy Buds2"]);
     }
 
     #[test]
