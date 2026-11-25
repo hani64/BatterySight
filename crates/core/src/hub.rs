@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::{Catalog, CollectionSelector, EngineKind};
-use crate::engine::{Action, Engine, WriteDestination, write_allowed};
+use crate::engine::{Action, Engine, FeatureSetId, WriteDestination, write_allowed};
 use crate::engines::{self, Selection};
 use crate::hid::{CollectionId, CollectionRole, GroupId, HidGroup, ReportKind, ReportOrigin};
 use crate::model::{
@@ -29,6 +29,10 @@ pub enum HubInput {
         origin: ReportOrigin,
         bytes: Vec<u8>,
     },
+    FeatureSetComplete {
+        collection: CollectionId,
+        id: FeatureSetId,
+    },
     Resume,
     RefreshNow,
     /// Audible activity on the physical device, not evidence that it is awake.
@@ -46,6 +50,8 @@ pub enum HubOutput {
         bytes: Vec<u8>,
         /// For feature operations, the transaction deadline capped by its grant expiry.
         deadline: Option<Ms>,
+        /// A successful SET completion must return this ID to the issuing engine.
+        set_id: Option<FeatureSetId>,
     },
     /// A request was denied without exposing its payload or the device identity.
     WriteRefused {
@@ -231,6 +237,15 @@ impl Hub {
                     let gid = route.group;
                     let actions = slot.engine.on_report(collection, origin, &bytes, now);
                     self.apply(gid, actions, Some(origin), now, &mut pass);
+                }
+            }
+            HubInput::FeatureSetComplete { collection, id } => {
+                if let Some(route) = self.routes.get(&collection).filter(|route| route.role.is_some())
+                    && let Some(slot) = self.engines.get_mut(&route.group)
+                {
+                    let gid = route.group;
+                    let actions = slot.engine.on_feature_set_complete(collection, id, now);
+                    self.apply(gid, actions, None, now, &mut pass);
                 }
             }
             HubInput::Resume => self.request_all(Trigger::Resume, now, &mut pass),
@@ -754,6 +769,10 @@ impl Hub {
                             kind,
                             bytes,
                             deadline,
+                            set_id: (kind == ReportKind::SetFeature).then_some(FeatureSetId {
+                                grant,
+                                issued_ms: now,
+                            }),
                         }),
                         Err(reason) => pass.out.push(HubOutput::WriteRefused {
                             kind,
@@ -887,6 +906,9 @@ impl Hub {
         let behind_receiver = initial.via == Some(Via::Receiver);
         let (verification, catalog_name) = self.identity(slot, behind_receiver, wpid);
         let product = slot.product.clone();
+        let preserve_level_less_sample = slot.kind == EngineKind::Sonix
+            && initial.level.is_none()
+            && initial.millivolts.is_none();
 
         let groups = self.owners.entry(key.clone()).or_default();
         if groups.last().is_none_or(|owner| owner.group != gid) {
@@ -923,7 +945,14 @@ impl Hub {
             });
         state.verification = verification;
         apply_polling_caps(state, caps);
+        let sample_history = (preserve_level_less_sample
+            && (state.level.is_some() || state.millivolts.is_some()))
+        .then_some((state.source, state.updated_ms));
         state.apply(&initial, now);
+        if let Some((source, updated_ms)) = sample_history {
+            state.source = source;
+            state.updated_ms = updated_ms;
+        }
         if let Some(name) = catalog_name {
             state.name = name;
         }
@@ -1363,12 +1392,14 @@ quirks = { query_wakes = true }
                     kind: ReportKind::Output,
                     bytes: vec![0xA1],
                     deadline: None,
+                    set_id: None,
                 },
                 HubOutput::Send {
                     collection: coll(1),
                     kind: ReportKind::Output,
                     bytes: vec![0xA2],
                     deadline: None,
+                    set_id: None,
                 },
             ]
         );
@@ -1455,6 +1486,7 @@ quirks = { query_wakes = true }
                     kind: ReportKind::Output,
                     bytes: valid.to_vec(),
                     deadline: None,
+                    set_id: None,
                 },
                 refused(ReportKind::Output, coll(1), WriteRefusal::Grant),
             ]
@@ -1572,6 +1604,7 @@ quirks = { query_wakes = true }
                         kind: ReportKind::GetFeature,
                         bytes: vec![0x31, 0, 0, 0],
                         deadline: Some(expected),
+                        set_id: None,
                     }
                 ]
             );
@@ -1994,6 +2027,7 @@ quirks = { query_wakes = true }
                 kind: ReportKind::Output,
                 bytes: vec![0x10, 0xFF, 0x81, 0, 0, 0, 0],
                 deadline: None,
+                set_id: None,
             }]
         );
     }

@@ -1,7 +1,7 @@
 //! Pulsar SONiX report-0 mailbox and (Fusion2) report-5 events.
 
 use crate::catalog::{CollectionSelector, DeviceEntry, EngineKind};
-use crate::engine::{Action, BytePattern, Engine, WriteRule};
+use crate::engine::{Action, BytePattern, Engine, FeatureSetId, WriteRule};
 use crate::hid::{
     Collection, CollectionId, CollectionRole, GroupId, HidGroup, ReportKind, ReportOrigin,
 };
@@ -58,18 +58,24 @@ struct WakeGrace {
 }
 
 struct Query {
-    // The previous answer to the same selector may be latched before the SET.
-    old_level: Option<u8>,
+    // A completed response may be latched in the shared mailbox before our SET.
+    preflight: [u8; FEATURE_LEN],
     matched_busy: bool,
-    reset: Option<(Ms, [u8; 3])>,
+    reset_since: Option<Ms>,
     resent: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MailboxIo {
+    Reading,
+    Writing(FeatureSetId),
+    CheckAt(Ms),
 }
 
 struct Transaction {
     grant: GrantId,
     until: Ms,
-    /// `None` while a GET is in flight. We never launch another GET without its reply.
-    check_at: Option<Ms>,
+    io: MailboxIo,
     /// No SET before the preflight GET finds a known nonbusy buffer.
     query: Option<Query>,
 }
@@ -174,7 +180,7 @@ impl SonixEngine {
         let transaction = Transaction {
             grant,
             until,
-            check_at: None,
+            io: MailboxIo::Reading,
             query: None,
         };
         let get = Self::send(self.command, &transaction, ReportKind::GetFeature, &GET_MAILBOX);
@@ -212,7 +218,8 @@ impl SonixEngine {
             via: new.then_some(Via::Receiver),
             level: level.map(Level::Percent),
             millivolts: None,
-            charge,
+            // A newly registered receiver cannot vouch for the previous owner's charge.
+            charge: charge.or(new.then_some(Charge::Unknown)),
             presence: Some(presence),
             source,
         };
@@ -302,14 +309,14 @@ impl SonixEngine {
         let Some(mut transaction) = self.transaction.take() else {
             return Vec::new();
         };
-        if transaction.check_at.is_some() {
+        if transaction.io != MailboxIo::Reading {
             self.transaction = Some(transaction);
             return Vec::new();
         }
         let echo = [*category, *register, *sub];
         let matched = echo == BATTERY_ECHO;
         let check_at = now.saturating_add(CHECK_MS);
-        transaction.check_at = Some(check_at);
+        transaction.io = MailboxIo::CheckAt(check_at);
 
         let mut send = false;
         match transaction.query.as_mut() {
@@ -319,19 +326,27 @@ impl SonixEngine {
                 && (matches!(*status, 0x01 | 0x05) || bytes == GET_MAILBOX) =>
             {
                 transaction.query = Some(Query {
-                    old_level: (matched && *status == 1).then_some(*level),
+                    preflight: bytes.try_into().expect("validated mailbox width"),
                     matched_busy: false,
-                    reset: None,
+                    reset_since: None,
                     resent: false,
                 });
                 send = true;
             }
             None => {}
-            Some(query) => match (*status, matched) {
-                (0x05, true) => return self.unlinked(Presence::Asleep, Source::Query),
-                (0x01, true) if query.old_level != Some(*level) || query.matched_busy => {
-                    match level {
+            Some(query) => {
+                let stale_terminal = !query.matched_busy
+                    && query.preflight[1] == *status
+                    && query.preflight[2..5] == BATTERY_ECHO
+                    && (*status == 0x05 || query.preflight[7] == *level);
+                match (*status, matched) {
+                    (0x05, true) if !stale_terminal => {
+                        return self.unlinked(Presence::Asleep, Source::Query);
+                    }
+                    (0x01, true) if !stale_terminal => match level {
                         0..=100 => {
+                            // Reachability is not an input edge and cannot arm the fallback.
+                            self.linked = self.events.is_some();
                             return vec![self.observe(
                                 Presence::Online,
                                 Some(*level),
@@ -340,33 +355,37 @@ impl SonixEngine {
                             )];
                         }
                         0xFF => return self.unlinked(Presence::Offline, Source::Query),
-                        _ => query.reset = None,
+                        _ => query.reset_since = None,
+                    },
+                    (0x02, _) => {
+                        // Any busy report blocks a SET. Only ours proves this command ran.
+                        query.matched_busy = matched;
+                        query.reset_since = None;
                     }
-                }
-                (0x02, _) => {
-                    // Any pending request blocks a SET. Only ours can prove that a
-                    // later return to a previous answer is the documented reset.
-                    query.matched_busy = matched;
-                    query.reset = None;
-                }
-                (0x01, false) if self.events.is_some() && query.matched_busy && !query.resent => {
-                    let since = match query.reset {
-                        Some((at, previous)) if previous == echo => at,
-                        _ => now,
-                    };
-                    query.reset = Some((since, echo));
-                    if now.saturating_sub(since) >= RESET_MS
-                        && now.saturating_add(RESEND_ROOM_MS) < transaction.until
+                    (0x01, false)
+                        if self.events.is_some()
+                            && query.matched_busy
+                            && !query.resent
+                            && bytes == query.preflight =>
                     {
-                        query.resent = true;
-                        query.matched_busy = false;
-                        send = true;
+                        let since = *query.reset_since.get_or_insert(now);
+                        if now.saturating_sub(since) >= RESET_MS
+                            && now.saturating_add(RESEND_ROOM_MS) < transaction.until
+                        {
+                            query.resent = true;
+                            query.matched_busy = false;
+                            send = true;
+                        }
                     }
+                    _ => query.reset_since = None,
                 }
-                _ => query.reset = None,
-            },
+            }
         }
         let action = send.then(|| {
+            transaction.io = MailboxIo::Writing(FeatureSetId {
+                grant: transaction.grant,
+                issued_ms: now,
+            });
             Self::send(self.command, &transaction, ReportKind::SetFeature, &READ_BATTERY)
         });
         self.transaction = Some(transaction);
@@ -476,6 +495,23 @@ impl Engine for SonixEngine {
         }
     }
 
+    fn on_feature_set_complete(
+        &mut self,
+        collection: CollectionId,
+        id: FeatureSetId,
+        now: Ms,
+    ) -> Vec<Action> {
+        self.expire(now);
+        if collection == self.command
+            && id.issued_ms <= now
+            && let Some(transaction) = &mut self.transaction
+            && transaction.io == MailboxIo::Writing(id)
+        {
+            transaction.io = MailboxIo::CheckAt(now.saturating_add(CHECK_MS));
+        }
+        Vec::new()
+    }
+
     fn on_tick(&mut self, now: Ms) -> Vec<Action> {
         self.expire(now);
         if let Some(WakeGrace { at, grant }) = self.grace.take_if(|g| {
@@ -490,9 +526,9 @@ impl Engine for SonixEngine {
             return self.begin(grant, until, now);
         }
         if let Some(transaction) = &mut self.transaction
-            && transaction.check_at.is_some_and(|at| now >= at)
+            && matches!(transaction.io, MailboxIo::CheckAt(at) if now >= at)
         {
-            transaction.check_at = None;
+            transaction.io = MailboxIo::Reading;
             return vec![Self::send(
                 self.command,
                 transaction,
@@ -508,10 +544,10 @@ impl Engine for SonixEngine {
             .grace
             .as_ref()
             .map(|g| g.grant.map_or(g.at, |(_, expires)| g.at.min(expires)));
-        let mailbox = self
-            .transaction
-            .as_ref()
-            .map(|t| t.check_at.map_or(t.until, |at| at.min(t.until)));
+        let mailbox = self.transaction.as_ref().map(|t| match t.io {
+            MailboxIo::CheckAt(at) => at.min(t.until),
+            MailboxIo::Reading | MailboxIo::Writing(_) => t.until,
+        });
         grace.into_iter().chain(mailbox).min()
     }
 

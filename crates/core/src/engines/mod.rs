@@ -578,6 +578,7 @@ source = "Linux hid-logitech-hidpp"
                 kind: crate::hid::ReportKind::Output,
                 bytes: vec![0x10, 0xFF, 0x81, 0, 0, 0, 0],
                 deadline: None,
+                set_id: None,
             }]
         );
         // Only the receive interface opened; it could send under the family default,

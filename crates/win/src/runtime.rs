@@ -381,6 +381,19 @@ impl Device {
                 );
                 false
             }
+            OsEvent::FeatureSetComplete {
+                collection,
+                id,
+                deadline,
+            } => {
+                let now = now_ms();
+                if now < deadline
+                    && let Some(id) = id
+                {
+                    self.feed(HubInput::FeatureSetComplete { collection, id }, now);
+                }
+                false
+            }
             OsEvent::FeatureFailed {
                 collection,
                 kind,
@@ -734,17 +747,18 @@ impl Device {
                     kind,
                     bytes,
                     deadline,
+                    set_id,
                 } => {
                     let (started, direction) = match (kind, deadline) {
                         (ReportKind::Output, _) => {
                             (self.reactor.write(collection, &bytes), Direction::Out)
                         }
                         (ReportKind::SetFeature, Some(at)) => (
-                            self.reactor.feature(collection, kind, &bytes, at),
+                            self.reactor.feature(collection, kind, &bytes, at, set_id),
                             Direction::FeatureSet,
                         ),
                         (ReportKind::GetFeature, Some(at)) => (
-                            self.reactor.feature(collection, kind, &bytes, at),
+                            self.reactor.feature(collection, kind, &bytes, at, None),
                             Direction::FeatureGet,
                         ),
                         (_, None) => unreachable!("admitted feature requests have a deadline"),

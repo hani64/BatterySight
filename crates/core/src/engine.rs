@@ -10,6 +10,14 @@ use crate::model::{DeviceKey, DeviceUpdate, Presence};
 use crate::scheduler::{Capabilities, Grant, GrantId};
 use crate::time::Ms;
 
+/// Identifies a feature SET within its grant. Successive SETs in the same
+/// transaction are issued on different ticks, and each has its own completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeatureSetId {
+    pub grant: GrantId,
+    pub issued_ms: Ms,
+}
+
 /// What an engine asks the hub to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -274,6 +282,15 @@ pub trait Engine {
         bytes: &[u8],
         now: Ms,
     ) -> Vec<Action>;
+    /// Transport confirmed this SET; it is not an input report or a GET reply.
+    fn on_feature_set_complete(
+        &mut self,
+        _collection: CollectionId,
+        _id: FeatureSetId,
+        _now: Ms,
+    ) -> Vec<Action> {
+        Vec::new()
+    }
     fn on_tick(&mut self, now: Ms) -> Vec<Action>;
     /// When `on_tick` next needs to run, if ever.
     fn next_deadline(&self) -> Option<Ms>;

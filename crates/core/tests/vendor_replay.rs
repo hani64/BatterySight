@@ -1,6 +1,7 @@
 //! Replays synthesized vendor frames through the real catalog, selection and hub.
 
 use batterysight_core::catalog::Catalog;
+use batterysight_core::engine::FeatureSetId;
 use batterysight_core::engines::rapoo::RapooEngine;
 use batterysight_core::hid::{
     Collection, CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin,
@@ -502,6 +503,7 @@ fn steelseries_sent(out: Vec<HubOutput>, expected: Option<(u8, usize)>) {
                 kind: ReportKind::Output,
                 bytes,
                 deadline: None,
+                set_id: None,
             }
         })
         .collect();
@@ -1038,6 +1040,7 @@ fn hyperx_sent(out: Vec<HubOutput>, width: usize, prefix: &[u8]) {
             kind: ReportKind::Output,
             bytes: hyperx_packet(width, prefix),
             deadline: None,
+            set_id: None,
         })
         .into_iter()
         .collect();
@@ -1793,29 +1796,46 @@ fn sonix_mailbox(hub: &mut Hub, now: Ms, prefix: &[u8]) -> Vec<HubOutput> {
     sonix_report(hub, now, OTHER, ReportOrigin::FeatureReply, 65, prefix)
 }
 
-fn sonix_send(out: Vec<HubOutput>, expected: Option<(ReportKind, Ms)>) {
+fn sonix_send(out: Vec<HubOutput>, expected: Option<(ReportKind, Ms)>) -> Option<FeatureSetId> {
     let sent: Vec<_> = out
         .into_iter()
         .filter(|e| *e != HubOutput::StateChanged)
         .collect();
     let Some((kind, at)) = expected else {
         assert!(sent.is_empty(), "unexpected operation: {sent:?}");
-        return;
+        return None;
     };
     let mut bytes = vec![0; 65];
     if kind == ReportKind::SetFeature {
         bytes[2..5].copy_from_slice(&[8, 0x81, 1]);
         bytes[63] = 0x8A;
     }
-    assert_eq!(
-        sent,
-        [HubOutput::Send {
-            collection: OTHER,
-            kind,
-            bytes,
-            deadline: Some(at),
-        }]
-    );
+    let [
+        HubOutput::Send {
+            collection,
+            kind: sent_kind,
+            bytes: sent_bytes,
+            deadline,
+            set_id,
+        },
+    ] = sent.as_slice()
+    else {
+        panic!("expected one {kind:?}, got {sent:?}");
+    };
+    assert_eq!((*collection, *sent_kind, sent_bytes, *deadline), (OTHER, kind, &bytes, Some(at)));
+    assert_eq!(set_id.is_some(), kind == ReportKind::SetFeature);
+    *set_id
+}
+
+fn sonix_complete_set(hub: &mut Hub, at: Ms, collection: CollectionId, id: FeatureSetId) {
+    sonix_send(hub.handle(HubInput::FeatureSetComplete { collection, id }, at), None);
+}
+
+fn sonix_ready_mailbox(hub: &mut Hub, at: Ms, response: &[u8], deadline: Ms) -> FeatureSetId {
+    let out = sonix_mailbox(hub, at, response);
+    let id = sonix_send(out, Some((ReportKind::SetFeature, deadline))).unwrap();
+    sonix_complete_set(hub, at, OTHER, id);
+    id
 }
 
 fn sonix_arrival(hub: &mut Hub, pid: u16, deadline: Ms) {
@@ -1915,10 +1935,7 @@ fn sonix_busy_get_first_and_awake_reply_after_four_operations() {
     sonix_send(hub.handle(HubInput::Tick, 62_120), get);
     sonix_send(sonix_mailbox(&mut hub, 62_120, SONIX_PENDING), None);
     sonix_send(hub.handle(HubInput::Tick, 62_140), get);
-    sonix_send(
-        sonix_mailbox(&mut hub, 62_140, SONIX_FOREIGN),
-        Some((ReportKind::SetFeature, deadline)),
-    );
+    sonix_ready_mailbox(&mut hub, 62_140, SONIX_FOREIGN, deadline);
     sonix_send(sonix_mailbox(&mut hub, 62_141, SONIX_OK), None);
     sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
     sonix_send(hub.handle(HubInput::Tick, 62_160), get);
@@ -1932,8 +1949,7 @@ fn sonix_resends_once_only_after_matching_pending_and_a_stable_reset() {
     let mut hub = hub();
     sonix_arrival(&mut hub, 0x5402, 1_000);
     let get = Some((ReportKind::GetFeature, 1_000));
-    let set = Some((ReportKind::SetFeature, 1_000));
-    sonix_send(sonix_mailbox(&mut hub, 0, SONIX_FOREIGN), set);
+    let initial = sonix_ready_mailbox(&mut hub, 0, SONIX_FOREIGN, 1_000);
     for (at, mailbox) in [
         (20, SONIX_FOREIGN),
         (40, SONIX_FOREIGN),
@@ -1946,11 +1962,15 @@ fn sonix_resends_once_only_after_matching_pending_and_a_stable_reset() {
         sonix_send(sonix_mailbox(&mut hub, at, mailbox), None);
     }
     sonix_send(hub.handle(HubInput::Tick, 140), get);
-    sonix_send(sonix_mailbox(&mut hub, 140, SONIX_FOREIGN), set);
-    for at in (160..1_000).step_by(20) {
+    let out = sonix_mailbox(&mut hub, 140, SONIX_FOREIGN);
+    let resend = sonix_send(out, Some((ReportKind::SetFeature, 1_000))).unwrap();
+    sonix_complete_set(&mut hub, 140, OTHER, initial);
+    sonix_send(hub.handle(HubInput::Tick, 160), None);
+    sonix_complete_set(&mut hub, 160, OTHER, resend);
+    for at in (180..1_000).step_by(20) {
         sonix_send(hub.handle(HubInput::Tick, at), get);
         sonix_send(
-            sonix_mailbox(&mut hub, at, if at == 160 { SONIX_PENDING } else { SONIX_FOREIGN }),
+            sonix_mailbox(&mut hub, at, if at == 180 { SONIX_PENDING } else { SONIX_FOREIGN }),
             None,
         );
     }
@@ -1966,10 +1986,7 @@ fn sonix_rejects_wrong_echo_width_role_and_level_then_05_is_final() {
     let mut hub = hub();
     sonix_arrival(&mut hub, 0x5402, 1_000);
     sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
-    sonix_send(
-        sonix_mailbox(&mut hub, 0, SONIX_OK),
-        Some((ReportKind::SetFeature, 1_000)),
-    );
+    sonix_ready_mailbox(&mut hub, 0, SONIX_OK, 1_000);
     for (at, reply) in [
         (20, SONIX_OK), // unchanged preflight latch is not a fresh reply
         (40, SONIX_FOREIGN),
@@ -2011,10 +2028,7 @@ fn sonix_down_cancels_and_the_earlier_grant_expiry_caps_operations() {
     );
     sonix_arrival(&mut hub, 0x5402, 70);
     sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
-    sonix_send(
-        sonix_mailbox(&mut hub, 0, &[]),
-        Some((ReportKind::SetFeature, 70)),
-    );
+    sonix_ready_mailbox(&mut hub, 0, &[], 70);
     sonix_send(
         hub.handle(HubInput::Tick, 20),
         Some((ReportKind::GetFeature, 70)),
@@ -2084,7 +2098,7 @@ fn sonix_validates_read_and_write_roles_per_pid_without_substitution() {
 fn sonix_feinmann_has_only_battery_one_shots_not_a_poll_interval() {
     let mut hub = hub();
     sonix_arrival(&mut hub, 0x5404, 1_000);
-    sonix_send(sonix_mailbox(&mut hub, 0, &[]), Some((ReportKind::SetFeature, 1_000)));
+    sonix_ready_mailbox(&mut hub, 0, &[], 1_000);
     sonix_send(hub.handle(HubInput::Tick, 20), Some((ReportKind::GetFeature, 1_000)));
     sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
     sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
@@ -2093,4 +2107,125 @@ fn sonix_feinmann_has_only_battery_one_shots_not_a_poll_interval() {
     sonix_send(hub.handle(HubInput::Tick, 5_000), None);
     sonix_send(sonix_input(&mut hub, 70_000, SONIX_PULSE), None);
     sonix_send(hub.handle(HubInput::Resume, 70_000), Some((ReportKind::GetFeature, 71_000)));
+}
+
+#[test]
+fn sonix_slow_or_missing_set_completion_does_not_start_a_get() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    let out = sonix_mailbox(&mut hub, 0, &[]);
+    let id = sonix_send(out, Some((ReportKind::SetFeature, 1_000))).unwrap();
+    sonix_send(hub.handle(HubInput::Tick, 20), None);
+    sonix_send(hub.handle(HubInput::Tick, 450), None);
+    sonix_complete_set(&mut hub, 450, RX, id);
+    sonix_send(hub.handle(HubInput::Tick, 470), None);
+    sonix_complete_set(&mut hub, 500, OTHER, id);
+    sonix_send(hub.handle(HubInput::Tick, 519), None);
+    sonix_send(
+        hub.handle(HubInput::Tick, 520),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
+    sonix_send(sonix_mailbox(&mut hub, 520, SONIX_OK), None);
+    sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
+    sonix_send(hub.handle(HubInput::RefreshNow, 600), Some((ReportKind::GetFeature, 1_600)));
+    let out = sonix_mailbox(&mut hub, 600, &[]);
+    let new = sonix_send(out, Some((ReportKind::SetFeature, 1_600))).unwrap();
+    sonix_complete_set(&mut hub, 601, OTHER, id);
+    sonix_send(hub.handle(HubInput::Tick, 621), None);
+    sonix_send(sonix_input(&mut hub, 625, SONIX_DOWN), None);
+    sonix_complete_set(&mut hub, 626, OTHER, new);
+    sonix_send(hub.handle(HubInput::Tick, 1_600), None);
+    sonix_complete_set(&mut hub, 1_601, OTHER, new);
+    sonix_send(hub.handle(HubInput::Tick, 10_000), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_missing_successful_set_completion_times_out_without_a_get() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    let out = sonix_mailbox(&mut hub, 0, &[]);
+    let id = sonix_send(out, Some((ReportKind::SetFeature, 1_000))).unwrap();
+    sonix_send(hub.handle(HubInput::Tick, 999), None);
+    sonix_send(hub.handle(HubInput::Tick, 1_000), None);
+    sonix_complete_set(&mut hub, 1_000, OTHER, id);
+    sonix_send(hub.handle(HubInput::Tick, 1_020), None);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_ignores_a_retained_05_but_ends_on_a_new_05() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(sonix_input(&mut hub, 0, SONIX_PUSH), None);
+    sonix_ready_mailbox(&mut hub, 0, SONIX_ASLEEP, 1_000);
+    for (at, reply, want) in [
+        (20, SONIX_ASLEEP, Presence::Online),
+        (40, SONIX_PENDING, Presence::Online),
+        (60, SONIX_ASLEEP, Presence::Asleep),
+    ] {
+        sonix_send(hub.handle(HubInput::Tick, at), Some((ReportKind::GetFeature, 1_000)));
+        sonix_send(sonix_mailbox(&mut hub, at, reply), None);
+        assert_eq!(hub.snapshot()[0].presence, want);
+    }
+    sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
+    assert_eq!(hub.next_deadline(), None);
+}
+
+#[test]
+fn sonix_successful_arrival_reply_validates_link_without_an_edge() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_ready_mailbox(&mut hub, 0, &[], 1_000);
+    sonix_send(hub.handle(HubInput::Tick, 20), Some((ReportKind::GetFeature, 1_000)));
+    sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
+    sonix_send(hub.handle(HubInput::Tick, 2_020), None);
+    sonix_send(sonix_input(&mut hub, 60_019, SONIX_PULSE), None);
+    sonix_send(hub.handle(HubInput::Tick, 60_020), None);
+    sonix_send(
+        sonix_input(&mut hub, 60_020, SONIX_PULSE),
+        Some((ReportKind::GetFeature, 61_020)),
+    );
+}
+
+#[test]
+fn sonix_resend_requires_the_same_preflight_answer_not_just_a_foreign_echo() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_ready_mailbox(&mut hub, 0, SONIX_FOREIGN, 1_000);
+    const OTHER_ANSWER: &[u8] = &[0, 1, 0x08, 0x81, 2, 0, 0, 42];
+    for (at, reply) in [
+        (20, SONIX_PENDING),
+        (40, OTHER_ANSWER),
+        (60, OTHER_ANSWER),
+        (80, OTHER_ANSWER),
+        (100, SONIX_FOREIGN),
+        (120, SONIX_FOREIGN),
+    ] {
+        sonix_send(hub.handle(HubInput::Tick, at), Some((ReportKind::GetFeature, 1_000)));
+        sonix_send(sonix_mailbox(&mut hub, at, reply), None);
+    }
+    sonix_send(hub.handle(HubInput::Tick, 140), Some((ReportKind::GetFeature, 1_000)));
+    sonix_ready_mailbox(&mut hub, 140, SONIX_FOREIGN, 1_000);
+}
+
+#[test]
+fn sonix_link_only_rearrival_does_not_replace_the_cached_battery_sample() {
+    let mut hub = hub();
+    sonix_arrival(&mut hub, 0x5402, 1_000);
+    sonix_send(sonix_input(&mut hub, 10, SONIX_PUSH), None);
+    sonix_send(hub.handle(HubInput::GroupRemoved(GroupId(1)), 50), None);
+    let mut returned = sonix_group(0x5402);
+    returned.id = GroupId(2);
+    sonix_send(
+        hub.handle(HubInput::GroupArrived(returned), 60),
+        Some((ReportKind::GetFeature, 1_060)),
+    );
+    sonix_send(sonix_input(&mut hub, 70, SONIX_UP), None);
+    let state = hub.snapshot().remove(0);
+    assert_eq!(state.level, Some(Level::Percent(81)));
+    assert_eq!(state.updated_ms, 10);
+    assert_eq!(state.source, Source::Push);
+    assert_eq!(state.presence, Presence::Online);
+    assert_eq!(state.charge, Charge::Unknown);
 }
