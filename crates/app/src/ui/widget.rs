@@ -1,19 +1,35 @@
 //! The in-taskbar widget: a layered child window of `Shell_TrayWnd` and of every
 //! `Shell_SecondaryTrayWnd` that "Show on" chooses, drawn with `UpdateLayeredWindow`.
 //!
+//! A widget sits left of its taskbar's notification area (`TrayNotifyWnd`), or of the clock
+//! on a secondary taskbar without one, and steps past what Windows puts there
+//! ([`step_past`]): Windows 10's weather button (News and interests) and Windows 11's
+//! Widgets button, which sits next to the notification area on a left-aligned taskbar. On
+//! Windows 10 the primary taskbar's task buttons (`ReBarWindow32`) reach behind the widget
+//! after every layout pass of Explorer's, so they are narrowed to end where it starts, and
+//! Explorer lays them out over the full width again when the widget hides or goes.
+//!
 //! Positioning is event-driven. WinEvent hooks on the taskbars' threads only (not the rest of
-//! Explorer) report when a taskbar or its notification area (`TrayNotifyWnd`) moves or
-//! resizes, when a taskbar's direct child appears, and when a taskbar's children change
-//! z-order (which can cover the widget); the UI thread then lays the widgets out again, which
-//! also raises a covered widget. Auto-hide needs nothing: a child moves with its parent. A
-//! secondary taskbar has no window for its clock, so its position comes from UI Automation
-//! on a windowless MTA thread ([`uia_thread`]), queried again only on `TaskbarCreated`,
-//! `WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`, a new secondary taskbar or one that changed width.
+//! Explorer) report when a taskbar, its notification area, its clock window, its weather
+//! button or its task buttons move or resize, when a taskbar's direct child appears or hides, and when a
+//! taskbar's children change z-order (which can cover the widget); the UI thread then lays
+//! the widgets out again, which also raises a covered widget. Auto-hide needs nothing: a
+//! child moves with its parent. Windows 11's taskbars are XAML: a secondary one has no
+//! window for its clock, and none has one for its Widgets button, so their positions come
+//! from UI Automation on a windowless MTA thread ([`uia_thread`]), queried again only on
+//! `TaskbarCreated`, `WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`, a new widget on such a taskbar
+//! or one that changed width, and every 5 s while a Widgets button sits beside a notification
+//! area (its weather text changes its width).
 //!
 //! The only Explorer-directed calls this module makes on the UI thread are `CreateWindowExW` /
-//! `DestroyWindow` of the child, `SetWindowPos` on it and `UpdateLayeredWindow`, each
-//! measured to stay bounded. Everything else here reads window-manager state locally.
+//! `DestroyWindow` of the child, `SetWindowPos` on it, `UpdateLayeredWindow` and a posted
+//! `WM_SIZE` that has a taskbar lay its task buttons out again, each measured to stay
+//! bounded. The task buttons are resized on another windowless thread ([`narrower_thread`]):
+//! on the UI thread, whose input queue Explorer's taskbar thread shares, even an
+//! asynchronous `SetWindowPos` would wait for Explorer. Everything else here reads
+//! window-manager state locally.
 
+use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -29,33 +45,37 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationCondition, SetWinEventHook,
-    TreeScope_Descendants, UnhookWinEvent,
+    CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
+    SetWinEventHook, TreeScope_Descendants, UnhookWinEvent,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, FindWindowExW, FindWindowW, GA_PARENT, GW_HWNDPREV,
-    GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_TOP, IsWindow, IsWindowVisible, MA_NOACTIVATE,
-    MONITORINFOF_PRIMARY, OBJID_WINDOW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, FindWindowExW,
+    FindWindowW, GA_PARENT, GW_HWNDPREV, GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP, IsWindow,
+    IsWindowVisible, MA_NOACTIVATE, MONITORINFOF_PRIMARY, OBJID_WINDOW, PostMessageW,
+    SIZE_RESTORED, SWP_ASYNCWINDOWPOS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU, WM_DPICHANGED_AFTERPARENT,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
+    WM_SIZE, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
 use super::menu::{MonitorInfo, display_number};
 use super::{
-    DeviceView, WIDGET_CLASS, WM_APP_CLOCKS, WM_APP_HOVER_END, WM_APP_MENU, hinstance, post, render,
+    DeviceView, WIDGET_CLASS, WM_APP_HOVER_END, WM_APP_MENU, WM_APP_PARTS, hinstance, post, render,
 };
 
 /// How often UI Automation looks again for a secondary taskbar's clock that is missing
 /// (Explorer starting), and for how many rounds.
 const CLOCK_RETRY: Duration = Duration::from_millis(500);
 const CLOCK_RETRIES: u32 = 20;
+
+/// How often UI Automation reads again where a Widgets button beside a notification area is.
+const WIDGETS_POLL: Duration = Duration::from_secs(5);
 
 /// The cursor left the window (asked for with `TrackMouseEvent`); the `windows` crate
 /// defines it only with its `Win32_UI_Controls` feature.
@@ -65,15 +85,18 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 #[derive(Debug)]
 pub struct CreateFailed;
 
-/// The widgets on every taskbar, the WinEvent hooks and the UI Automation thread.
+/// The widgets on every taskbar, the WinEvent hooks, the UI Automation thread and the thread
+/// that narrows Windows 10's task buttons.
 pub struct Widgets {
     widgets: Vec<Widget>,
-    /// (secondary taskbar, its clock's left edge minus the taskbar's left edge), from UIA.
-    clocks: Vec<(isize, i32)>,
+    /// What UI Automation found on Windows 11 taskbars.
+    parts: Vec<Parts>,
     hooks: Vec<HWINEVENTHOOK>,
     /// (process, thread) of the taskbars the hooks watch.
     hooked: Vec<(u32, u32)>,
     uia: Option<Uia>,
+    /// Started the first time task buttons need narrowing.
+    narrower: Option<Narrower>,
     /// Which taskbars get a widget ("Show on").
     monitors: MonitorChoice,
 }
@@ -86,10 +109,23 @@ struct Widget {
     painted: Option<Painted>,
     /// (left in the taskbar's client area, width) as last set, while shown.
     pos: Option<(i32, i32)>,
-    /// Width of the taskbar when its clock was last asked for (secondary taskbars).
+    /// Width of the taskbar when UI Automation was last asked about it ([`uia_reads`]).
     bar_width: i32,
     /// Each shown device's columns of the painted strip: (key, x0, x1).
     devices: Vec<(DeviceKey, i32, i32)>,
+    /// The taskbar's task buttons were narrowed for this widget ([`narrow_task_buttons`]).
+    narrowed: bool,
+}
+
+/// What UI Automation found on a Windows 11 (XAML) taskbar, as x offsets from its left edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Parts {
+    bar: isize,
+    /// The clock's left edge; looked up on secondary taskbars only, which have no window for
+    /// it.
+    clock: Option<i32>,
+    /// The Widgets button's left and right edges.
+    widgets: Option<(i32, i32)>,
 }
 
 /// The device under the cursor on a widget ([`Widgets::hit`]), in screen coordinates.
@@ -113,8 +149,14 @@ struct Painted {
 }
 
 struct Uia {
-    requests: Sender<()>,
-    results: Receiver<Vec<(isize, i32)>>,
+    /// The taskbars to look at: (taskbar, primary).
+    requests: Sender<Vec<(isize, bool)>>,
+    results: Receiver<Vec<Parts>>,
+}
+
+struct Narrower {
+    /// (task buttons, width, height).
+    requests: Sender<(isize, i32, i32)>,
 }
 
 impl Widgets {
@@ -127,10 +169,11 @@ impl Widgets {
     ) -> Result<Widgets, CreateFailed> {
         let mut widgets = Widgets {
             widgets: Vec::new(),
-            clocks: Vec::new(),
+            parts: Vec::new(),
             hooks: Vec::new(),
             hooked: Vec::new(),
             uia: None,
+            narrower: None,
             monitors: monitors.clone(),
         };
         widgets.arrange(views, light)?;
@@ -162,21 +205,21 @@ impl Widgets {
     /// them next to their anchor.
     fn arrange(&mut self, views: &[DeviceView], light: bool) -> Result<(), CreateFailed> {
         self.hook_taskbars();
-        let clocks = &self.clocks;
+        let parts = &self.parts;
         let bars = select(&taskbars(), &self.monitors, monitor_device, |bar| {
-            anchor_x(bar, clocks, window_rect(bar)).is_some()
+            anchor_x(bar, parts, window_rect(bar)).is_some()
         });
-        self.widgets.retain(|w| {
+        self.widgets.retain_mut(|w| {
             // SAFETY: plain handle checks.
             let alive =
                 unsafe { IsWindow(Some(w.hwnd)).as_bool() && IsWindow(Some(w.bar)).as_bool() };
             let keep = alive && bars.iter().any(|&(bar, _)| bar == w.bar);
             if !keep {
-                destroy(w.hwnd);
+                remove(w);
             }
             keep
         });
-        let mut ask_clocks = false;
+        let mut ask_uia = false;
         for (bar, primary) in bars {
             if self.widgets.iter().any(|w| w.bar == bar) {
                 continue;
@@ -185,13 +228,13 @@ impl Widgets {
                 continue; // taskbar not laid out yet
             }
             self.widgets.push(create(bar, primary)?);
-            ask_clocks |= !primary;
+            ask_uia |= uia_reads(bar, primary);
         }
         for w in &mut self.widgets {
             let bar_rect = window_rect(w.bar);
-            if !w.primary && bar_rect.right - bar_rect.left != w.bar_width {
+            if bar_rect.right - bar_rect.left != w.bar_width && uia_reads(w.bar, w.primary) {
                 w.bar_width = bar_rect.right - bar_rect.left;
-                ask_clocks = true;
+                ask_uia = true;
             }
             // SAFETY: plain handle query.
             let dpi = unsafe { GetDpiForWindow(w.bar) }.max(96);
@@ -203,12 +246,13 @@ impl Widgets {
                 paint(w, views, dpi, height, light);
             }
             if let Some(p) = w.painted {
-                let anchor = anchor_x(w.bar, &self.clocks, bar_rect);
-                position(w, anchor, p);
+                let anchor = anchor_x(w.bar, &self.parts, bar_rect);
+                let obstacles = obstacles(w.bar, &self.parts, bar_rect);
+                position(w, anchor, &obstacles, p, &mut self.narrower);
             }
         }
-        if ask_clocks {
-            self.ask_clocks();
+        if ask_uia {
+            self.ask_uia();
         }
         Ok(())
     }
@@ -220,10 +264,10 @@ impl Widgets {
         light: bool,
     ) -> Result<(), CreateFailed> {
         self.destroy_windows();
-        self.clocks.clear();
+        self.parts.clear();
         self.unhook(); // the taskbars run on new threads; `arrange` hooks them
         self.arrange(views, light)?;
-        self.ask_clocks();
+        self.ask_uia();
         Ok(())
     }
 
@@ -235,16 +279,16 @@ impl Widgets {
         light: bool,
     ) -> Result<(), CreateFailed> {
         self.arrange(views, light)?;
-        self.ask_clocks();
+        self.ask_uia();
         Ok(())
     }
 
-    /// Takes the latest clock positions from the UI Automation thread.
-    pub fn take_clocks(&mut self) {
+    /// Takes what the UI Automation thread last found on Windows 11 taskbars.
+    pub fn take_parts(&mut self) {
         let Some(uia) = &self.uia else { return };
         loop {
             match uia.results.try_recv() {
-                Ok(clocks) => self.clocks = clocks,
+                Ok(parts) => self.parts = parts,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.uia = None;
@@ -294,28 +338,36 @@ impl Widgets {
     }
 
     fn destroy_windows(&mut self) {
-        for w in self.widgets.drain(..) {
-            destroy(w.hwnd);
+        for mut w in self.widgets.drain(..) {
+            remove(&mut w);
         }
     }
 
-    fn ask_clocks(&mut self) {
-        if self.widgets.iter().all(|w| w.primary) {
+    /// Has the UI Automation thread look at the taskbars with a widget that need it
+    /// ([`uia_reads`]); with none, a running thread stops reading Widgets buttons again.
+    fn ask_uia(&mut self) {
+        let bars: Vec<(isize, bool)> = self
+            .widgets
+            .iter()
+            .filter(|w| uia_reads(w.bar, w.primary))
+            .map(|w| (w.bar.0 as isize, w.primary))
+            .collect();
+        if bars.is_empty() && self.uia.is_none() {
             return;
         }
         if self.uia.is_none() {
             self.uia = spawn_uia();
         }
         if let Some(uia) = &self.uia
-            && uia.requests.send(()).is_err()
+            && uia.requests.send(bars).is_err()
         {
             self.uia = None;
         }
     }
 
-    /// Watches the taskbars' threads (only those) for windows that move, resize, appear or
-    /// change z-order (see [`on_win_event`]). Re-hooks only when those threads changed, as
-    /// after an Explorer restart.
+    /// Watches the taskbars' threads (only those) for windows that move, resize, appear,
+    /// hide or change z-order (see [`on_win_event`]). Re-hooks only when those threads
+    /// changed, as after an Explorer restart.
     fn hook_taskbars(&mut self) {
         let mut threads: Vec<(u32, u32)> = taskbars()
             .into_iter()
@@ -337,6 +389,7 @@ impl Widgets {
             for event in [
                 EVENT_OBJECT_LOCATIONCHANGE,
                 EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_HIDE,
                 EVENT_OBJECT_REORDER,
             ] {
                 // SAFETY: `on_win_event` matches WINEVENTPROC; out-of-context, so it runs on
@@ -376,9 +429,10 @@ impl Drop for Widgets {
 }
 
 /// Lays out again (posted, so it never runs inside whatever call this event interrupted)
-/// for the events [`is_layout_trigger`] accepts: on a taskbar's thread, a taskbar or its
-/// notification area moves, resizes or appears, a taskbar's direct child appears (it can
-/// cover the widget), or a taskbar's children change z-order.
+/// for the events [`is_layout_trigger`] accepts: on a taskbar's thread, a taskbar, its
+/// notification area, its weather button or its task buttons move or resize, a taskbar or
+/// its notification area appears, a taskbar's direct child appears (it can cover the
+/// widget) or hides (the widget may move back), or a taskbar's children change z-order.
 unsafe extern "system" fn on_win_event(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -401,19 +455,40 @@ unsafe extern "system" fn on_win_event(
 
 const TASKBAR_CLASSES: [&str; 2] = ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
 const TRAY_NOTIFY_CLASS: &str = "TrayNotifyWnd";
+/// Windows 10's weather button (News and interests), a direct child of the taskbar left of
+/// the notification area: `ShellFeedsTaskbarViewWindow` on some builds, `DynamicContent2` on
+/// others (19045, where `DynamicContent1` is the search highlights icon in the search box).
+const FEEDS_CLASSES: [&str; 2] = ["ShellFeedsTaskbarViewWindow", "DynamicContent2"];
+/// Windows 10's task buttons, a direct child of the primary taskbar.
+const TASK_BUTTONS_CLASS: &str = "ReBarWindow32";
+/// A Windows 10 secondary taskbar's clock.
+const CLOCK_CLASS: &str = "ClockButton";
+/// The child window that hosts a Windows 11 taskbar's XAML content.
+const XAML_CLASS: &str = "Windows.UI.Composition.DesktopWindowContentBridge";
 
 /// Whether a WinEvent asks for a layout. `window`: the event is about a whole window
 /// (`OBJID_WINDOW`, `CHILDID_SELF`); `class` and `parent_class`: of the event's window and
 /// of its parent.
 fn is_layout_trigger(event: u32, window: bool, class: &str, parent_class: &str) -> bool {
     let taskbar = |c: &str| TASKBAR_CLASSES.contains(&c);
+    // What the widget sits next to, steps past or narrows: their moves and resizes move it.
+    let beside = || {
+        taskbar(parent_class)
+            && (FEEDS_CLASSES.contains(&class)
+                || class == TASK_BUTTONS_CLASS
+                || class == CLOCK_CLASS)
+    };
     match event {
-        EVENT_OBJECT_LOCATIONCHANGE => window && (taskbar(class) || class == TRAY_NOTIFY_CLASS),
+        EVENT_OBJECT_LOCATIONCHANGE => {
+            window && (taskbar(class) || class == TRAY_NOTIFY_CLASS || beside())
+        }
         // A taskbar shown again (its tray's visibility follows it without an event of its
         // own), its notification area, or any direct child of a taskbar (it may cover us).
         EVENT_OBJECT_SHOW => {
             window && (taskbar(class) || class == TRAY_NOTIFY_CLASS || taskbar(parent_class))
         }
+        // A direct child of a taskbar went, such as the weather button turned off.
+        EVENT_OBJECT_HIDE => window && taskbar(parent_class),
         EVENT_OBJECT_REORDER => taskbar(class),
         _ => false,
     }
@@ -514,7 +589,14 @@ fn create(bar: HWND, primary: bool) -> Result<Widget, CreateFailed> {
         pos: None,
         bar_width: 0,
         devices: Vec::new(),
+        narrowed: false,
     })
+}
+
+/// Gives the taskbar its task buttons' full width back and destroys the widget's window.
+fn remove(w: &mut Widget) {
+    restore_task_buttons(w);
+    destroy(w.hwnd);
 }
 
 fn destroy(hwnd: HWND) {
@@ -569,8 +651,17 @@ fn paint(w: &mut Widget, views: &[DeviceView], dpi: u32, height: i32, light: boo
     }
 }
 
-/// Puts the widget left of `anchor` (screen x), or hides it when there is no anchor.
-fn position(w: &mut Widget, anchor: Option<i32>, p: Painted) {
+/// Puts the widget left of `anchor` (screen x) and of the `obstacles` in the way
+/// ([`step_past`]), or hides it when there is no anchor. On Windows 10's primary taskbar it
+/// narrows the task buttons to end where the widget starts, even when the widget stays put:
+/// Explorer widens them again on its own layout passes.
+fn position(
+    w: &mut Widget,
+    anchor: Option<i32>,
+    obstacles: &[(i32, i32)],
+    p: Painted,
+    narrower: &mut Option<Narrower>,
+) {
     let shown = style_visible(w.hwnd);
     let Some(anchor) = anchor else {
         if shown {
@@ -588,16 +679,20 @@ fn position(w: &mut Widget, anchor: Option<i32>, p: Painted) {
             };
         }
         w.pos = None;
+        restore_task_buttons(w);
         return;
     };
     let gap = 4 * p.dpi as i32 / 96;
     let mut point = POINT {
-        x: anchor,
+        x: step_past(anchor, p.size.cx + gap, obstacles),
         y: window_rect(w.bar).top,
     };
     // SAFETY: `point` outlives the call.
     let _ = unsafe { ScreenToClient(w.bar, &mut point) };
     let left = point.x - p.size.cx - gap;
+    if w.primary {
+        narrow_task_buttons(w, left, narrower);
+    }
     // Something above us, such as a new child starting below Explorer's
     // DesktopWindowContentBridge, would cover the widget.
     // SAFETY: plain handle query.
@@ -623,6 +718,115 @@ fn position(w: &mut Widget, anchor: Option<i32>, p: Painted) {
 fn style_visible(hwnd: HWND) -> bool {
     // SAFETY: plain handle query.
     (unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_VISIBLE.0) != 0
+}
+
+/// The right edge (screen x) for a strip `width` wide that ends at `anchor` at the latest:
+/// moved left past every obstacle, a screen x span (left, right), it would overlap, until
+/// none does. Each step lands on an obstacle's left edge, so it ends.
+fn step_past(anchor: i32, width: i32, obstacles: &[(i32, i32)]) -> i32 {
+    let mut edge = anchor;
+    while let Some(left) = obstacles
+        .iter()
+        .filter(|&&(l, r)| l < r && l < edge && r > edge - width)
+        .map(|&(l, _)| l)
+        .min()
+    {
+        edge = left;
+    }
+    edge
+}
+
+/// Windows 10: narrows `w`'s taskbar's task buttons so they end at `left`, the widget's left
+/// edge in the taskbar's client area; on the narrower thread, started here when first needed.
+fn narrow_task_buttons(w: &mut Widget, left: i32, narrower: &mut Option<Narrower>) {
+    if is_xaml(w.bar) {
+        return; // Windows 11: the task buttons are XAML and do not reach the notification area
+    }
+    let Some(buttons) = child(w.bar, TASK_BUTTONS_CLASS) else {
+        return;
+    };
+    let r = window_rect(buttons);
+    let mut start = POINT {
+        x: r.left,
+        y: r.top,
+    };
+    // SAFETY: `start` outlives the call.
+    let _ = unsafe { ScreenToClient(w.bar, &mut start) };
+    let Some(width) = narrowed_width(start.x, r.right - r.left, left) else {
+        return;
+    };
+    if narrower.is_none() {
+        *narrower = spawn_narrower();
+    }
+    match narrower {
+        Some(n)
+            if n.requests
+                .send((buttons.0 as isize, width, r.bottom - r.top))
+                .is_ok() =>
+        {
+            w.narrowed = true;
+        }
+        _ => *narrower = None,
+    }
+}
+
+/// The width that task buttons starting at client x `start`, `width` wide, get so they end
+/// at `widget_left`; `None` when they end there already or start right of it.
+fn narrowed_width(start: i32, width: i32, widget_left: i32) -> Option<i32> {
+    (start < widget_left && start + width > widget_left).then_some(widget_left - start)
+}
+
+/// Has Explorer lay `w`'s taskbar's task buttons out again over the full width, when they
+/// were narrowed for the widget that now hides or goes. A posted `WM_SIZE` with the
+/// taskbar's own size, as on any resize of the taskbar; it never waits for Explorer.
+fn restore_task_buttons(w: &mut Widget) {
+    if !std::mem::take(&mut w.narrowed) {
+        return;
+    }
+    let c = client_rect(w.bar);
+    let size = (c.right & 0xFFFF) | ((c.bottom & 0xFFFF) << 16);
+    // SAFETY: a posted message; a stale handle only makes the post fail.
+    let _ = unsafe {
+        PostMessageW(
+            Some(w.bar),
+            WM_SIZE,
+            WPARAM(SIZE_RESTORED as usize),
+            LPARAM(size as isize),
+        )
+    };
+}
+
+fn spawn_narrower() -> Option<Narrower> {
+    let (requests, requested) = mpsc::channel();
+    thread::Builder::new()
+        .name("batterysight-taskbuttons".into())
+        .spawn(move || narrower_thread(&requested))
+        .ok()?;
+    Some(Narrower { requests })
+}
+
+/// Resizes the task buttons as last asked. It owns no windows, so its input queue is not
+/// Explorer's and `SWP_ASYNCWINDOWPOS` only posts the request to Explorer's taskbar thread.
+fn narrower_thread(requests: &Receiver<(isize, i32, i32)>) {
+    while let Ok(first) = requests.recv() {
+        let (buttons, width, height) = requests.try_iter().last().unwrap_or(first);
+        let buttons = HWND(buttons as *mut c_void);
+        if class_name(buttons) != TASK_BUTTONS_CLASS {
+            continue; // gone with an Explorer restart
+        }
+        // SAFETY: plain call on a window handle; posted, see above.
+        let _ = unsafe {
+            SetWindowPos(
+                buttons,
+                None,
+                0,
+                0,
+                width,
+                height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            )
+        };
+    }
 }
 
 /// Primary taskbar first, then every secondary taskbar.
@@ -734,24 +938,71 @@ pub fn primary_anchor_ready() -> bool {
 
 /// The visible, non-empty notification area of `bar`.
 fn tray_notify(bar: HWND) -> Option<RECT> {
-    // SAFETY: literal class name; plain handle queries.
-    unsafe {
-        let tray = FindWindowExW(Some(bar), None, w!("TrayNotifyWnd"), PCWSTR::null()).ok()?;
-        let r = window_rect(tray);
-        (IsWindowVisible(tray).as_bool() && r.right > r.left).then_some(r)
-    }
+    visible_child(bar, TRAY_NOTIFY_CLASS)
+}
+
+/// The first direct child of `parent` of window class `class`.
+fn child(parent: HWND, class: &str) -> Option<HWND> {
+    let class: Vec<u16> = class.encode_utf16().chain([0]).collect();
+    // SAFETY: `class` is NUL-terminated and outlives the call.
+    unsafe { FindWindowExW(Some(parent), None, PCWSTR(class.as_ptr()), PCWSTR::null()) }.ok()
+}
+
+/// The screen rectangle of `parent`'s first direct child of class `class`, when it is
+/// visible and not empty.
+fn visible_child(parent: HWND, class: &str) -> Option<RECT> {
+    let hwnd = child(parent, class)?;
+    let r = window_rect(hwnd);
+    // SAFETY: plain handle query.
+    (unsafe { IsWindowVisible(hwnd) }.as_bool() && r.right > r.left).then_some(r)
+}
+
+/// Whether `bar` is a Windows 11 taskbar, whose content is XAML.
+fn is_xaml(bar: HWND) -> bool {
+    child(bar, XAML_CLASS).is_some()
+}
+
+/// Whether UI Automation has to look at `bar` ([`uia_thread`]): a Windows 11 taskbar for its
+/// Widgets button, and a secondary taskbar with neither a notification area nor a clock
+/// window (Windows 11, or Explorer still starting) for its clock.
+fn uia_reads(bar: HWND, primary: bool) -> bool {
+    is_xaml(bar)
+        || (!primary && tray_notify(bar).is_none() && visible_child(bar, CLOCK_CLASS).is_none())
 }
 
 /// Screen x of what the widget sits left of: the notification area, or on a secondary
-/// taskbar (no clock window) the clock UI Automation found.
-fn anchor_x(bar: HWND, clocks: &[(isize, i32)], bar_rect: RECT) -> Option<i32> {
+/// taskbar without one the clock: its window on Windows 10, else the one UI Automation
+/// found.
+fn anchor_x(bar: HWND, parts: &[Parts], bar_rect: RECT) -> Option<i32> {
     if let Some(r) = tray_notify(bar) {
         return Some(r.left);
     }
-    clocks
+    if !is_xaml(bar)
+        && let Some(r) = visible_child(bar, CLOCK_CLASS)
+    {
+        return Some(r.left);
+    }
+    parts
         .iter()
-        .find(|(b, _)| *b == bar.0 as isize)
-        .map(|&(_, offset)| bar_rect.left + offset)
+        .find(|p| p.bar == bar.0 as isize)
+        .and_then(|p| p.clock)
+        .map(|offset| bar_rect.left + offset)
+}
+
+/// What the widget must not cover on `bar`, as screen x spans (left, right): Windows 10's
+/// weather button, read on every layout because its text changes its width, and the
+/// Widgets button UI Automation found on a Windows 11 taskbar.
+fn obstacles(bar: HWND, parts: &[Parts], bar_rect: RECT) -> Vec<(i32, i32)> {
+    let feeds = FEEDS_CLASSES
+        .iter()
+        .filter_map(|class| visible_child(bar, class))
+        .map(|r| (r.left, r.right));
+    let widgets = parts
+        .iter()
+        .filter(|p| p.bar == bar.0 as isize)
+        .filter_map(|p| p.widgets)
+        .map(|(l, r)| (bar_rect.left + l, bar_rect.left + r));
+    feeds.chain(widgets).collect()
 }
 
 fn window_rect(hwnd: HWND) -> RECT {
@@ -779,20 +1030,22 @@ fn spawn_uia() -> Option<Uia> {
 }
 
 /// UI Automation goes to Explorer's UI thread, so it runs here, on a thread that owns no
-/// windows, never on the widget's thread. Each request is answered with the clocks of all
-/// secondary taskbars; while one is missing (Explorer starting), it looks again every 500 ms
-/// for up to 10 s.
-fn uia_thread(requests: &Receiver<()>, results: &Sender<Vec<(isize, i32)>>) {
+/// windows, never on the widget's thread. Each request names the taskbars to look at and is
+/// answered with what they show ([`look_up`]). While a secondary taskbar's clock is missing
+/// (Explorer starting), it looks again every 500 ms for up to 10 s; while a Widgets button
+/// sits beside a notification area, it reads where that button is again every 5 s (its
+/// weather text changes its width) and tells the UI thread when it moved.
+fn uia_thread(requests: &Receiver<Vec<(isize, bool)>>, results: &Sender<Vec<Parts>>) {
     // SAFETY: initialises COM for this thread only; balanced below.
     if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
         return;
     }
-    serve_clocks(requests, results);
-    // SAFETY: balances CoInitializeEx; every COM object was dropped in `serve_clocks`.
+    serve_parts(requests, results);
+    // SAFETY: balances CoInitializeEx; every COM object was dropped in `serve_parts`.
     unsafe { CoUninitialize() };
 }
 
-fn serve_clocks(requests: &Receiver<()>, results: &Sender<Vec<(isize, i32)>>) {
+fn serve_parts(requests: &Receiver<Vec<(isize, bool)>>, results: &Sender<Vec<Parts>>) {
     // SAFETY: COM is initialised on this thread.
     let Ok(uia) = (unsafe {
         CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
@@ -803,71 +1056,167 @@ fn serve_clocks(requests: &Receiver<()>, results: &Sender<Vec<(isize, i32)>>) {
     let Ok(all) = (unsafe { uia.CreateTrueCondition() }) else {
         return;
     };
-    while requests.recv().is_ok() {
-        let mut tries = 0;
-        loop {
-            while requests.try_recv().is_ok() {}
-            let (clocks, missing) = secondary_clocks(&uia, &all);
-            if results.send(clocks).is_err() {
+    let mut bars = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
+    let mut sent: Option<Vec<Parts>> = None;
+    let mut tries = 0;
+    loop {
+        let retry = found.iter().any(|f| f.clock_missing) && tries < CLOCK_RETRIES;
+        let wait = if retry {
+            Some(CLOCK_RETRY)
+        } else if found.iter().any(Found::beside_tray) {
+            Some(WIDGETS_POLL)
+        } else {
+            None
+        };
+        let asked = match wait {
+            None => match requests.recv() {
+                Ok(asked) => Some(asked),
+                Err(_) => return,
+            },
+            Some(wait) => match requests.recv_timeout(wait) {
+                Ok(asked) => Some(asked),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+        };
+        let answer = asked.is_some();
+        if let Some(asked) = asked {
+            bars = requests.try_iter().last().unwrap_or(asked);
+            tries = 0;
+            found = look_up(&uia, &all, &bars);
+        } else if retry {
+            tries += 1;
+            found = look_up(&uia, &all, &bars);
+        } else {
+            for f in &mut found {
+                f.read_widgets_again(&uia, &all);
+            }
+        }
+        let parts: Vec<Parts> = found.iter().map(|f| f.parts).collect();
+        if answer || sent.as_ref() != Some(&parts) {
+            if results.send(parts.clone()).is_err() {
                 return;
             }
-            post(WM_APP_CLOCKS);
-            if !missing || tries == CLOCK_RETRIES {
-                break;
+            sent = Some(parts);
+            post(WM_APP_PARTS);
+        }
+    }
+}
+
+/// What UI Automation found on one taskbar, with the Widgets button to read again.
+struct Found {
+    parts: Parts,
+    primary: bool,
+    /// A secondary taskbar showed no clock (Explorer starting).
+    clock_missing: bool,
+    button: Option<IUIAutomationElement>,
+}
+
+impl Found {
+    /// Whether the Widgets button sits beside the notification area (a left-aligned
+    /// taskbar), where the widget may have to step past it.
+    fn beside_tray(&self) -> bool {
+        let bar = window_rect(HWND(self.parts.bar as *mut c_void));
+        self.parts
+            .widgets
+            .is_some_and(|(left, _)| beside_tray(left, bar.right - bar.left))
+    }
+
+    /// Reads the Widgets button's place again; looks the taskbar over again when the button
+    /// went (Widgets turned off, the button made anew).
+    fn read_widgets_again(&mut self, uia: &IUIAutomation, all: &IUIAutomationCondition) {
+        let Some(button) = &self.button else { return };
+        let bar = HWND(self.parts.bar as *mut c_void);
+        let bar_rect = window_rect(bar);
+        // SAFETY: a COM call on this thread's MTA object.
+        match unsafe { button.CurrentBoundingRectangle() } {
+            Ok(r) if within(&r, &bar_rect) => {
+                self.parts.widgets = Some((r.left - bar_rect.left, r.right - bar_rect.left));
             }
-            tries += 1;
-            match requests.recv_timeout(CLOCK_RETRY) {
-                Ok(()) => tries = 0,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+            _ => {
+                if let Some(again) = look_up(uia, all, &[(self.parts.bar, self.primary)]).pop() {
+                    *self = again;
+                }
             }
         }
     }
 }
 
-/// (secondary taskbar, its clock's left edge minus the taskbar's), and whether some
-/// secondary taskbar had no clock. The clock is the leftmost `SystemTrayIcon` element
-/// inside the taskbar.
-fn secondary_clocks(
+/// Whether a Widgets button whose left edge is `left` (from the taskbar's left edge) sits in
+/// the right half of a taskbar `bar_width` wide: beside the notification area, not at the far
+/// left as on a centred taskbar.
+fn beside_tray(left: i32, bar_width: i32) -> bool {
+    left > bar_width / 2
+}
+
+/// Whether `r` is a non-empty rectangle within the x span of `bar`.
+fn within(r: &RECT, bar: &RECT) -> bool {
+    r.right > r.left && r.left >= bar.left && r.right <= bar.right
+}
+
+/// Looks each of `bars` (taskbar, primary) over: a secondary taskbar's clock, the leftmost
+/// `SystemTrayIcon` element, and the `WidgetsButton` element.
+fn look_up(
     uia: &IUIAutomation,
     all: &IUIAutomationCondition,
-) -> (Vec<(isize, i32)>, bool) {
-    let mut clocks = Vec::new();
-    let mut missing = false;
-    for (bar, _) in taskbars().into_iter().filter(|&(_, primary)| !primary) {
-        let bar_rect = window_rect(bar);
-        // SAFETY: COM calls on this thread's MTA objects.
-        let left = unsafe {
-            uia.ElementFromHandle(bar)
-                .and_then(|root| root.FindAll(TreeScope_Descendants, all))
-                .ok()
-                .and_then(|found| {
-                    (0..found.Length().unwrap_or(0))
-                        .filter_map(|i| found.GetElement(i).ok())
-                        .filter(|el| {
-                            el.CurrentAutomationId()
-                                .is_ok_and(|id| id == "SystemTrayIcon")
-                        })
-                        .filter_map(|el| el.CurrentBoundingRectangle().ok())
-                        .filter(|r| {
-                            r.right > r.left && r.left >= bar_rect.left && r.right <= bar_rect.right
-                        })
-                        .map(|r| r.left)
-                        .min()
-                })
-        };
-        match left {
-            Some(x) => clocks.push((bar.0 as isize, x - bar_rect.left)),
-            None => missing = true,
-        }
-    }
-    (clocks, missing)
+    bars: &[(isize, bool)],
+) -> Vec<Found> {
+    bars.iter()
+        .map(|&(bar, primary)| {
+            let hwnd = HWND(bar as *mut c_void);
+            let bar_rect = window_rect(hwnd);
+            let mut clock: Option<i32> = None;
+            let mut button = None;
+            // SAFETY: COM calls on this thread's MTA objects.
+            unsafe {
+                if let Ok(found) = uia
+                    .ElementFromHandle(hwnd)
+                    .and_then(|root| root.FindAll(TreeScope_Descendants, all))
+                {
+                    for el in
+                        (0..found.Length().unwrap_or(0)).filter_map(|i| found.GetElement(i).ok())
+                    {
+                        let Ok(id) = el.CurrentAutomationId() else {
+                            continue;
+                        };
+                        let wanted = (id == "SystemTrayIcon" && !primary)
+                            || (id == "WidgetsButton" && button.is_none());
+                        let Some(r) = wanted
+                            .then(|| el.CurrentBoundingRectangle().ok())
+                            .flatten()
+                            .filter(|r| within(r, &bar_rect))
+                        else {
+                            continue;
+                        };
+                        if id == "WidgetsButton" {
+                            button = Some((el, r));
+                        } else {
+                            clock = Some(clock.map_or(r.left, |c| c.min(r.left)));
+                        }
+                    }
+                }
+            }
+            Found {
+                parts: Parts {
+                    bar,
+                    clock: clock.map(|x| x - bar_rect.left),
+                    widgets: button
+                        .as_ref()
+                        .map(|(_, r)| (r.left - bar_rect.left, r.right - bar_rect.left)),
+                },
+                primary,
+                clock_missing: !primary && clock.is_none(),
+                button: button.map(|(el, _)| el),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_HIDE;
+    use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_DESTROY;
 
     const NOT_TASKBAR: &str = "#32769";
 
@@ -947,6 +1296,70 @@ mod tests {
     }
 
     #[test]
+    fn location_change_of_the_weather_or_task_buttons_triggers() {
+        for class in [
+            "DynamicContent2",
+            "ShellFeedsTaskbarViewWindow",
+            "ReBarWindow32",
+        ] {
+            assert!(
+                is_layout_trigger(EVENT_OBJECT_LOCATIONCHANGE, true, class, "Shell_TrayWnd"),
+                "{class}"
+            );
+            assert!(is_layout_trigger(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                true,
+                class,
+                "Shell_SecondaryTrayWnd"
+            ));
+            // Only as a taskbar's direct child, and only for the whole window.
+            assert!(!is_layout_trigger(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                true,
+                class,
+                NOT_TASKBAR
+            ));
+            assert!(!is_layout_trigger(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                false,
+                class,
+                "Shell_TrayWnd"
+            ));
+        }
+        // A Windows 10 secondary taskbar's clock widens with its text (9:59 to 10:00).
+        assert!(is_layout_trigger(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            true,
+            "ClockButton",
+            "Shell_SecondaryTrayWnd"
+        ));
+        // Windows 10 19045's search highlights icon sits inside the search box.
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            true,
+            "DynamicContent1",
+            "TrayDummySearchControl"
+        ));
+    }
+
+    #[test]
+    fn hide_of_a_taskbar_child_triggers() {
+        // The weather turned off, say: the widget moves back next to the notification area.
+        assert!(is_layout_trigger(
+            EVENT_OBJECT_HIDE,
+            true,
+            "DynamicContent2",
+            "Shell_TrayWnd"
+        ));
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_HIDE,
+            false,
+            "DynamicContent2",
+            "Shell_TrayWnd"
+        ));
+    }
+
+    #[test]
     fn other_events_do_not_trigger() {
         assert!(!is_layout_trigger(
             EVENT_OBJECT_HIDE,
@@ -954,6 +1367,74 @@ mod tests {
             "Shell_TrayWnd",
             NOT_TASKBAR
         ));
+        assert!(!is_layout_trigger(
+            EVENT_OBJECT_DESTROY,
+            true,
+            "DynamicContent2",
+            "Shell_TrayWnd"
+        ));
+    }
+
+    // Windows 10 19045 at 96 DPI: the notification area starts at x 2287, the weather button
+    // spans 2101..2279, and the widget is 102 px wide plus its 4 px gap.
+    const TRAY: i32 = 2287;
+    const STRIP: i32 = 102 + 4;
+    const WEATHER: (i32, i32) = (2101, 2279);
+
+    #[test]
+    fn widget_steps_past_the_weather_button() {
+        assert_eq!(step_past(TRAY, STRIP, &[WEATHER]), 2101);
+    }
+
+    #[test]
+    fn widget_stays_next_to_the_tray_without_obstacles() {
+        assert_eq!(step_past(TRAY, STRIP, &[]), TRAY);
+        // Far left of where the widget goes (a centred Windows 11 Widgets button), or right
+        // of the anchor.
+        assert_eq!(step_past(TRAY, STRIP, &[(0, 180)]), TRAY);
+        assert_eq!(step_past(TRAY, STRIP, &[(TRAY, 2560)]), TRAY);
+        // An empty rectangle is no obstacle.
+        assert_eq!(step_past(TRAY, STRIP, &[(2200, 2200)]), TRAY);
+    }
+
+    #[test]
+    fn widget_steps_past_an_obstacle_reaching_into_its_strip() {
+        // Ends 1 px into the strip (which starts at 2287 - 106 = 2181).
+        assert_eq!(step_past(TRAY, STRIP, &[(2000, 2182)]), 2000);
+        // Ends right where the strip starts: nothing to step past.
+        assert_eq!(step_past(TRAY, STRIP, &[(2000, 2181)]), TRAY);
+    }
+
+    #[test]
+    fn widget_steps_past_obstacles_side_by_side() {
+        // A second obstacle that only gets in the way once the widget stepped past the first.
+        let near = (2120, 2279);
+        let next = (1990, 2060);
+        assert_eq!(step_past(TRAY, STRIP, &[next, near]), 1990);
+        // One the widget fits beside after the first step stays where it is.
+        let clear = (1900, 2014);
+        assert_eq!(step_past(TRAY, STRIP, &[clear, near]), 2120);
+    }
+
+    #[test]
+    fn task_buttons_end_where_the_widget_starts() {
+        // Client x: the task buttons start at 382 and end at 2079; the widget starts at 1995.
+        assert_eq!(narrowed_width(382, 2079 - 382, 1995), Some(1995 - 382));
+        // Ending before the widget, or right at it: left alone.
+        assert_eq!(narrowed_width(382, 1500, 1995), None);
+        assert_eq!(narrowed_width(382, 1995 - 382, 1995), None);
+        // Starting at or right of the widget (a taskbar too narrow for both): left alone.
+        assert_eq!(narrowed_width(1995, 300, 1995), None);
+        assert_eq!(narrowed_width(2000, 300, 1995), None);
+    }
+
+    #[test]
+    fn widgets_button_beside_the_tray_is_read_again() {
+        // Left-aligned taskbar 2560 px wide: the button sits next to the notification area.
+        assert!(beside_tray(2101, 2560));
+        // Centred: it sits at the far left.
+        assert!(!beside_tray(12, 2560));
+        assert!(!beside_tray(1280, 2560));
     }
 
     #[test]

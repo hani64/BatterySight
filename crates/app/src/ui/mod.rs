@@ -16,8 +16,9 @@
 //! own, and a session break at start and as the PC sleeps) appended, and the Run value
 //! written, by the store's writer thread ([`Store`]). The history window (a normal
 //! top-level window) runs on its own thread, which this thread only sends data to
-//! (`history_window`). UI Automation runs on its own windowless thread (`widget`), and the
-//! [`watchdog`] on another.
+//! (`history_window`). UI Automation runs on its own windowless thread (`widget`), so does
+//! the resizing of Windows 10's task buttons next to the widget, and the [`watchdog`] on
+//! another.
 //!
 //! # Re-entrancy
 //!
@@ -340,8 +341,8 @@ const CARD_CLASS: PCWSTR = w!("BatterySightCard");
 const WM_APP_CHANGED: u32 = WM_APP + 1;
 /// Lay the widgets out again (a taskbar moved or resized, or the DPI changed).
 const WM_APP_LAYOUT: u32 = WM_APP + 2;
-/// The UI Automation thread found the secondary taskbars' clocks.
-const WM_APP_CLOCKS: u32 = WM_APP + 3;
+/// The UI Automation thread found where Windows 11 taskbars' clocks and Widgets buttons are.
+const WM_APP_PARTS: u32 = WM_APP + 3;
 /// Explorer restarted (`TaskbarCreated`).
 const WM_APP_TASKBAR_CREATED: u32 = WM_APP + 4;
 /// Displays or settings changed (`WM_DISPLAYCHANGE`, `WM_SETTINGCHANGE`).
@@ -594,9 +595,9 @@ impl Ui {
                 self.show();
                 self.follow_hover(None);
             }
-            WM_APP_CLOCKS => {
+            WM_APP_PARTS => {
                 if let Surface::Widgets(w) = &mut self.surface {
-                    w.take_clocks();
+                    w.take_parts();
                 }
                 self.show();
                 self.follow_hover(None);
