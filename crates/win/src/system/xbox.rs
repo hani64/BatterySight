@@ -18,7 +18,7 @@ use windows::Foundation::{EventHandler, IReference};
 use windows::Gaming::Input::{Gamepad, IGameController, RawGameController};
 use windows::System::Power::BatteryStatus;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_PropertyW, CR_BUFFER_SMALL, CR_SUCCESS,
+    CM_Get_DevNode_PropertyW, CONFIGRET, CR_NO_SUCH_VALUE, CR_SUCCESS,
 };
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_CompatibleIds, DEVPROP_TYPE_STRING_LIST, DEVPROPTYPE,
@@ -206,7 +206,8 @@ fn path_vendor(hardware: &str) -> PathVendor {
 /// What the Configuration Manager list text says; nothing is opened. Instance segments
 /// are never inspected. No Microsoft pad is identified while a present path carries
 /// Microsoft's SIG company ID, or cannot be parsed and either mentions Microsoft's VID in
-/// its hardware segment or, per `game_class`, is a game controller by its cached IDs.
+/// its hardware segment or, per `game_class`, is a game controller by its cached IDs or
+/// cannot be checked.
 pub(crate) fn non_usb_products(list: &[u16], game_class: impl Fn(&[u16]) -> bool) -> HidProducts {
     let mut products = HidProducts::default();
     for path in list
@@ -235,33 +236,42 @@ pub(crate) fn non_usb_products(list: &[u16], game_class: impl Fn(&[u16]) -> bool
 /// read from Configuration Manager's cached properties without opening the device.
 fn game_class(path: &[u16]) -> bool {
     let path: Vec<u16> = path.iter().copied().chain([0]).collect();
-    let Some(node) = interface_node(&path) else {
-        return false;
+    game_class_from(interface_node(&path), |node, kind, ids, size| {
+        // SAFETY: `ids` is writable for its whole length, which `size` never exceeds.
+        unsafe {
+            CM_Get_DevNode_PropertyW(
+                node,
+                &DEVPKEY_Device_CompatibleIds,
+                kind,
+                Some(ids.as_mut_ptr().cast()),
+                size,
+                0,
+            )
+        }
+    })
+}
+
+/// Maps the devnode lookup and the compatible-ID read to the game-class answer. Only a
+/// clean read says "not a game controller": a string list without the ID, or no
+/// compatible IDs at all. Anything else cannot tell and fails closed.
+fn game_class_from(
+    node: Option<u32>,
+    read: impl FnOnce(u32, &mut DEVPROPTYPE, &mut [u16], &mut u32) -> CONFIGRET,
+) -> bool {
+    let Some(node) = node else {
+        return true;
     };
     let mut ids = [0u16; 2048];
     let mut kind = DEVPROPTYPE::default();
     // The last unit stays NUL whatever is written, so the list stays terminated.
     let mut size = (size_of_val(&ids) - size_of::<u16>()) as u32;
-    // SAFETY: `ids` is writable for the `size` bytes passed.
-    let status = unsafe {
-        CM_Get_DevNode_PropertyW(
-            node,
-            &DEVPKEY_Device_CompatibleIds,
-            &mut kind,
-            Some(ids.as_mut_ptr().cast()),
-            &mut size,
-            0,
-        )
-    };
-    if status == CR_BUFFER_SMALL {
-        // Cannot tell; fail closed.
-        return true;
-    }
-    status == CR_SUCCESS
-        && kind == DEVPROP_TYPE_STRING_LIST
-        && ids
+    match read(node, &mut kind, &mut ids, &mut size) {
+        CR_NO_SUCH_VALUE => false,
+        CR_SUCCESS if kind == DEVPROP_TYPE_STRING_LIST => ids
             .split(|&unit| unit == 0)
-            .any(|id| String::from_utf16_lossy(id).eq_ignore_ascii_case("HID_DEVICE_SYSTEM_GAME"))
+            .any(|id| String::from_utf16_lossy(id).eq_ignore_ascii_case("HID_DEVICE_SYSTEM_GAME")),
+        _ => true,
+    }
 }
 
 fn observation(
@@ -627,6 +637,10 @@ mod tests {
     use batterysight_core::model::{CoarseLevel, DeviceState, Level, Presence};
     use batterysight_core::scheduler::Policy;
     use windows::System::Power::BatteryStatus;
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CR_BUFFER_SMALL, CR_FAILURE, CR_INVALID_DEVNODE,
+    };
+    use windows::Win32::Devices::Properties::DEVPROP_TYPE_STRING;
     use windows::Win32::UI::Input::XboxController::{
         BATTERY_LEVEL, BATTERY_LEVEL_EMPTY, BATTERY_LEVEL_FULL, BATTERY_LEVEL_LOW,
         BATTERY_LEVEL_MEDIUM, BATTERY_TYPE, BATTERY_TYPE_ALKALINE, BATTERY_TYPE_DISCONNECTED,
@@ -1171,6 +1185,74 @@ mod tests {
 
     fn no_game_class(_: &[u16]) -> bool {
         false
+    }
+
+    /// A compatible-ID read that answers `status` with `kind` and the NUL-separated `ids`.
+    fn cached(
+        status: CONFIGRET,
+        kind: DEVPROPTYPE,
+        ids: &str,
+    ) -> impl FnOnce(u32, &mut DEVPROPTYPE, &mut [u16], &mut u32) -> CONFIGRET {
+        move |node, out_kind, out, size| {
+            assert_eq!(node, 7);
+            let units: Vec<u16> = ids
+                .encode_utf16()
+                .map(|unit| if unit == u16::from(b'|') { 0 } else { unit })
+                .collect();
+            assert!(units.len() * 2 <= *size as usize);
+            out[..units.len()].copy_from_slice(&units);
+            *out_kind = kind;
+            *size = (units.len() * 2) as u32;
+            status
+        }
+    }
+
+    const GAME: &str = "HID\\VID_1234|HID_DEVICE_SYSTEM_GAME|HID_DEVICE|";
+    const OTHER: &str = "HID\\VID_1234|HID_DEVICE_UP:0001_U:0002|HID_DEVICE|";
+
+    #[test]
+    fn game_class_answers_only_from_a_clean_read() {
+        let list = DEVPROP_TYPE_STRING_LIST;
+        let none = DEVPROPTYPE::default();
+        assert!(!game_class_from(
+            Some(7),
+            cached(CR_NO_SUCH_VALUE, none, "")
+        ));
+        assert!(!game_class_from(Some(7), cached(CR_SUCCESS, list, OTHER)));
+        assert!(game_class_from(Some(7), cached(CR_SUCCESS, list, GAME)));
+    }
+
+    #[test]
+    fn game_class_lookup_errors_fail_closed() {
+        let never = |_: u32, _: &mut DEVPROPTYPE, _: &mut [u16], _: &mut u32| -> CONFIGRET {
+            panic!("no devnode to read")
+        };
+        let list = DEVPROP_TYPE_STRING_LIST;
+        let cases = [
+            ("node lookup failure", game_class_from(None, never)),
+            (
+                "other error",
+                game_class_from(Some(7), cached(CR_FAILURE, list, OTHER)),
+            ),
+            (
+                "stale devnode",
+                game_class_from(Some(7), cached(CR_INVALID_DEVNODE, list, "")),
+            ),
+            (
+                "wrong type",
+                game_class_from(Some(7), cached(CR_SUCCESS, DEVPROP_TYPE_STRING, OTHER)),
+            ),
+            (
+                "buffer too small",
+                game_class_from(Some(7), cached(CR_BUFFER_SMALL, list, "")),
+            ),
+        ];
+        let open: Vec<&str> = cases
+            .iter()
+            .filter(|(_, closed)| !closed)
+            .map(|(case, _)| *case)
+            .collect();
+        assert!(open.is_empty(), "failed open: {open:?}");
     }
 
     #[test]
