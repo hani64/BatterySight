@@ -44,7 +44,34 @@ When a sibling model from the same vendor already works, the new one usually nee
 1. Add its PID to the sibling's `pids` if it is the same device under another id, or add a `[[device]]` entry modelled on the sibling: same `engine`, the `send`/`receive` collection selectors and engine settings adjusted to your dump.
 2. Set `status` and `source` (table below).
 
-Logitech HID++ devices need no entry: the HID++ family covers them. Add one only for a better name, a wireless id (`wpids`) or quirks; the comment at the top of [`logitech.toml`](crates/core/catalog/logitech.toml) explains the ids.
+The SteelSeries Arctis Nova 7 entry, from [`steelseries.toml`](crates/core/catalog/steelseries.toml); a new model on the same protocol copies its shape:
+
+```toml
+[[device]]
+name = "SteelSeries Arctis Nova 7 family"     # the name the app shows
+vid = 0x1038                                  # from --dump
+pids = [0x2202, 0x2206, 0x220A, 0x223A, 0x227A, 0x22A4]  # USB product ids
+kind = "headset"                              # mouse, keyboard, headset, speaker, controller or other
+engine = "steelseries"
+status = "source-verified"                    # see "Status and source"
+source = "HeadsetControl steelseries_arctis_nova_7/7p.hpp (PIDs, 0–4, command); Linux hid-steelseries-arctis.c (quarter steps, if 3/5); Linux-Arctis-Manager nova_7.yaml (event selector)"
+receive = { usage_page = 0xFF00, usage = 1, interface = 5 }              # the collection that reports the battery
+send = { usage_page = 0xFFC0, usage = 1, interface = 3, output_len = 65 } # the collection BatterySight writes to
+steelseries = "nova7-steps"                   # engine setting
+```
+
+Logitech HID++ devices need no entry: the HID++ family covers them. Add one only for a better name, a wireless id (`wpids`) or quirks; the comment at the top of [`logitech.toml`](crates/core/catalog/logitech.toml) explains the ids. A mouse on a receiver is matched by the wireless id the receiver reports for its slot (the PRO X Superlight entry, `source` shortened):
+
+```toml
+[[device]]
+name = "PRO X Superlight"
+vid = 0x046D
+wpids = [0x4093]         # wireless id, not the receiver's USB id
+kind = "mouse"
+engine = "hidpp"
+status = "hardware-tested"
+source = "Solaar lib/logitech_receiver/descriptors.py (wpid 4093); owner hardware test 2026-11-23 on a C547 receiver"
+```
 
 ### Path 2: a new protocol
 
