@@ -2155,7 +2155,7 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
         let observation = |container| bluetooth::Observation {
             container,
             name: "Cached Bluetooth".into(),
-            kind: batterysight_core::model::DeviceKind::Headset,
+            kind: Some(batterysight_core::model::DeviceKind::Headset),
             connected: true,
             level: Some(72),
         };
@@ -2215,7 +2215,7 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
             Ok(vec![bluetooth::Observation {
                 container: HEADSET,
                 name: "Cached Bluetooth".into(),
-                kind: batterysight_core::model::DeviceKind::Headset,
+                kind: Some(batterysight_core::model::DeviceKind::Headset),
                 connected,
                 level,
             }])

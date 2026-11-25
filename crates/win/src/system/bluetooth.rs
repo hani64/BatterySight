@@ -55,7 +55,9 @@ const CONNECTED_REREAD_MS: Ms = 60_000;
 pub struct Observation {
     pub container: ContainerId,
     pub name: String,
-    pub kind: DeviceKind,
+    /// `None` when nothing identified the kind (a later failed read must not replace a
+    /// known one); the hub shows a new row without a kind as Other.
+    pub kind: Option<DeviceKind>,
     pub connected: bool,
     /// May still be populated after disconnect. Do not publish it as a new reading then.
     pub level: Option<u8>,
@@ -204,11 +206,7 @@ impl Group {
             kind: self
                 .class
                 .or(self.hid.kind())
-                .unwrap_or(if self.hands_free {
-                    DeviceKind::Headset
-                } else {
-                    DeviceKind::Other
-                }),
+                .or(self.hands_free.then_some(DeviceKind::Headset)),
             name: self.name(),
         }
     }
@@ -236,12 +234,10 @@ fn hid_usages(hardware_ids: &[u16], matching_id: &[u16]) -> HidUsages {
             continue;
         };
         let (Some(page), Some(usage)) = (
-            rest.get(..4)
-                .and_then(|hex| u16::from_str_radix(hex, 16).ok()),
+            hex4(rest),
             rest.get(4..)
                 .and_then(|tail| tail.strip_prefix("_U:"))
-                .and_then(|tail| tail.get(..4))
-                .and_then(|hex| u16::from_str_radix(hex, 16).ok()),
+                .and_then(hex4),
         ) else {
             continue;
         };
@@ -266,6 +262,15 @@ fn hid_usages(hardware_ids: &[u16], matching_id: &[u16]) -> HidUsages {
         _ => {}
     }
     usages
+}
+
+/// Exactly four ASCII hex digits at the start of `text`, not followed by another hex digit.
+/// Checked before parsing: `from_str_radix` also accepts a leading `+`.
+fn hex4(text: &str) -> Option<u16> {
+    let digits = text.get(..4)?;
+    let exact = digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !text[4..].starts_with(|c: char| c.is_ascii_hexdigit());
+    exact.then(|| u16::from_str_radix(digits, 16).ok())?
 }
 
 fn observations(groups: BTreeMap<ContainerId, Group>) -> Vec<Observation> {
@@ -614,7 +619,7 @@ impl Source {
                 update: DeviceUpdate {
                     key,
                     name: Some(observation.name),
-                    kind: Some(observation.kind),
+                    kind: observation.kind,
                     via: Some(Via::Bluetooth),
                     level: observation.level.map(Level::Percent),
                     millivolts: None,
@@ -686,7 +691,7 @@ mod tests {
 
     /// A BLE peer (no Class of Device unless `cod` is given) plus HID devnodes in its
     /// container, each as (`HardwareIds` multi-string, `MatchingDeviceId`).
-    fn le_kind(cod: Option<DeviceKind>, hids: &[(&str, &str)]) -> DeviceKind {
+    fn le_kind(cod: Option<DeviceKind>, hids: &[(&str, &str)]) -> Option<DeviceKind> {
         let mut groups = BTreeMap::new();
         add_node(
             &mut groups,
@@ -732,37 +737,85 @@ mod tests {
 
     #[test]
     fn ble_hid_usage_gives_the_device_kind() {
-        assert_eq!(le_kind(None, &[PAD]), DeviceKind::Controller);
+        assert_eq!(le_kind(None, &[PAD]), Some(DeviceKind::Controller));
         assert_eq!(
             le_kind(None, &[("HID\\VID_045E\0\0", "HID_DEVICE_SYSTEM_GAME")]),
-            DeviceKind::Controller
+            Some(DeviceKind::Controller)
         );
-        assert_eq!(le_kind(None, &[MOUSE_HID]), DeviceKind::Mouse);
-        assert_eq!(le_kind(None, &[KEYS_HID]), DeviceKind::Keyboard);
-        // Ambiguous without a game collection: fail closed.
-        assert_eq!(le_kind(None, &[MOUSE_HID, KEYS_HID]), DeviceKind::Other);
+        assert_eq!(le_kind(None, &[MOUSE_HID]), Some(DeviceKind::Mouse));
+        assert_eq!(le_kind(None, &[KEYS_HID]), Some(DeviceKind::Keyboard));
+        // Ambiguous without a game collection: fail closed (no kind; new rows show Other).
+        assert_eq!(le_kind(None, &[MOUSE_HID, KEYS_HID]), None);
         // Any game collection wins.
         assert_eq!(
             le_kind(None, &[MOUSE_HID, KEYS_HID, PAD]),
-            DeviceKind::Controller
+            Some(DeviceKind::Controller)
         );
         // Other usages (consumer control) give nothing.
         assert_eq!(
             le_kind(None, &[("HID\\VID_046D&UP:000C_U:0001\0\0", "")]),
-            DeviceKind::Other
+            None
         );
-        assert_eq!(le_kind(None, &[]), DeviceKind::Other);
+        assert_eq!(le_kind(None, &[]), None);
+    }
+
+    #[test]
+    fn hid_usage_tokens_need_exactly_four_hex_digits() {
+        let usage = |id: &str| hid_usages(&wide(id), &[]);
+        assert_eq!(
+            usage("HID\\VID_045E&UP:0001_U:00050\0\0"),
+            HidUsages::default()
+        );
+        assert_eq!(
+            usage("HID\\VID_045E&UP:0001_U:+005\0\0"),
+            HidUsages::default()
+        );
+        assert_eq!(
+            usage("HID\\VID_045E&UP:+001_U:0005\0\0"),
+            HidUsages::default()
+        );
+        assert_eq!(
+            usage("HID\\VID_045E&UP:00010_U:0005\0\0"),
+            HidUsages::default()
+        );
+        assert!(usage("HID\\VID_045E&UP:0001_U:0005&Col01\0\0").game);
+        assert!(usage("HID\\VID_045E&UP:0001_U:0005\0\0").game);
+    }
+
+    #[test]
+    fn a_scan_that_loses_the_kind_keeps_the_known_kind() {
+        let mut source = Source::default();
+        let mut hub = Hub::new(Catalog::builtin(), Policy::default());
+        let pad = |kind| Observation {
+            container: ID,
+            name: "Pad".into(),
+            kind,
+            connected: true,
+            level: Some(68),
+        };
+        for (now, kind) in [(0, Some(DeviceKind::Controller)), (1, None)] {
+            for input in source.reconcile(Ok(vec![pad(kind)]), now, &hub) {
+                hub.handle(input, now);
+            }
+        }
+        assert_eq!(hub.snapshot()[0].kind, DeviceKind::Controller);
+        // A row first seen without any kind still shows the hub's Other default.
+        let mut fresh = Hub::new(Catalog::builtin(), Policy::default());
+        for input in Source::default().reconcile(Ok(vec![pad(None)]), 0, &fresh) {
+            fresh.handle(input, 0);
+        }
+        assert_eq!(fresh.snapshot()[0].kind, DeviceKind::Other);
     }
 
     #[test]
     fn class_of_device_keeps_priority_over_hid_usage() {
         assert_eq!(
             le_kind(Some(DeviceKind::Headset), &[PAD]),
-            DeviceKind::Headset
+            Some(DeviceKind::Headset)
         );
         assert_eq!(
             le_kind(Some(DeviceKind::Mouse), &[KEYS_HID]),
-            DeviceKind::Mouse
+            Some(DeviceKind::Mouse)
         );
     }
 
@@ -787,7 +840,7 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].container, ID);
         assert_eq!(nodes[0].name, "Example Headphones");
-        assert_eq!(nodes[0].kind, DeviceKind::Headset);
+        assert_eq!(nodes[0].kind, Some(DeviceKind::Headset));
         assert!(nodes[0].connected);
         assert_eq!(nodes[0].level, Some(75));
         assert!(!classic(false, Some(75))[0].connected);
