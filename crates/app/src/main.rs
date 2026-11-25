@@ -90,8 +90,9 @@ impl Drop for SingleInstance {
 }
 
 /// The steps before the UI: a command-line tool's exit code (`Ok`), otherwise the
-/// single-instance check's result, which is `None` when another instance runs. Tools come
-/// first, so they work beside a running instance and start no store, trace or audio.
+/// single-instance check's result, which is `None` when another instance runs. The CLI tools
+/// run before the single-instance check and the store, so they work beside a running
+/// instance. `--list` logs like the app; `--dump` and `--capture` add no log lines.
 fn dispatch(
     args: &[OsString],
     acquire: impl FnOnce(bool) -> Option<SingleInstance>,
