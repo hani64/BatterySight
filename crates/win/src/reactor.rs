@@ -86,6 +86,8 @@ pub enum OsEvent {
     },
     /// Audio activity is not (fully) watched: `stage` failed on the audio thread.
     AudioUnavailable { stage: &'static str },
+    /// Windows.Gaming.Input added or removed a controller; carries no identifier.
+    GameControllers,
     /// Posted by another thread to make [`Reactor::wait`] return.
     Wake,
 }

@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 batterysight-core = { path = "../core" }
 windows = { version = "0.62", features = [
+    "Devices_Power",
+    "Foundation",
+    "Gaming_Input",
+    "System_Power",
     "Wdk_System_IO",
     "Win32_Devices_Bluetooth",
     "Win32_Devices_DeviceAndDriverInstallation",
@@ -23,6 +27,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Power",
     "Win32_System_SystemInformation",
     "Win32_System_Variant",
+    "Win32_UI_Input_XboxController",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }

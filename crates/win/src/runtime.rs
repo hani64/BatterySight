@@ -34,7 +34,7 @@ use crate::notify::{
 };
 use crate::power::register_power;
 use crate::reactor::{FeatureFailure, OsEvent, Poster, Reactor, clock_ms as now_ms};
-use crate::system::bluetooth;
+use crate::system::{bluetooth, xbox};
 use crate::trace::{Direction, Trace};
 
 /// How long [`RuntimeHandle::stop`] waits for the device thread to finish.
@@ -154,6 +154,8 @@ fn device_thread(
     let _ = ready.send(Ok(reactor.poster()));
     let _bluetooth_interfaces = register_bluetooth_interfaces(&reactor.poster());
     let radios = watch_local_radios(&reactor.poster());
+    // Without it controllers are still polled on start, Refresh and resume.
+    let _controllers = xbox::Watch::start(&reactor.poster()).ok();
     // Without it no device is read on audio activity; every other trigger still works.
     let _audio = audio::start(reactor.poster())
         .inspect_err(|_| {
@@ -174,6 +176,7 @@ fn device_thread(
         held: BTreeMap::new(),
         audio: AudioActivity::default(),
         bluetooth: bluetooth::Source::default(),
+        xbox: xbox::Source::default(),
         hid_containers: BTreeMap::new(),
         trace: Trace::from_env(),
         states,
@@ -246,6 +249,7 @@ struct Device {
     held: BTreeMap<PathSet, Ms>,
     audio: AudioActivity,
     bluetooth: bluetooth::Source,
+    xbox: xbox::Source,
     /// Retain the last HID container during the hub's removal grace for deduplication.
     hid_containers: BTreeMap<DeviceKey, ContainerId>,
     trace: Option<Trace>,
@@ -299,6 +303,7 @@ impl Device {
     fn run(mut self, commands: &Receiver<Command>) {
         self.rescan();
         self.bluetooth.request(now_ms(), false);
+        self.xbox.request();
         loop {
             let now = now_ms();
             if self
@@ -317,6 +322,9 @@ impl Device {
             if self.bluetooth.take_due(now) {
                 self.rescan_bluetooth();
             }
+            if self.xbox.take_due(now) {
+                self.poll_xbox();
+            }
             // May return nothing before the deadline; the loop then checks it again.
             let events = self.reactor.wait(self.deadline(), now_ms());
             let mut rescan = false;
@@ -333,6 +341,7 @@ impl Device {
                         self.guard.clear();
                         self.rescan();
                         self.rearm_bluetooth();
+                        self.xbox.request();
                         self.feed(HubInput::RefreshNow, now_ms());
                     }
                     Ok(Command::SetIntervals(gaps)) => {
@@ -467,6 +476,7 @@ impl Device {
                 self.guard.clear();
                 self.rescan();
                 self.rearm_bluetooth();
+                self.xbox.request();
                 self.feed(HubInput::Resume, now_ms());
                 false
             }
@@ -481,6 +491,10 @@ impl Device {
                 if let Some(trace) = &mut self.trace {
                     trace.audio_unavailable(stage);
                 }
+                false
+            }
+            OsEvent::GameControllers => {
+                self.xbox.request();
                 false
             }
             OsEvent::WriteFailed { .. } | OsEvent::Wake => false,
@@ -508,8 +522,21 @@ impl Device {
         scanned: windows::core::Result<Vec<bluetooth::Observation>>,
         now: Ms,
     ) {
+        let inputs = self.bluetooth.reconcile(scanned, now, &self.hub);
+        self.apply_system(inputs, now);
+    }
+
+    fn poll_xbox(&mut self) {
+        let polled = self.xbox.poll(hid_enum::enumerate);
+        let now = now_ms();
+        let inputs = self.xbox.reconcile(polled, xbox::read_xinput, now);
+        self.apply_system(inputs, now);
+    }
+
+    /// Hands system observations to the hub; they never produce sends.
+    fn apply_system(&mut self, inputs: Vec<HubInput>, now: Ms) {
         let mut changed = false;
-        for input in self.bluetooth.reconcile(scanned, now, &self.hub) {
+        for input in inputs {
             changed |= self
                 .hub
                 .handle(input, now)
@@ -528,6 +555,7 @@ impl Device {
             self.release_at,
             self.activity_deadline(),
             self.bluetooth.deadline(),
+            self.xbox.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -918,6 +946,7 @@ impl Device {
                     .is_some_and(|container| cached.contains_key(container))
             }
         });
+        xbox::hide_replaced(&mut snapshot);
         if *published != snapshot {
             *published = snapshot;
             drop(published);
@@ -1591,6 +1620,7 @@ mod tests {
             held: BTreeMap::new(),
             audio: AudioActivity::default(),
             bluetooth: bluetooth::Source::default(),
+            xbox: xbox::Source::default(),
             hid_containers: BTreeMap::new(),
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),
