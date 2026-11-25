@@ -1,6 +1,7 @@
 //! Local Windows device observations, independent of HID engine grants.
 
 pub mod bluetooth;
+pub(crate) mod handover;
 pub mod xbox;
 
 use std::collections::BTreeSet;

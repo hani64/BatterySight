@@ -34,6 +34,7 @@ use crate::notify::{
 };
 use crate::power::register_power;
 use crate::reactor::{FeatureFailure, OsEvent, Poster, Reactor, clock_ms as now_ms};
+use crate::system::handover::Handover;
 use crate::system::{bluetooth, xbox};
 use crate::trace::{Direction, Trace};
 
@@ -177,6 +178,7 @@ fn device_thread(
         audio: AudioActivity::default(),
         bluetooth: bluetooth::Source::default(),
         xbox: xbox::Source::default(),
+        handover: Handover::default(),
         hid_containers: BTreeMap::new(),
         trace: Trace::from_env(),
         states,
@@ -250,6 +252,8 @@ struct Device {
     audio: AudioActivity,
     bluetooth: bluetooth::Source,
     xbox: xbox::Source,
+    /// Hides a controller's previous row when it moves between Bluetooth and a cable.
+    handover: Handover,
     /// Retain the last HID container during the hub's removal grace for deduplication.
     hid_containers: BTreeMap<DeviceKey, ContainerId>,
     trace: Option<Trace>,
@@ -947,6 +951,7 @@ impl Device {
             }
         });
         self.xbox.hide_replaced(&mut snapshot);
+        self.handover.apply(&mut snapshot, now_ms());
         if *published != snapshot {
             *published = snapshot;
             drop(published);
@@ -1621,6 +1626,7 @@ mod tests {
             audio: AudioActivity::default(),
             bluetooth: bluetooth::Source::default(),
             xbox: xbox::Source::default(),
+            handover: Handover::default(),
             hid_containers: BTreeMap::new(),
             trace: None,
             states: Arc::new(Mutex::new(Vec::new())),

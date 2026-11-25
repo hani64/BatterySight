@@ -42,6 +42,11 @@ const REREAD_MS: Ms = 60_000;
 const WGI_PREFIX: &str = "pad:wgi:";
 const XINPUT_PREFIX: &str = "pad:xinput:";
 
+/// Whether `key` is a row of this source.
+pub(crate) fn is_pad_key(key: &DeviceKey) -> bool {
+    key.0.starts_with(WGI_PREFIX) || key.0.starts_with(XINPUT_PREFIX)
+}
+
 /// A `BatteryReport` as WGI returned it. For these pads the capacities are quantized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Report {
