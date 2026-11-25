@@ -853,7 +853,7 @@ fn taskbars() -> Vec<(HWND, bool)> {
 /// the named monitor is disconnected or has no taskbar, or a secondary taskbar's clock is
 /// not known yet (UI Automation answers after the widgets are made). So a widget shows at
 /// once next to the primary's notification area, and the widgets narrow to the choice when
-/// its anchor arrives ([`Widgets::take_clocks`], then a layout).
+/// its anchor arrives ([`Widgets::take_parts`], then a layout).
 fn select<T: Copy>(
     bars: &[(T, bool)],
     choice: &MonitorChoice,
