@@ -46,6 +46,8 @@ mod history_window;
 mod menu;
 mod notify;
 pub mod render;
+#[cfg(test)]
+mod screenshots;
 mod tray;
 pub mod watchdog;
 mod widget;
@@ -76,11 +78,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SetTimer, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION,
-    WM_MOUSEMOVE, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    GetCursorPos, GetMessageW, IDC_ARROW, KillTimer, LoadCursorW, LoadIconW, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SetTimer, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -1343,6 +1345,8 @@ fn create_host() -> Option<HWND> {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(history_window::window_proc),
             hInstance: instance,
+            // The exe's icon (resource 1, see build.rs); Windows picks the small size itself.
+            hIcon: LoadIconW(Some(instance), PCWSTR(1 as _)).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: HISTORY_CLASS,
             ..Default::default()

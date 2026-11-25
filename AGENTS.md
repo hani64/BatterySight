@@ -10,7 +10,7 @@
 
 ## Rules
 
-- Never add a code path that queries an idle device. Only the scheduler decides when anything is sent; queries happen only on the events in README "When BatterySight asks a device".
+- Never add a code path that queries an idle device. Only the scheduler decides when anything is sent; queries happen only on the events in README "How it reads batteries".
 - No network access, no telemetry, never keystroke or movement contents.
 - No blocking work on the UI thread. In `unsafe` code, check handle and COM lifetimes.
 - An engine behaviour change needs a replay test (`crates/core/tests/hidpp_replay.rs` for HID++, `vendor_replay.rs` for the others).

@@ -30,7 +30,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# The application manifest (see build.rs). embed-manifest writes the resource object itself,
-# so neither rc.exe nor windres is needed, with the MSVC or the GNU toolchain.
+# The application manifest and the icon (see build.rs). embed-manifest writes the manifest's
+# resource object itself; embed-resource compiles the icon with rc.exe (MSVC, from the Windows
+# SDK) or windres (GNU binutils).
 [build-dependencies]
 embed-manifest = "1"
+embed-resource = "3"

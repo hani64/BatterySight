@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- The BatterySight logo fitted to a 16 px grid: flat colours, no shadows. -->
+  <defs>
+    <clipPath id="in-white"><path d="M2.5 8 C5 4.6 11 4.6 13.5 8 C11 11.4 5 11.4 2.5 8 Z"/></clipPath>
+    <clipPath id="in-glass"><circle cx="7.5" cy="8" r="2"/></clipPath>
+  </defs>
+  <path d="M0 8 C3 2 13 2 16 8 C13 14 3 14 0 8 Z" fill="#1A7FD8"/>
+  <path d="M2.5 8 C5 4.6 11 4.6 13.5 8 C11 11.4 5 11.4 2.5 8 Z" fill="#FFFFFF"/>
+  <g clip-path="url(#in-white)">
+    <rect x="10" y="7" width="2" height="2" rx="0.67" fill="#0B4FA8"/>
+    <circle cx="7.5" cy="8" r="3.5" fill="#0B4FA8"/>
+    <circle cx="7.5" cy="8" r="2" fill="#FFFFFF"/>
+    <rect x="0" y="8" width="16" height="16" fill="#2EA043" clip-path="url(#in-glass)"/>
+  </g>
+</svg>
