@@ -1,0 +1,17 @@
+# cargo-deny: run `cargo deny check bans sources advisories` (CI runs bans and sources on
+# every PR; advisories weekly and when Cargo.lock changes).
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own path dependencies (`{ path = "../core" }`) carry no version.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
