@@ -60,8 +60,9 @@ reviews:
   # opengrep and ast-grep run their built-in rules), secrets (gitleaks, trufflehog),
   # workflows (actionlint, zizmor) and CI results (github-checks). Turned off: the
   # Markdown and YAML linters (the repo writes one line per paragraph, so they report
-  # only line length), grammar nits, PII patterns that do not occur here, and OSV, which
-  # repeats cargo-deny's advisory check on Cargo.lock.
+  # only line length), grammar nits, PII patterns that do not occur here, OSV, which
+  # repeats cargo-deny's advisory check on Cargo.lock, and Checkov, whose workflow checks
+  # zizmor covers.
   tools:
     markdownlint:
       enabled: false
@@ -72,6 +73,8 @@ reviews:
     presidio:
       enabled: false
     osvScanner:
+      enabled: false
+    checkov:
       enabled: false
 knowledge_base:
   code_guidelines:
