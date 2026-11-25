@@ -294,7 +294,8 @@ fn observation(
             source: SampleSource::Os,
         },
         verification: Verification::SourceVerified,
-        reports_changes: false,
+        // Windows holds the pad's own pushed status; reading it sends nothing to the pad.
+        reports_changes: true,
     })
 }
 
@@ -1068,6 +1069,33 @@ mod tests {
             rows(&states),
             [("pad:xinput:0", Some(Level::Coarse(CoarseLevel::Low)))]
         );
+    }
+
+    #[test]
+    fn wgi_and_xinput_rows_report_their_own_changes() {
+        // Windows holds the pad's own pushed status; reading it sends nothing to the pad.
+        let mut source = Source::default();
+        let mut first = hub();
+        let states = apply(
+            &mut source,
+            &mut first,
+            poll(vec![pad(1, USB, Some(report(100, 100)))], &[]),
+            no_xinput,
+            0,
+        );
+        assert_eq!(states[0].key.0, "pad:wgi:1");
+        assert!(states[0].reports_changes);
+        let mut source = Source::default();
+        let mut fresh = hub();
+        let states = apply(
+            &mut source,
+            &mut fresh,
+            poll(vec![pad(1, USB, None)], &[]),
+            || [slot(BATTERY_TYPE_NIMH, BATTERY_LEVEL_LOW), None, None, None],
+            0,
+        );
+        assert_eq!(states[0].key.0, "pad:xinput:0");
+        assert!(states[0].reports_changes);
     }
 
     #[test]
