@@ -18,14 +18,15 @@
 //! The UI adds `"<unix ms> ui <text>"` lines ([`ui_line`]) and the settings and history
 //! store `"<unix ms> store <text>"` lines when a file cannot be read or written or is set
 //! aside. Tracing only records what the runtime already does, so it adds no device
-//! traffic, and it never fails the app: an unwritable file just means no trace. When the log
-//! exceeds 1 MiB at a size check, it becomes `sends.old.log`, replacing the previous log.
+//! traffic, and it never fails the app: an unwritable file just means no trace. The current
+//! log rotates to `sends.old.log` at about 1 MiB. If rotation fails, writers stop appending
+//! at the 2 MiB ceiling and periodically check whether they can resume.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,9 +54,13 @@ pub(crate) fn enabled() -> bool {
 }
 
 fn rotate_if_needed(dir: &Path, cap: u64) {
+    rotate_for_append(dir, cap, 0);
+}
+
+fn rotate_for_append(dir: &Path, cap: u64, incoming: u64) {
     let current = dir.join("sends.log");
-    let oversized = || fs::metadata(&current).is_ok_and(|meta| meta.len() > cap);
-    if !oversized() {
+    let over_budget = |size: u64| size > cap - incoming;
+    if !fs::metadata(&current).is_ok_and(|meta| over_budget(meta.len())) {
         return;
     }
 
@@ -73,9 +78,42 @@ fn rotate_if_needed(dir: &Path, cap: u64) {
     }
 
     // A different writer may have already rotated and opened a new, small log.
-    if oversized() {
-        let _ = fs::rename(&current, dir.join("sends.old.log"));
+    let Ok(meta) = fs::metadata(&current) else {
+        return;
+    };
+    let size = meta.len();
+    if !over_budget(size) {
+        return;
     }
+    let old = dir.join("sends.old.log");
+    if size > 2 * cap {
+        // Stage the bounded archive, but do not replace the previous archive if the
+        // current log cannot be renamed. A failed trim leaves the plain rotation intact.
+        let tail = dir.join("sends.old.log.tmp");
+        let trimmed = stage_legacy_tail(&current, &tail, size, cap).is_ok();
+        if fs::rename(&current, &old).is_ok() && trimmed {
+            let _ = fs::rename(&tail, &old);
+        }
+        let _ = fs::remove_file(&tail);
+    } else {
+        let _ = fs::rename(&current, &old);
+    }
+}
+
+fn stage_legacy_tail(current: &Path, tail: &Path, size: u64, cap: u64) -> io::Result<()> {
+    let mut source = File::open(current)?;
+    source.seek(SeekFrom::Start(size - cap))?;
+    let mut window = vec![0; cap as usize];
+    source.read_exact(&mut window)?;
+    let start = window
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(window.len(), |i| i + 1);
+    let end = window[start..]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(start, |i| start + i + 1);
+    fs::write(tail, &window[start..end])
 }
 
 fn open_log(dir: &Path) -> Option<File> {
@@ -100,6 +138,7 @@ fn open_log_for_oversized_record(dir: &Path) -> Option<File> {
 pub(crate) struct Trace {
     file: File,
     dir: PathBuf,
+    size: u64,
     written: u64,
     #[cfg(test)]
     cap: u64,
@@ -124,9 +163,12 @@ impl Trace {
     fn open_in_with_cap(dir: &Path, cap: u64) -> Option<Trace> {
         fs::create_dir_all(dir).ok()?;
         rotate_if_needed(dir, cap);
+        let file = open_log(dir)?;
+        let size = file.metadata().ok()?.len();
         Some(Trace {
-            file: open_log(dir)?,
+            file,
             dir: dir.to_path_buf(),
+            size,
             written: 0,
             #[cfg(test)]
             cap,
@@ -147,32 +189,53 @@ impl Trace {
         }
 
         let len = bytes.len() as u64;
-        if len > recheck_bytes {
-            // A record larger than the budget cannot risk a rename between open and write.
-            if let Some(mut file) = open_log_for_oversized_record(&self.dir) {
-                let _ = file.write_all(bytes);
-                drop(file);
-                self.recheck(cap);
-            }
+        if len > cap {
+            // Rejected records still advance recovery when logging is paused.
+            self.recheck(cap, 0);
             return;
         }
-        if self.written + len > recheck_bytes {
-            self.recheck(cap);
+        if len > recheck_bytes {
+            rotate_for_append(&self.dir, cap, len);
+            // A record larger than the recheck interval cannot risk a rename during the write.
+            if let Some(mut file) = open_log_for_oversized_record(&self.dir)
+                && file
+                    .metadata()
+                    .is_ok_and(|meta| meta.len().saturating_add(len) <= 2 * cap)
+            {
+                let _ = file.write_all(bytes);
+            }
+            self.refresh();
+            return;
         }
-        let _ = self.file.write_all(bytes);
-        // Count attempted bytes even on error so a stale handle does not prevent a reopen.
+        if self.written + len > recheck_bytes || (self.size <= cap && self.size + len > cap) {
+            self.recheck(cap, len);
+        }
+        if self.size.saturating_add(len) <= 2 * cap {
+            let _ = self.file.write_all(bytes);
+            self.size += len;
+        }
+        // Count attempted bytes, including dropped records, so a paused log can recover.
         self.written += len;
         if self.written >= recheck_bytes {
-            self.recheck(cap);
+            self.recheck(cap, 0);
         }
     }
 
-    fn recheck(&mut self, cap: u64) {
+    fn recheck(&mut self, cap: u64, incoming: u64) {
+        rotate_for_append(&self.dir, cap, incoming);
+        self.refresh();
+    }
+
+    fn refresh(&mut self) {
         self.written = 0;
-        rotate_if_needed(&self.dir, cap);
         // Reopen even if this call didn't rotate: another writer may have done so.
-        if let Some(file) = open_log(&self.dir) {
+        if let Some(file) = open_log(&self.dir)
+            && let Ok(meta) = file.metadata()
+        {
+            self.size = meta.len();
             self.file = file;
+        } else if let Ok(meta) = self.file.metadata() {
+            self.size = meta.len();
         }
     }
 
@@ -275,6 +338,7 @@ impl Trace {
         Trace {
             file,
             dir: PathBuf::new(),
+            size: 0,
             written: 0,
             cap: CAP_BYTES,
             recheck_bytes: RECHECK_BYTES,
@@ -451,10 +515,10 @@ mod tests {
         let current = dir.0.join("sends.log");
         let old = dir.0.join("sends.old.log");
         fs::write(&current, b"oversized").unwrap();
-        rotate_if_needed(&dir.0, 4);
+        rotate_if_needed(&dir.0, 5);
 
         fs::write(&current, b"new").unwrap();
-        rotate_if_needed(&dir.0, 4);
+        rotate_if_needed(&dir.0, 5);
         assert_eq!(fs::read(&current).unwrap(), b"new");
         assert_eq!(fs::read(&old).unwrap(), b"oversized");
     }
@@ -469,12 +533,12 @@ mod tests {
         let guard = File::create(dir.0.join("sends.log.lock")).unwrap();
         guard.try_lock().unwrap();
 
-        rotate_if_needed(&dir.0, 4);
+        rotate_if_needed(&dir.0, 5);
         assert_eq!(fs::read(&current).unwrap(), b"oversized");
         assert_eq!(fs::read(&old).unwrap(), b"archive");
 
         drop(guard);
-        rotate_if_needed(&dir.0, 4);
+        rotate_if_needed(&dir.0, 5);
         assert!(!current.exists());
         assert_eq!(fs::read(&old).unwrap(), b"oversized");
     }
@@ -494,11 +558,8 @@ mod tests {
         }
         assert_eq!(fs::read(&current).unwrap(), EARLY.repeat(4));
         assert!(!old.exists());
-        for _ in 0..2 {
-            trace.append(EARLY);
-        }
         trace.append(LATER);
-        assert_eq!(fs::read(&old).unwrap(), EARLY.repeat(6));
+        assert_eq!(fs::read(&old).unwrap(), EARLY.repeat(4));
         assert_eq!(fs::read(&current).unwrap(), LATER);
 
         fs::rename(&current, &external).unwrap();
@@ -577,6 +638,77 @@ mod tests {
         assert_eq!(fs::read(&old).unwrap(), b"earlier\n");
         drop(lock);
         assert_eq!(fs::read(&current).unwrap(), b"current\n");
+    }
+
+    #[test]
+    fn rename_denied_at_ceiling_drops_writes_until_rotation_succeeds() {
+        let dir = TempDir::new("ceiling");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        fs::write(&current, [b'x'; 200]).unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+            .open(&current)
+            .unwrap();
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        let line = b"logged after recovery...\n"; // 25 bytes
+
+        for _ in 0..4 {
+            trace.append(line);
+            Trace::open_with_limits(&dir.0, 100, 50)
+                .unwrap()
+                .append(line);
+        }
+        assert_eq!(fs::read(&current).unwrap(), [b'x'; 200]);
+        assert!(!old.exists());
+
+        drop(reader);
+        for _ in 0..3 {
+            trace.append(line);
+        }
+        assert_eq!(fs::read(&old).unwrap(), [b'x'; 200]);
+        assert_eq!(fs::read(&current).unwrap(), line);
+    }
+
+    #[test]
+    fn record_larger_than_cap_is_dropped_whole() {
+        let dir = TempDir::new("record-over-cap");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        trace.append(b"keep this\n");
+        trace.append(&[b'x'; 101]);
+        assert_eq!(fs::read(dir.0.join("sends.log")).unwrap(), b"keep this\n");
+        assert!(!dir.0.join("sends.old.log").exists());
+    }
+
+    #[test]
+    fn fitting_large_record_rotates_before_writing() {
+        let dir = TempDir::new("pre-write-rotation");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        let earlier = b"earlier......................\n";
+        let mut large = [b'x'; 80];
+        large[79] = b'\n';
+        trace.append(earlier);
+        trace.append(&large);
+        assert_eq!(fs::read(&old).unwrap(), earlier);
+        assert_eq!(fs::read(&current).unwrap(), large);
+    }
+
+    #[test]
+    fn legacy_rotation_retains_only_complete_lines_in_the_tail_window() {
+        let dir = TempDir::new("legacy");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        fs::write(
+            &current,
+            b"discarded legacy data\npartial\nfirst\nlast\nunfinished",
+        )
+        .unwrap();
+        rotate_if_needed(&dir.0, 24);
+        assert!(!current.exists());
+        assert_eq!(fs::read(&old).unwrap(), b"first\nlast\n");
     }
 
     #[test]
