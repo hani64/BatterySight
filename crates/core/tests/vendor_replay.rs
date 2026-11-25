@@ -629,6 +629,12 @@ fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
         None,
     );
     steelseries_state(&hub, Presence::Online, Some(79), Charge::Charging);
+    // Link edges are presence only: the 79% keeps its age and source.
+    let sampled = |hub: &Hub, at: Ms| {
+        let state = &hub.snapshot()[0];
+        assert_eq!((state.updated_ms, state.source), (at, Source::Push));
+    };
+    sampled(&hub, 2_101);
     let key = hub.snapshot()[0].key.clone();
     hub.handle(HubInput::SetIntervals([(key.clone(), 1)].into()), 2_102);
     steelseries_sent(hub.handle(HubInput::Tick, 900_000), None);
@@ -644,6 +650,7 @@ fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
         None,
     );
     steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    sampled(&hub, 2_101);
     steelseries_sent(
         steelseries_input(&mut hub, OTHER, &[0, 0xB7, 0, 2], 900_004),
         None,
@@ -657,6 +664,8 @@ fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
         steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 900_006),
         None,
     );
+    steelseries_state(&hub, Presence::Online, Some(79), Charge::Unknown);
+    sampled(&hub, 2_101);
     steelseries_sent(hub.handle(HubInput::Tick, 910_000), None);
     steelseries_sent(hub.handle(HubInput::Resume, 910_001), request);
     steelseries_sent(hub.handle(HubInput::RefreshNow, 910_002), request);
@@ -664,6 +673,8 @@ fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
         steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 910_003),
         None,
     );
+    steelseries_state(&hub, Presence::Offline, Some(79), Charge::Unknown);
+    sampled(&hub, 2_101);
     // The dongle can answer an explicit read even when its radio link is down.
     steelseries_sent(hub.handle(HubInput::RefreshNow, 910_004), request);
     steelseries_sent(
@@ -675,6 +686,14 @@ fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
         steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 910_006),
         None,
     );
+    // A B0 reply that reports the headset down carries no usable level.
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 2, 0, 40, 2], 920_000),
+        None,
+    );
+    steelseries_state(&hub, Presence::Offline, Some(65), Charge::Unknown);
+    let state = &hub.snapshot()[0];
+    assert_eq!((state.updated_ms, state.source), (910_005, Source::Query));
 }
 
 #[test]
@@ -720,6 +739,7 @@ fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
         None,
     );
     steelseries_state(&hub, Presence::Offline, Some(82), Charge::Unknown);
+    assert_eq!(hub.snapshot()[0].updated_ms, 2_008, "a dock-out is not a reading");
     let offline = hub.snapshot();
     steelseries_sent(
         steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 0, 2, 3], 2_010),

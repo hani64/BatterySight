@@ -306,19 +306,26 @@ impl SteelseriesEngine {
             return Vec::new();
         }
         let charge = charge.or(self.pending_dongle_charge.take());
+        // A link change alone is not a reading: the last battery keeps its age.
+        if self.registered && (!up || (level.is_none() && charge.is_none())) {
+            return vec![Action::Presence {
+                key: self.key.clone(),
+                presence: if up {
+                    Presence::Online
+                } else {
+                    Presence::Offline
+                },
+            }];
+        }
         let mut update = DeviceUpdate {
             key: self.key.clone(),
             name: None,
             kind: None,
             via: None,
-            level: if up { level } else { None },
+            level,
             millivolts: None,
-            charge: if up { charge } else { Some(Charge::Unknown) },
-            presence: Some(if up {
-                Presence::Online
-            } else {
-                Presence::Offline
-            }),
+            charge,
+            presence: Some(Presence::Online),
             source,
         };
         if self.registered {
