@@ -3,7 +3,21 @@
 # second reader. Under 10 stars, start a review with `@coderabbitai review`.
 reviews:
   profile: chill
-  request_changes_workflow: true
+  # Request changes for blocking findings and approve once they are resolved; authors
+  # cannot approve their own PR with `@coderabbitai approve`.
+  auto_approvals:
+    enabled: true
+    allow_author_approval: false
+  auto_review:
+    # Dependency bumps are gated by CI (cargo-deny, the build and the tests).
+    ignore_usernames:
+      - "dependabot[bot]"
+  # Contributions stay written by their authors.
+  finishing_touches:
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
   path_instructions:
     - path: "crates/core/catalog/**"
       instructions: >-
@@ -23,6 +37,13 @@ reviews:
         Check handle and COM lifetimes and unsafe blocks; no blocking work on the UI thread;
         no network access.
   pre_merge_checks:
+    title:
+      mode: warning
+      requirements: >-
+        `area: lowercase summary`, where the area is what the change is about, not every
+        directory it touches: core, win, app, cli, catalog, ci, docs, or an engine (hidpp,
+        steelseries, hyperx, …). A change that rests equally on two areas names both,
+        comma-separated (`core, win: …`).
     custom_checks:
       - name: No personal data
         mode: error
@@ -35,3 +56,25 @@ reviews:
         instructions: >-
           Fail if a [[device]] entry is added or its status changed and its source does not
           hold the evidence that status needs (CONTRIBUTING.md, "Adding or fixing a device").
+  # Tools for the files this repo has: Rust (clippy skips itself because CI runs it;
+  # opengrep and ast-grep run their built-in rules), secrets (gitleaks, trufflehog),
+  # workflows (actionlint, zizmor) and CI results (github-checks). Turned off: the
+  # Markdown and YAML linters (the repo writes one line per paragraph, so they report
+  # only line length), grammar nits, PII patterns that do not occur here, and OSV, which
+  # repeats cargo-deny's advisory check on Cargo.lock.
+  tools:
+    markdownlint:
+      enabled: false
+    yamllint:
+      enabled: false
+    languagetool:
+      enabled: false
+    presidio:
+      enabled: false
+    osvScanner:
+      enabled: false
+knowledge_base:
+  code_guidelines:
+    # AGENTS.md is read automatically; CONTRIBUTING.md holds the full rules.
+    filePatterns:
+      - "CONTRIBUTING.md"
