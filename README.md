@@ -97,10 +97,10 @@ Two read-only tools help add support for a device. Both run next to a running Ba
 - `batterysight --dump > dump.txt` lists every HID collection (VID:PID, interface, usage page and usage, report lengths, the name Windows cached) and every Bluetooth device's name and whether Windows has a battery property for it.
 - `batterysight --capture 046D:C547 5 > capture.txt` records, for 1 to 60 whole minutes, the input reports of that VID:PID's vendor-defined collections, opened shared and read-only (keyboard, mouse and gamepad input is never opened). Each line holds the milliseconds since the start, a collection label (`c1`, `c2`, …) and the report bytes exactly as read.
 
-`batterysight.exe` is a Windows (GUI) program, so a console does not wait for it: in cmd the prompt returns at once and `%ERRORLEVEL%` is not its exit code. To wait for `--list`, `--dump` or `--capture` to finish (a capture runs for minutes) and to get the exit code (0 success, 1 failure, 2 wrong arguments), start it with `start /wait` in cmd or `Start-Process -Wait` in PowerShell:
+`batterysight.exe` is a Windows (GUI) program, so a console does not wait for it: in cmd the prompt returns at once and `%ERRORLEVEL%` is not its exit code. To wait for `--list`, `--dump` or `--capture` to finish (a capture runs for minutes) and to get the exit code (0 success, 1 failure, 2 wrong arguments), start it with `start /b /wait` in cmd (without `/b` its output does not reach a redirected file) or `Start-Process -Wait` in PowerShell:
 
 ```
-start /wait batterysight.exe --capture 046D:C547 5 > capture.txt
+start /b /wait batterysight.exe --capture 046D:C547 5 > capture.txt
 echo %ERRORLEVEL%
 ```
 
