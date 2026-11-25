@@ -1,7 +1,7 @@
 //! Why the session shows tray icons instead of the widget, and whether a taskbar or display
 //! change should try the widget again.
 //!
-//! Each fallback is traced (`BATTERYSIGHT_TRACE=1`) as `"<unix ms> ui fallback <reason>"`.
+//! Each fallback is traced to `sends.log` as `"<unix ms> ui fallback <reason>"`.
 
 use batterysight_win::trace::ui_line;
 
@@ -58,7 +58,7 @@ pub fn start_reason(tray_only: bool, takeover: bool, user_tray: bool) -> Option<
     }
 }
 
-/// Traces the fallback (`BATTERYSIGHT_TRACE=1` only).
+/// Traces the fallback to `sends.log`.
 pub fn trace(reason: TrayReason) {
     ui_line(&trace_text(reason));
 }

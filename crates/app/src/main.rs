@@ -25,6 +25,7 @@ use windows::core::w;
 const TAKEOVER_WAIT_MS: u32 = 10_000;
 
 fn main() {
+    batterysight_win::trace::enable();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     let instance = match dispatch(&args, SingleInstance::acquire) {
@@ -89,8 +90,9 @@ impl Drop for SingleInstance {
 }
 
 /// The steps before the UI: a command-line tool's exit code (`Ok`), otherwise the
-/// single-instance check's result, which is `None` when another instance runs. Tools come
-/// first, so they work beside a running instance and start no store, trace or audio.
+/// single-instance check's result, which is `None` when another instance runs. The CLI tools
+/// run before the single-instance check and the store, so they work beside a running
+/// instance. `--list` logs like the app; `--dump` and `--capture` add no log lines.
 fn dispatch(
     args: &[OsString],
     acquire: impl FnOnce(bool) -> Option<SingleInstance>,

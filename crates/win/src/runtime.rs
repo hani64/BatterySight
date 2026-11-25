@@ -180,7 +180,7 @@ fn device_thread(
         xbox: xbox::Source::default(),
         handover: Handover::default(),
         hid_containers: BTreeMap::new(),
-        trace: Trace::from_env(),
+        trace: Trace::open(),
         states,
         on_change,
     }

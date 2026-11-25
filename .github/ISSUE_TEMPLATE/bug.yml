@@ -39,11 +39,11 @@ body:
     attributes:
       label: Steps to reproduce
   - type: textarea
-    id: trace
+    id: log
     attributes:
-      label: Trace
+      label: Log
       description: |
-        Set the environment variable `BATTERYSIGHT_TRACE=1`, start BatterySight, reproduce the problem, exit, and paste the relevant part of `%LOCALAPPDATA%\BatterySight\sends.log`. Device ids can stay; they help debugging.
+        Press Win+R, paste `%LOCALAPPDATA%\BatterySight\sends.log`, and copy the lines from around when the problem happened (older lines are in `sends.old.log`). Device ids can stay; they help debugging.
       render: text
   - type: checkboxes
     id: privacy

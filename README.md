@@ -177,7 +177,7 @@ SteelSeries: events on Windows without SteelSeries GG, and the Nova Pro station'
 | A level looks old | Choose **Refresh now**. Bluetooth and Xbox levels are as fresh as Windows' own. |
 | Start with Windows won't stay on | Task Manager → Startup apps has BatterySight disabled; tick it again in the menu. |
 | SmartScreen blocks it | **More info → Run anyway.** |
-| Something else | Open a [bug report](https://github.com/hani64/BatterySight/issues/new/choose) with a trace: set `BATTERYSIGHT_TRACE=1`, reproduce, attach `%LOCALAPPDATA%\BatterySight\sends.log`. |
+| Something else | Open a [bug report](https://github.com/hani64/BatterySight/issues/new/choose) and copy the relevant lines from `%LOCALAPPDATA%\BatterySight\sends.log` (older lines are in `sends.old.log`). Review the lines before sharing. |
 
 <details>
 <summary>Command line and trace log</summary>
@@ -185,13 +185,15 @@ SteelSeries: events on Windows without SteelSeries GG, and the Nova Pro station'
 - `--tray-only`: tray icons instead of the widget.
 - `--list`: prints the devices found (name, connection, level, charging, key, status, `asleep`) and exits, once readings settle for 5 s (10 s at most; 8 s at least with a SteelSeries base station). The key can be a device id.
 - If the widget stops responding, BatterySight restarts itself with tray icons (after about 1.5 s, or 5 s if Explorer is busy) so it can't freeze the taskbar. It retries the widget after 15 s, 1 min and 5 min, and when Explorer restarts or displays or settings change.
-- The trace log records every report sent and received with its bytes, refused or failed requests, audio activity, devices held back after rapid replugging or failing to open, discovery retries, tray-icon fallbacks, autostart and text-rendering problems, and settings or history file errors. It is off by default and contains device ids.
+- BatterySight always writes a local troubleshooting log. At about 1 MB, `sends.log` rotates to `sends.old.log`, replacing the previous archive. `--list` writes to the log; the read-only `--dump` and `--capture` tools do not. The log records reports sent and received, refused or failed requests, audio activity, devices held back after rapid replugging or failing to open, discovery retries, tray-icon fallbacks, autostart and text-rendering problems, and settings or history file errors.
 
 </details>
 
 ## Privacy
 
 No account, no telemetry, no internet. Settings (`settings.toml`) and 30 days of history (`history.tsv`) stay in `%LOCALAPPDATA%\BatterySight`.
+
+The troubleshooting log stays on your PC unless you share it. It can contain device ids, names and report bytes, including serial-like values. Review the relevant lines before sharing them.
 
 <details>
 <summary>What the files contain</summary>

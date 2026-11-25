@@ -50,7 +50,7 @@ body:
     id: capture
     attributes:
       label: Capture
-      description: A `BATTERYSIGHT_TRACE=1` trace or a USB capture while the battery level shows or changes. Device ids can stay; they help debugging.
+      description: Lines from `%LOCALAPPDATA%\BatterySight\sends.log` or a USB capture while the battery level shows or changes. Device ids can stay; they help debugging.
       render: text
   - type: checkboxes
     id: privacy
