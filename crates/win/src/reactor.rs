@@ -56,10 +56,10 @@ pub enum OsEvent {
         bytes: Vec<u8>,
         deadline: Ms,
     },
-    /// A successful feature SET, with no report payload.
+    /// A successful correlated feature SET, with no report payload.
     FeatureSetComplete {
         collection: CollectionId,
-        id: Option<FeatureSetId>,
+        id: FeatureSetId,
         deadline: Ms,
     },
     /// A feature request was refused, failed or ran past its deadline.
@@ -242,7 +242,28 @@ impl Reactor {
     /// the HID report ID (zero for an unnumbered report). The absolute deadline is in
     /// monotonic milliseconds since boot; a cancelled operation keeps its slot until
     /// its completion is dequeued.
-    pub(crate) fn feature(
+    pub fn feature(
+        &mut self,
+        collection: CollectionId,
+        kind: ReportKind,
+        bytes: &[u8],
+        deadline: Ms,
+    ) -> bool {
+        self.submit_feature(collection, kind, bytes, deadline, None)
+    }
+
+    /// Submits a SET whose successful completion must carry the issuing engine's ID.
+    pub(crate) fn feature_set(
+        &mut self,
+        collection: CollectionId,
+        bytes: &[u8],
+        deadline: Ms,
+        id: FeatureSetId,
+    ) -> bool {
+        self.submit_feature(collection, ReportKind::SetFeature, bytes, deadline, Some(id))
+    }
+
+    fn submit_feature(
         &mut self,
         collection: CollectionId,
         kind: ReportKind,
@@ -496,11 +517,13 @@ impl Reactor {
             match (op.kind, op.result(handle)) {
                 (_, Err(error)) => Err(FeatureFailure::Completion(error.code())),
                 (Kind::SetFeature, Ok(_)) => {
-                    out.push(OsEvent::FeatureSetComplete {
-                        collection,
-                        id: feature.set_id,
-                        deadline,
-                    });
+                    if let Some(id) = feature.set_id {
+                        out.push(OsEvent::FeatureSetComplete {
+                            collection,
+                            id,
+                            deadline,
+                        });
+                    }
                     Ok(())
                 }
                 (Kind::GetFeature { report_id }, Ok(read)) => {
@@ -916,28 +939,21 @@ pub(crate) mod tests {
             (&[0x05, 1, 2, 3][..], [0x05, 1, 2, 3]),
             (&[0x00, 1][..], [0x00, 1, 0, 0]),
         ] {
-            assert!(reactor.feature(id, ReportKind::SetFeature, request, 50, None));
+            assert!(reactor.feature(id, ReportKind::SetFeature, request, 50));
             let mut pending = PendingCall::take(&reactor, id);
             let call = pending.call();
             assert_eq!((call.code, call.input_len, call.output_len), (0xb0191, 4, 0));
             assert!(call.input.is_some() && call.output.is_none());
             assert_eq!(pending.buffer(), expected);
             pending.complete(0, 0); // A successful SET transfers no output.
-            assert_eq!(
-                reactor.wait(Some(0), 0),
-                [OsEvent::FeatureSetComplete {
-                    collection: id,
-                    id: None,
-                    deadline: 50,
-                }]
-            );
+            assert!(reactor.wait(Some(0), 0).is_empty());
         }
 
         for (report_id, expected) in [
             (0x07, &[0x07, 0xAB, 0xCD][..]),
             (0x00, &[0x00, 0xAB, 0xCD, 0xEF][..]),
         ] {
-            assert!(reactor.feature(id, ReportKind::GetFeature, &[report_id], 50, None));
+            assert!(reactor.feature(id, ReportKind::GetFeature, &[report_id], 50));
             let pending = PendingCall::take(&reactor, id);
             let call = pending.call();
             assert_eq!((call.code, call.input_len, call.output_len), (0xb0192, 0, 4));
@@ -961,7 +977,7 @@ pub(crate) mod tests {
             grant: batterysight_core::scheduler::GrantId(3),
             issued_ms: 10,
         };
-        assert!(reactor.feature(id, ReportKind::SetFeature, &[0, 1], 1_000, Some(set_id)));
+        assert!(reactor.feature_set(id, &[0, 1], 1_000, set_id));
         let mut pending = PendingCall::take(&reactor, id);
 
         FEATURE_NOW.set(Some(450));
@@ -971,18 +987,18 @@ pub(crate) mod tests {
             reactor.wait(Some(0), 450),
             [OsEvent::FeatureSetComplete {
                 collection: id,
-                id: Some(set_id),
+                id: set_id,
                 deadline: 1_000,
             }]
         );
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[0], 1_000, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[0], 1_000));
         PendingCall::take(&reactor, id).reply(&[0, 1, 2, 3], 3);
         assert_eq!(
             reactor.wait(Some(0), 450),
             [feature_reply(id, &[0, 1, 2, 3], 1_000)]
         );
 
-        assert!(reactor.feature(id, ReportKind::SetFeature, &[0, 1], 1_000, Some(set_id)));
+        assert!(reactor.feature_set(id, &[0, 1], 1_000, set_id));
         PendingCall::take(&reactor, id).complete(STATUS_CANCELLED.0 as usize, 0);
         assert_eq!(
             reactor.wait(Some(0), 450),
@@ -992,7 +1008,7 @@ pub(crate) mod tests {
                 FeatureFailure::Completion(ERROR_OPERATION_ABORTED.to_hresult()),
             )]
         );
-        assert!(reactor.feature(id, ReportKind::SetFeature, &[0, 1], 1_000, Some(set_id)));
+        assert!(reactor.feature_set(id, &[0, 1], 1_000, set_id));
         let mut timed_out = PendingCall::take(&reactor, id);
         FEATURE_NOW.set(Some(1_000));
         assert_eq!(
@@ -1023,7 +1039,7 @@ pub(crate) mod tests {
             (id, ReportKind::GetFeature, &[3, 1, 2, 3, 4][..], 50),
             (id, ReportKind::GetFeature, &[3][..], 10),
         ] {
-            assert!(!reactor.feature(collection, kind, bytes, deadline, None));
+            assert!(!reactor.feature(collection, kind, bytes, deadline));
             assert!(FEATURE_CALL.get().is_none());
             assert_eq!(
                 reactor.wait(Some(0), 0),
@@ -1032,7 +1048,7 @@ pub(crate) mod tests {
         }
 
         FEATURE_STATUS.set(STATUS_ACCESS_DENIED);
-        assert!(!reactor.feature(id, ReportKind::SetFeature, &[3], 50, None));
+        assert!(!reactor.feature(id, ReportKind::SetFeature, &[3], 50));
         assert_eq!(
             reactor.wait(Some(0), 0),
             [feature_failed(
@@ -1051,7 +1067,7 @@ pub(crate) mod tests {
             (0, 0, 4),
             (0, 1, 3),
         ] {
-            assert!(reactor.feature(id, ReportKind::GetFeature, &[requested_id], 50, None));
+            assert!(reactor.feature(id, ReportKind::GetFeature, &[requested_id], 50));
             PendingCall::take(&reactor, id).reply(&[reply_id], transferred);
             assert_eq!(
                 reactor.wait(Some(0), 0),
@@ -1059,7 +1075,7 @@ pub(crate) mod tests {
             );
         }
 
-        assert!(reactor.feature(id, ReportKind::SetFeature, &[3], 50, None));
+        assert!(reactor.feature(id, ReportKind::SetFeature, &[3], 50));
         PendingCall::take(&reactor, id).complete(STATUS_CANCELLED.0 as usize, 0);
         assert_eq!(
             reactor.wait(Some(0), 0),
@@ -1081,7 +1097,7 @@ pub(crate) mod tests {
 
         // Do not post or touch the captured pointer until the reactor confirms it
         // retained the operation. The pre-fix false result means the allocation is gone.
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50));
         let mut pending = PendingCall::take(&reactor, id);
         pending.complete(STATUS_DEVICE_BUSY.0 as usize, 0);
         assert_eq!(
@@ -1112,9 +1128,9 @@ pub(crate) mod tests {
         let mut reactor = feature_reactor(Some(10));
         reactor.open(GroupId(1), &pipe, true, true).unwrap();
         reactor.open(GroupId(2), &other, false, true).unwrap();
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50));
         let old = PendingCall::take(&reactor, id);
-        assert!(reactor.feature(other_id, ReportKind::GetFeature, &[5], 100, None));
+        assert!(reactor.feature(other_id, ReportKind::GetFeature, &[5], 100));
         let unrelated = PendingCall::take(&reactor, other_id);
 
         FEATURE_NOW.set(Some(50));
@@ -1130,7 +1146,7 @@ pub(crate) mod tests {
             );
         });
         assert_eq!(old.buffer(), [3, 0, 0, 0]);
-        assert!(!reactor.feature(id, ReportKind::GetFeature, &[3], 100, None));
+        assert!(!reactor.feature(id, ReportKind::GetFeature, &[3], 100));
         assert!(FEATURE_CALL.get().is_none());
         assert_eq!(
             reactor.wait(Some(0), 0),
@@ -1145,7 +1161,7 @@ pub(crate) mod tests {
             reactor.wait(Some(0), 0),
             [feature_reply(other_id, &[5, 9], 100)]
         );
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 100, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 100));
         PendingCall::take(&reactor, id).reply(&[3, 1], 2);
         assert_eq!(reactor.wait(Some(0), 0), [feature_reply(id, &[3, 1], 100)]);
     }
@@ -1158,7 +1174,7 @@ pub(crate) mod tests {
         reactor.open(GroupId(1), &pipe, false, true).unwrap();
         let start = Instant::now();
         let at = clock_ms() + 80;
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], at, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], at));
         let _pending = PendingCall::take(&reactor, id);
         // Keep a distant caller deadline as a backstop; it must not be the one that wakes us.
         let events = loop {
@@ -1183,7 +1199,7 @@ pub(crate) mod tests {
         successor.collection.id = id;
         let mut reactor = feature_reactor(Some(10));
         reactor.open(GroupId(1), &pipe, false, true).unwrap();
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50));
         let old = PendingCall::take(&reactor, id);
         let old_handle = reactor.opens[&id].handle.0;
         reactor.close_group(GroupId(1));
@@ -1191,11 +1207,11 @@ pub(crate) mod tests {
         assert_eq!(old.buffer(), [3, 0, 0, 0]);
 
         reactor.open(GroupId(2), &successor, false, true).unwrap();
-        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50, None));
+        assert!(reactor.feature(id, ReportKind::GetFeature, &[3], 50));
         let new = PendingCall::take(&reactor, id);
         old.reply(&[3, 0xAA], 2);
         assert!(reactor.wait(Some(0), 0).is_empty());
-        assert!(!reactor.feature(id, ReportKind::GetFeature, &[3], 50, None));
+        assert!(!reactor.feature(id, ReportKind::GetFeature, &[3], 50));
         assert_eq!(
             reactor.wait(Some(0), 0),
             [feature_failed(id, ReportKind::GetFeature, FeatureFailure::Rejected)]

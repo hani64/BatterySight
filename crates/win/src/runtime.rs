@@ -387,9 +387,7 @@ impl Device {
                 deadline,
             } => {
                 let now = now_ms();
-                if now < deadline
-                    && let Some(id) = id
-                {
+                if now < deadline {
                     self.feed(HubInput::FeatureSetComplete { collection, id }, now);
                 }
                 false
@@ -749,19 +747,23 @@ impl Device {
                     deadline,
                     set_id,
                 } => {
-                    let (started, direction) = match (kind, deadline) {
-                        (ReportKind::Output, _) => {
+                    let (started, direction) = match (kind, deadline, set_id) {
+                        (ReportKind::Output, _, _) => {
                             (self.reactor.write(collection, &bytes), Direction::Out)
                         }
-                        (ReportKind::SetFeature, Some(at)) => (
-                            self.reactor.feature(collection, kind, &bytes, at, set_id),
+                        (ReportKind::SetFeature, Some(at), Some(id)) => (
+                            self.reactor.feature_set(collection, &bytes, at, id),
                             Direction::FeatureSet,
                         ),
-                        (ReportKind::GetFeature, Some(at)) => (
-                            self.reactor.feature(collection, kind, &bytes, at, None),
+                        (ReportKind::SetFeature, Some(at), None) => (
+                            self.reactor.feature(collection, kind, &bytes, at),
+                            Direction::FeatureSet,
+                        ),
+                        (ReportKind::GetFeature, Some(at), _) => (
+                            self.reactor.feature(collection, kind, &bytes, at),
                             Direction::FeatureGet,
                         ),
-                        (_, None) => unreachable!("admitted feature requests have a deadline"),
+                        (_, None, _) => unreachable!("admitted feature requests have a deadline"),
                     };
                     if started
                         && let Some(trace) = &mut self.trace
