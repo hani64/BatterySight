@@ -12,9 +12,11 @@ use batterysight_core::model::{Charge, CoarseLevel, Level, Presence};
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FillRect, GetTextExtentPoint32W,
-    GetTextMetricsW, HDC, IntersectClipRect, LineTo, MoveToEx, PS_SOLID, Polyline, RestoreDC,
-    SaveDC, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT, TextOutW,
+    GetTextMetricsW, HDC, IntersectClipRect, LineTo, MoveToEx, PS_DOT, PS_SOLID, Polyline,
+    RestoreDC, SaveDC, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT, TextOutW,
 };
+
+use super::dwrite::Stroke;
 
 /// Percent lines across the chart; the first, middle and last are labelled.
 const GRID: [u8; 5] = [0, 25, 50, 75, 100];
@@ -25,6 +27,9 @@ const NO_DATA: &str = "No readings in this period";
 struct Plot {
     /// Lines through the samples of stretches the device was awake; one point alone is a dot.
     lines: Vec<Vec<(u64, u8)>>,
+    /// From where a line ended as the device fell asleep to where the next began as it woke,
+    /// drawn dashed: its battery barely moves while it sleeps.
+    bridges: Vec<((u64, u8), (u64, u8))>,
     /// `(from, to)` while charging.
     charging: Vec<(u64, u64)>,
     /// Whether anything is drawn in the window (the sample carried in from before it alone
@@ -32,12 +37,32 @@ struct Plot {
     drawn: bool,
 }
 
+/// The longest stretch nothing was observed (the device offline, BatterySight restarting)
+/// that does not break a line: a quick restart is not a gap worth showing.
+const SHORT_GAP_MS: u64 = 5 * 60_000;
+
+/// The most a level may change across a sleep for the sleep to be bridged: more (a device
+/// charged while switched off, say) leaves a gap, as no line can show how it got there.
+const BRIDGE_MAX_CHANGE: u8 = 5;
+
+/// Why the last line ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The device fell asleep (and nothing else happened since).
+    Asleep,
+    /// Nothing was observed: the device went offline, had no level, or BatterySight or the
+    /// PC stopped.
+    Unobserved,
+}
+
 /// The plot of `samples` (in time order) from `from` to `now`. It starts with the last
 /// sample before `from`, so a line enters from the left edge. A line runs from a sample on
 /// only while the device is awake and has a level; a sample asleep or offline (a session
 /// break too) ends the line at its level, and draws nothing until the device is awake
-/// again. A [`provisional`] wake reading draws no point. An awake charging sample shades
-/// the time until the next sample (or now, for the latest).
+/// again. A line that ended as the device fell asleep is bridged to the next ([`Plot`]);
+/// one that ended unobserved continues if the next starts within [`SHORT_GAP_MS`], and
+/// otherwise leaves a gap. A [`provisional`] wake reading draws no point. An awake
+/// charging sample shades the time until the next sample (or now, for the latest).
 fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     let end = samples.partition_point(|s| s.at_unix_ms <= now);
     let start = samples[..end]
@@ -46,6 +71,8 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
     let shown = &samples[start..end];
     let mut plot = Plot::default();
     let mut line = Vec::new();
+    // Why the last finished line ended, until the next one starts.
+    let mut ended: Option<Ended> = None;
     for (i, s) in shown.iter().enumerate() {
         let awake = s.presence == Presence::Online;
         let point = if provisional(&samples[..end], start + i) {
@@ -54,11 +81,40 @@ fn plot(samples: &[Sample], from: u64, now: u64) -> Plot {
             s.level.map(height)
         };
         match point {
-            Some(h) if awake || !line.is_empty() => line.push((s.at_unix_ms, h)),
+            Some(h) if awake || !line.is_empty() => {
+                if line.is_empty() {
+                    let last = plot.lines.last().and_then(|l| l.last()).copied();
+                    match (ended.take(), last) {
+                        (Some(Ended::Asleep), Some(last))
+                            if last.1.abs_diff(h) <= BRIDGE_MAX_CHANGE =>
+                        {
+                            plot.bridges.push((last, (s.at_unix_ms, h)));
+                        }
+                        (Some(Ended::Unobserved), Some(last))
+                            if s.at_unix_ms - last.0 <= SHORT_GAP_MS =>
+                        {
+                            line = plot.lines.pop().unwrap_or_default();
+                        }
+                        _ => {}
+                    }
+                }
+                line.push((s.at_unix_ms, h));
+            }
             _ => {}
         }
-        if (!awake || s.level.is_none()) && !line.is_empty() {
-            plot.lines.push(std::mem::take(&mut line));
+        if !awake || s.level.is_none() {
+            let why = if s.presence == Presence::Asleep && s.level.is_some() {
+                Ended::Asleep
+            } else {
+                Ended::Unobserved
+            };
+            if !line.is_empty() {
+                plot.lines.push(std::mem::take(&mut line));
+                ended = Some(why);
+            } else if ended.is_some() && why == Ended::Unobserved {
+                // Asleep, then unobserved too: nothing is known about the time between.
+                ended = Some(Ended::Unobserved);
+            }
         }
         if awake && s.charge == Charge::Charging {
             let to = shown.get(i + 1).map_or(now, |next| next.at_unix_ms);
@@ -140,6 +196,11 @@ fn columns(plot: &Plot, x: impl Fn(u64) -> i32, left: i32, right: i32) -> Column
             _ => out.charging.push((from, to)),
         }
     }
+    out.bridges = plot
+        .bridges
+        .iter()
+        .map(|&((a, p), (b, q))| ((x(a), p), (x(b), q)))
+        .collect();
     out
 }
 
@@ -148,6 +209,8 @@ fn columns(plot: &Plot, x: impl Fn(u64) -> i32, left: i32, right: i32) -> Column
 struct Columns {
     /// (column, percent) per line.
     lines: Vec<Vec<(i32, u8)>>,
+    /// The plot's bridges, (column, percent) at each end.
+    bridges: Vec<((i32, u8), (i32, u8))>,
     /// (first column, end column) while charging.
     charging: Vec<(i32, i32)>,
 }
@@ -176,9 +239,12 @@ const COLORS: Colors = Colors {
     background: rgb(255, 255, 255),
     grid: rgb(229, 229, 229),
     text: rgb(96, 96, 96),
-    line: rgb(0, 103, 192),
+    line: rgb(LINE_RGB[0], LINE_RGB[1], LINE_RGB[2]),
     charging: rgb(223, 246, 221),
 };
+
+/// The line's colour; also [`COLORS`]'s.
+const LINE_RGB: [u8; 3] = [0, 103, 192];
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
@@ -258,31 +324,60 @@ pub fn paint(dc: HDC, rect: RECT, samples: &[Sample], window: Duration) {
             );
         }
 
-        IntersectClipRect(
-            dc,
-            area.left,
-            area.top - thick,
-            area.right + thick,
-            area.bottom + thick,
-        );
+        // Lines may reach above 100 % and below 0 % by their own width, and never left of
+        // the area into the labels.
+        let bounds = RECT {
+            left: area.left,
+            top: area.top - thick,
+            right: area.right + thick,
+            bottom: area.bottom + thick,
+        };
+        let at = |x: i32, p: u8| ((x - bounds.left) as f32, (y(p) - bounds.top) as f32);
+        let strokes: Vec<Stroke> = columns
+            .bridges
+            .iter()
+            .map(|&((x0, p0), (x1, p1))| Stroke {
+                points: vec![at(x0, p0), at(x1, p1)],
+                dashed: true,
+            })
+            .chain(columns.lines.iter().map(|line| Stroke {
+                points: line.iter().map(|&(x, p)| at(x, p)).collect(),
+                dashed: false,
+            }))
+            .collect();
+        // Antialiased by Direct2D; GDI draws them when it cannot.
+        let width = text_h as f32 / 7.0;
+        let smooth =
+            super::dwrite::with(|e| e.stroke(dc, bounds, &strokes, LINE_RGB, width).map(Some))
+                .is_some();
+        IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
         let line_pen = CreatePen(PS_SOLID, thick, colors.line);
+        let bridge_pen = CreatePen(PS_DOT, 1, colors.line);
         let dot_brush = CreateSolidBrush(colors.line);
-        SelectObject(dc, line_pen.into());
-        SelectObject(dc, dot_brush.into());
-        for line in &columns.lines {
-            let points: Vec<POINT> = line.iter().map(|&(x, p)| POINT { x, y: y(p) }).collect();
-            if let [dot] = points[..] {
-                // A reading alone: a filled dot of diameter 2 × the line's thickness + 1,
-                // in the line's colour.
-                let r = thick;
-                let _ = Ellipse(dc, dot.x - r, dot.y - r, dot.x + r + 1, dot.y + r + 1);
-            } else {
-                let _ = Polyline(dc, &points);
+        if !smooth {
+            SelectObject(dc, bridge_pen.into());
+            for &((x0, p0), (x1, p1)) in &columns.bridges {
+                let _ = MoveToEx(dc, x0, y(p0), None);
+                let _ = LineTo(dc, x1, y(p1));
+            }
+            SelectObject(dc, line_pen.into());
+            SelectObject(dc, dot_brush.into());
+            for line in &columns.lines {
+                let points: Vec<POINT> = line.iter().map(|&(x, p)| POINT { x, y: y(p) }).collect();
+                if let [dot] = points[..] {
+                    // A reading alone: a filled dot of diameter 2 × the line's thickness
+                    // + 1, in the line's colour.
+                    let r = thick;
+                    let _ = Ellipse(dc, dot.x - r, dot.y - r, dot.x + r + 1, dot.y + r + 1);
+                } else {
+                    let _ = Polyline(dc, &points);
+                }
             }
         }
         let _ = RestoreDC(dc, saved);
         let _ = DeleteObject(grid_pen.into());
         let _ = DeleteObject(line_pen.into());
+        let _ = DeleteObject(bridge_pen.into());
         let _ = DeleteObject(dot_brush.into());
     }
 }
@@ -381,6 +476,59 @@ mod tests {
                 vec![(at(60), 84)],
             ]
         );
+    }
+
+    fn restart(at: u64) -> Sample {
+        Sample::session_break(DeviceKey("logi:4082:1".into()), T + at * MIN)
+    }
+
+    #[test]
+    fn a_sleep_is_bridged_to_the_next_wake() {
+        let samples = [on(10, 90), asleep(30, 88), on(60, 87), on(70, 86)];
+        let p = plot(&samples, at(0), at(80));
+        assert_eq!(
+            p.lines,
+            [
+                vec![(at(10), 90), (at(30), 88)],
+                vec![(at(60), 87), (at(70), 86)],
+            ]
+        );
+        assert_eq!(p.bridges, [((at(30), 88), (at(60), 87))]);
+    }
+
+    #[test]
+    fn a_sleep_that_changed_the_level_much_is_not_bridged() {
+        // Switched off at 78 % and charged while off: no line can say how it got to 100 %.
+        let samples = [on(10, 78), asleep(20, 78), on(600, 100)];
+        let p = plot(&samples, at(0), at(610));
+        assert_eq!(p.lines.len(), 2);
+        assert!(p.bridges.is_empty());
+    }
+
+    #[test]
+    fn a_quick_restart_does_not_break_the_line() {
+        // BatterySight restarted within a few minutes: the line goes on.
+        let samples = [on(10, 90), on(20, 89), restart(23), on(23, 89), on(30, 88)];
+        let p = plot(&samples, at(0), at(40));
+        assert_eq!(
+            p.lines,
+            [vec![(at(10), 90), (at(20), 89), (at(23), 89), (at(30), 88)]]
+        );
+        assert!(p.bridges.is_empty());
+    }
+
+    #[test]
+    fn unobserved_stretches_stay_gaps() {
+        // The PC was off for an hour: nothing is known about that time.
+        let off = [on(10, 90), restart(11), on(70, 85)];
+        let p = plot(&off, at(0), at(80));
+        assert_eq!(p.lines, [vec![(at(10), 90)], vec![(at(70), 85)]]);
+        assert!(p.bridges.is_empty());
+        // Asleep, then BatterySight or the PC stopped: the sleep is not bridged either.
+        let slept_then_off = [on(10, 90), asleep(20, 89), restart(30), on(90, 80)];
+        let p = plot(&slept_then_off, at(0), at(100));
+        assert_eq!(p.lines.len(), 2);
+        assert!(p.bridges.is_empty());
     }
 
     #[test]
@@ -535,6 +683,7 @@ mod tests {
                 vec![(21, 69)],
                 vec![(40, 60)],
             ],
+            bridges: Vec::new(),
             charging: vec![(0, 3), (5, 12), (14, 16), (30, 200)],
             drawn: true,
         };
