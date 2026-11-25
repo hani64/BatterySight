@@ -18,9 +18,8 @@ use windows::Win32::Devices::Bluetooth::{
 };
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GETIDLIST_FILTER_NONE, CM_Get_DevNode_PropertyW, CM_Get_Device_ID_List_SizeW,
-    CM_Get_Device_ID_ListW, CM_LOCATE_DEVNODE_FLAGS, CM_LOCATE_DEVNODE_NORMAL,
-    CM_LOCATE_DEVNODE_PHANTOM, CM_Locate_DevNodeW, CR_BUFFER_SMALL, CR_NO_SUCH_DEVNODE,
-    CR_NO_SUCH_VALUE, CR_SUCCESS,
+    CM_Get_Device_ID_ListW, CM_LOCATE_DEVNODE_FLAGS, CM_LOCATE_DEVNODE_PHANTOM, CM_Locate_DevNodeW,
+    CR_BUFFER_SMALL, CR_NO_SUCH_DEVNODE, CR_NO_SUCH_VALUE, CR_SUCCESS,
 };
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_FriendlyName, DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_BYTE, DEVPROP_TYPE_STRING,
@@ -47,6 +46,8 @@ const CLASS_OF_DEVICE: DEVPROPKEY = DEVPROPKEY {
 };
 
 const CONNECT_FOLLOW_UP_MS: Ms = 4_000;
+/// BLE batteries were observed to settle about 8 s after connect; read again after that.
+const CONNECT_SETTLE_MS: Ms = 15_000;
 const CONNECTED_REREAD_MS: Ms = 60_000;
 
 /// One Bluetooth container, with presence independent of its cached battery value.
@@ -88,7 +89,6 @@ enum NodeRole {
     ClassicPeer,
     LePeer,
     HandsFree,
-    Hogp,
 }
 
 impl NodeRole {
@@ -114,7 +114,6 @@ struct Group {
     class: Option<DeviceKind>,
     classic: bool,
     le: bool,
-    hogp: Option<bool>,
     hands_free: bool,
     hfp_level: Option<u8>,
     le_level: Option<u8>,
@@ -152,10 +151,6 @@ impl Group {
                 self.hands_free = true;
                 &mut self.hfp_level
             }
-            NodeRole::Hogp => {
-                self.hogp = Some(self.hogp.unwrap_or(false) || node.connected);
-                &mut self.other_level
-            }
             NodeRole::Other => &mut self.other_level,
         };
         if let Some(value) = node.level {
@@ -165,9 +160,9 @@ impl Group {
     }
 
     fn observation(self, container: ContainerId) -> Observation {
-        // For installed BLE HID devices the HOGP node, not the persistent peer node,
-        // indicates presence. For Classic use the peer, not the HFP profile's own flag.
-        let le_connected = self.hogp.unwrap_or(self.le);
+        // Only the peer (`DEV_`) node's IsConnected tells presence, for Classic and LE
+        // alike: the HOGP service node stays present while a paired pad is off.
+        let le_connected = self.le;
         let level = if le_connected && !self.classic {
             self.le_level.or(self.hfp_level)
         } else {
@@ -213,8 +208,6 @@ fn node_role(id: &[u16]) -> Option<NodeRole> {
         Some(NodeRole::LePeer)
     } else if starts_with(id, br"BTHENUM\{0000111E-0000-1000-8000-00805F9B34FB}") {
         Some(NodeRole::HandsFree)
-    } else if starts_with(id, br"BTHLEDEVICE\{00001812-0000-1000-8000-00805F9B34FB}") {
-        Some(NodeRole::Hogp)
     } else if [br"BTHENUM\".as_slice(), br"BTHLE\", br"BTHLEDEVICE\"]
         .into_iter()
         .any(|prefix| starts_with(id, prefix))
@@ -254,8 +247,8 @@ fn read_groups(metadata_only: bool) -> Result<BTreeMap<ContainerId, Group>> {
         .take_while(|id| id.len() > 1)
     {
         let Some(role) = node_role(id) else { continue };
-        // PHANTOM includes installed but absent nodes, for cached metadata and to recognize
-        // an absent HOGP service. It does not request a device start or re-enumeration.
+        // PHANTOM includes installed but absent nodes, for cached metadata. It does not
+        // request a device start or re-enumeration.
         let Some(node) = locate(id, CM_LOCATE_DEVNODE_PHANTOM)? else {
             continue;
         };
@@ -283,8 +276,6 @@ fn read_groups(metadata_only: bool) -> Result<BTreeMap<ContainerId, Group>> {
                 if property(node, &CLASS_OF_DEVICE, &mut class)? == Some((DEVPROP_TYPE_UINT32, 4)) {
                     entry.kind = device_kind(u32::from_le_bytes(class));
                 }
-            } else if role == NodeRole::Hogp {
-                entry.connected = locate(id, CM_LOCATE_DEVNODE_NORMAL)?.is_some();
             }
         }
         add_node(&mut groups, entry);
@@ -393,13 +384,39 @@ pub(crate) fn container_of(key: &DeviceKey) -> Option<ContainerId> {
     Some(u128::from_str_radix(hex, 16).ok()?.to_be_bytes())
 }
 
+/// One connect follow-up delay, coalesced: the first event's deadline is kept and every
+/// later event is covered by at most one trailing deadline (the newest event's).
+#[derive(Default)]
+struct FollowUp {
+    next: Option<Ms>,
+    trailing: Option<Ms>,
+}
+
+impl FollowUp {
+    fn request(&mut self, at: Ms) {
+        match self.next {
+            Some(first) if at > first => self.trailing = Some(at),
+            Some(_) => {}
+            None => self.next = Some(at),
+        }
+    }
+
+    fn take_due(&mut self, now: Ms) -> bool {
+        let due = self.next.is_some_and(|at| at <= now);
+        if due {
+            self.next = self.trailing.take().filter(|&at| at > now);
+        }
+        due
+    }
+}
+
 /// Runtime state of this source. Neither visibility nor HID ownership affects its sampling.
 #[derive(Default)]
 pub(crate) struct Source {
     active: BTreeSet<ContainerId>,
     requested: bool,
-    delayed: Option<Ms>,
-    trailing: Option<Ms>,
+    /// Scans 4 s and 15 s after connect events; never periodic while idle.
+    follow_ups: [FollowUp; 2],
     periodic: Option<Ms>,
 }
 
@@ -407,15 +424,12 @@ impl Source {
     pub(crate) fn request(&mut self, now: Ms, follow_up: bool) {
         self.requested = true;
         if follow_up {
-            let at = now.saturating_add(CONNECT_FOLLOW_UP_MS);
-            // Keep the first follow-up, then cover every later connection with
-            // at most one trailing scan at the newest connection's deadline.
-            if let Some(first) = self.delayed {
-                if at > first {
-                    self.trailing = Some(at);
-                }
-            } else {
-                self.delayed = Some(at);
+            for (slot, delay) in self
+                .follow_ups
+                .iter_mut()
+                .zip([CONNECT_FOLLOW_UP_MS, CONNECT_SETTLE_MS])
+            {
+                slot.request(now.saturating_add(delay));
             }
         }
     }
@@ -424,16 +438,15 @@ impl Source {
         self.requested
             .then_some(0)
             .into_iter()
-            .chain(self.delayed)
+            .chain(self.follow_ups.iter().filter_map(|slot| slot.next))
             .chain(self.periodic)
             .min()
     }
 
     pub(crate) fn take_due(&mut self, now: Ms) -> bool {
         let mut due = std::mem::take(&mut self.requested);
-        if self.delayed.is_some_and(|at| at <= now) {
-            self.delayed = self.trailing.take().filter(|&at| at > now);
-            due = true;
+        for slot in &mut self.follow_ups {
+            due |= slot.take_due(now);
         }
         if self.periodic.is_some_and(|at| at <= now) {
             // Preserve a connected-only deadline if the next scan fails.
@@ -451,7 +464,7 @@ impl Source {
     ) -> Vec<HubInput> {
         let Ok(observed) = scan else {
             // Retry a failed scan unless one is already due; a success while idle ends this.
-            if self.delayed.is_none() {
+            if self.follow_ups.iter().all(|slot| slot.next.is_none()) {
                 self.periodic
                     .get_or_insert(now.saturating_add(CONNECTED_REREAD_MS));
             }
@@ -570,24 +583,43 @@ mod tests {
     }
 
     #[test]
-    fn present_hogp_links_to_le_peer_battery_without_using_peer_presence() {
-        let peer = || Node {
-            container: ID,
-            role: NodeRole::LePeer,
-            level: Some(34),
-            ..Node::default()
+    fn present_hogp_service_does_not_make_an_off_le_peer_connected() {
+        let hogp_id: Vec<u16> = r"BTHLEDEVICE\{00001812-0000-1000-8000-00805F9B34FB}_DEV_X"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let group = |peer_connected| {
+            group_nodes([
+                Node {
+                    container: ID,
+                    role: NodeRole::LePeer,
+                    connected: peer_connected,
+                    level: Some(59),
+                    ..Node::default()
+                },
+                // Hardware shows the HOGP devnode still present while the pad is off.
+                Node {
+                    container: ID,
+                    role: node_role(&hogp_id).unwrap(),
+                    connected: true,
+                    ..Node::default()
+                },
+            ])
         };
-        let hogp = Node {
-            container: ID,
-            role: NodeRole::Hogp,
-            connected: true,
-            ..Node::default()
-        };
-        assert!(!group_nodes([peer()])[0].connected);
-        let nodes = group_nodes([peer(), hogp]);
-        assert_eq!(nodes.len(), 1);
-        assert!(nodes[0].connected);
-        assert_eq!(nodes[0].level, Some(34));
+        assert!(!group(false)[0].connected);
+        assert!(group(true)[0].connected);
+
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
+        let mut source = Source::default();
+        assert!(source.reconcile(Ok(group(false)), 0, &hub).is_empty());
+        assert!(matches!(
+            &source.reconcile(Ok(group(true)), 1, &hub)[..],
+            [HubInput::System(_)]
+        ));
+        assert!(matches!(
+            &source.reconcile(Ok(group(false)), 2, &hub)[..],
+            [HubInput::SystemGone(_)]
+        ));
     }
 
     #[test]
@@ -660,7 +692,33 @@ mod tests {
         assert!(!source.take_due(7_899));
         assert!(source.take_due(7_900));
         source.reconcile(Ok(classic(false, Some(99))), 7_900, &hub);
+        // The settle follow-ups after the first and the last connection event.
+        assert_eq!(source.deadline(), Some(15_000));
+        assert!(source.take_due(15_000));
+        source.reconcile(Ok(classic(false, Some(99))), 15_000, &hub);
+        assert_eq!(source.deadline(), Some(18_900));
+        assert!(source.take_due(18_900));
+        source.reconcile(Ok(classic(false, Some(99))), 18_900, &hub);
         assert_eq!(source.deadline(), None);
+    }
+
+    #[test]
+    fn ble_connect_gets_a_settle_scan_after_the_four_second_one() {
+        let mut source = Source::default();
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
+        source.request(0, true);
+        assert!(source.take_due(0));
+        source.reconcile(Ok(classic(false, Some(59))), 0, &hub);
+        assert_eq!(source.deadline(), Some(4_000));
+        assert!(source.take_due(4_000));
+        // A transient value at 4 s; the settled one arrives about 8 s after connect.
+        source.reconcile(Ok(classic(true, Some(50))), 4_000, &hub);
+        assert_eq!(source.deadline(), Some(15_000));
+        assert!(!source.take_due(14_999));
+        assert!(source.take_due(15_000));
+        source.reconcile(Ok(classic(true, Some(68))), 15_000, &hub);
+        // Only the connected-only reread remains.
+        assert_eq!(source.deadline(), Some(64_000));
     }
 
     #[test]
@@ -680,6 +738,9 @@ mod tests {
             &source.reconcile(Ok(classic(true, Some(75))), 4_020, &hub)[..],
             [HubInput::System(_)]
         ));
+        assert_eq!(source.deadline(), Some(15_020));
+        assert!(source.take_due(15_020));
+        source.reconcile(Ok(classic(true, Some(75))), 15_020, &hub);
         assert_eq!(source.deadline(), Some(64_020));
         assert!(source.take_due(64_020));
         source.reconcile(
