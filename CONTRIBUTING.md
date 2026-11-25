@@ -92,13 +92,11 @@ source = "Solaar lib/logitech_receiver/descriptors.py (wpid 4093); owner hardwar
 
 A change to an engine's behaviour needs a replay test. HID++ transcripts live in `crates/core/tests/fixtures/hidpp/` and are replayed by `crates/core/tests/hidpp_replay.rs`; the other engines replay frames taken from their source or a capture in `crates/core/tests/vendor_replay.rs`.
 
-## Traces for bug reports
+## Logs for bug reports
 
-1. Set the environment variable `BATTERYSIGHT_TRACE=1`, start BatterySight, reproduce the problem, then exit.
-2. The trace is `%LOCALAPPDATA%\BatterySight\sends.log`.
+1. Reproduce the problem in BatterySight.
+2. Open `%LOCALAPPDATA%\BatterySight\sends.log` and copy the lines from around when the problem happened. Older lines are in `sends.old.log`.
 3. Before sharing it, check it holds no user name or local path. Device ids (unit ids, serial numbers, interface paths, audio container ids) can stay: they help debugging.
-
-If `BATTERYSIGHT_TRACE` is set for your whole user account, `cargo test` appends to the same `sends.log`; unset it while running tests.
 
 ## Pull requests
 

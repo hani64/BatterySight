@@ -25,6 +25,7 @@ use windows::core::w;
 const TAKEOVER_WAIT_MS: u32 = 10_000;
 
 fn main() {
+    batterysight_win::trace::enable();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     let instance = match dispatch(&args, SingleInstance::acquire) {
