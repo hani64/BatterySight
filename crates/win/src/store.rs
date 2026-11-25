@@ -4,7 +4,7 @@
 //! runs on one writer thread: callers only send ([`Store::save_settings`],
 //! [`Store::append_history`], [`Store::run`]), so the UI thread never waits on the disk.
 //! The blocking reads, [`Store::load_settings`] and [`Store::load_history`], happen at
-//! startup before any window exists. A failed write is traced (`BATTERYSIGHT_TRACE`) and
+//! startup before any window exists. A failed write is traced to `sends.log` and
 //! otherwise ignored: the app keeps its in-memory settings, and the next save writes the
 //! whole file again. An existing settings file is never replaced unless it was read and
 //! parsed: otherwise the first save sets it aside as `settings.toml.bad`. History lines are

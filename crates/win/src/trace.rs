@@ -1,8 +1,8 @@
-//! Opt-in log of every report the runtime sends and reads, of audio activity, of groups
-//! held back or given up and of UI events.
+//! Troubleshooting log of every report the runtime sends and reads, of audio activity, of
+//! groups held back or given up and of UI events.
 //!
-//! With `BATTERYSIGHT_TRACE=1`, each write the reactor started and each input report read
-//! is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
+//! The app enables tracing at startup. Each write the reactor started and each input report
+//! read is appended to `%LOCALAPPDATA%\BatterySight\sends.log` as
 //! `"<unix ms> <out|in> <collection id> <hex>"`, written on the device thread, which also
 //! adds `"<unix ms> audio <container hex> active|idle"` when a device's audio sessions start
 //! or stop (`"<unix ms> audio unavailable <stage>"` when they cannot be watched),
@@ -18,15 +18,16 @@
 //! The UI adds `"<unix ms> ui <text>"` lines ([`ui_line`]) and the settings and history
 //! store `"<unix ms> store <text>"` lines when a file cannot be read or written or is set
 //! aside. Tracing only records what the runtime already does, so it adds no device
-//! traffic, and it never fails the app: an unwritable file just means no trace.
+//! traffic, and it never fails the app: an unwritable file just means no trace. When the log
+//! exceeds 1 MiB at a size check, it becomes `sends.old.log`, replacing the previous log.
 
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use batterysight_core::hid::{CollectionId, ReportKind};
@@ -36,31 +37,103 @@ use batterysight_core::model::DeviceKey;
 use crate::hid_enum::{ContainerId, container_hex};
 use crate::reactor::FeatureFailure;
 
+const CAP_BYTES: u64 = 1_048_576;
+const RECHECK_BYTES: u64 = 65_536;
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables the troubleshooting log for this process. Only the app entry point calls this.
+pub fn enable() {
+    ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+fn rotate_if_needed(dir: &Path, cap: u64) {
+    let current = dir.join("sends.log");
+    if fs::metadata(&current).is_ok_and(|meta| meta.len() > cap) {
+        let _ = fs::rename(&current, dir.join("sends.old.log"));
+    }
+}
+
+fn open_log(dir: &Path) -> Option<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("sends.log"))
+        .ok()
+}
+
 /// The open trace file: the device thread's, held for the runtime's life, or one opened
-/// for a single [`ui_line`].
-pub(crate) struct Trace(File);
+/// for a single [`ui_line`] or [`store_line`].
+pub(crate) struct Trace {
+    file: File,
+    dir: PathBuf,
+    written: u64,
+    #[cfg(test)]
+    cap: u64,
+    #[cfg(test)]
+    recheck_bytes: u64,
+}
 
 impl Trace {
-    /// The trace file when `BATTERYSIGHT_TRACE=1` and the file can be opened, else `None`.
-    pub(crate) fn from_env() -> Option<Trace> {
-        if env::var_os("BATTERYSIGHT_TRACE").as_deref() != Some(OsStr::new("1")) {
+    /// The trace file if logging is enabled and the file can be opened.
+    pub(crate) fn open() -> Option<Trace> {
+        if !enabled() {
             return None;
         }
         let dir = PathBuf::from(env::var_os("LOCALAPPDATA")?).join("BatterySight");
-        fs::create_dir_all(&dir).ok()?;
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("sends.log"))
-            .ok()
-            .map(Trace)
+        Self::open_in(&dir)
+    }
+
+    fn open_in(dir: &Path) -> Option<Trace> {
+        Self::open_in_with_cap(dir, CAP_BYTES)
+    }
+
+    fn open_in_with_cap(dir: &Path, cap: u64) -> Option<Trace> {
+        fs::create_dir_all(dir).ok()?;
+        rotate_if_needed(dir, cap);
+        Some(Trace {
+            file: open_log(dir)?,
+            dir: dir.to_path_buf(),
+            written: 0,
+            #[cfg(test)]
+            cap,
+            #[cfg(test)]
+            recheck_bytes: RECHECK_BYTES,
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let _ = self.file.write_all(bytes);
+
+        #[cfg(not(test))]
+        let (cap, recheck_bytes) = (CAP_BYTES, RECHECK_BYTES);
+        #[cfg(test)]
+        let (cap, recheck_bytes) = (self.cap, self.recheck_bytes);
+        #[cfg(test)]
+        if self.dir.as_os_str().is_empty() {
+            return;
+        }
+
+        // Count attempted bytes even on error so a stale handle does not prevent a reopen.
+        self.written += bytes.len() as u64;
+        if self.written >= recheck_bytes {
+            self.written = 0;
+            rotate_if_needed(&self.dir, cap);
+            // Reopen even if this call didn't rotate: another writer may have done so.
+            if let Some(file) = open_log(&self.dir) {
+                self.file = file;
+            }
+        }
     }
 
     /// Appends one frame; write errors are ignored.
     pub(crate) fn record(&mut self, direction: Direction, collection: CollectionId, bytes: &[u8]) {
         let mut text = line(unix_ms(), direction, collection, bytes);
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends only the typed refusal metadata, never the request data.
@@ -75,7 +148,7 @@ impl Trace {
             unix_ms(),
             collection.0,
         );
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     pub(crate) fn feature_failed(
@@ -89,14 +162,14 @@ impl Trace {
             unix_ms(),
             collection.0,
         );
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends an audio activity change of `container`; write errors are ignored.
     pub(crate) fn audio(&mut self, container: &ContainerId, active: bool) {
         let mut text = audio_text(unix_ms(), container, active);
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends that audio activity is not (fully) watched because `stage` failed; write
@@ -104,7 +177,7 @@ impl Trace {
     pub(crate) fn audio_unavailable(&mut self, stage: &str) {
         let mut text = audio_unavailable_text(unix_ms(), stage);
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends that the reopen cap holds back the group with interface `paths` for
@@ -113,7 +186,7 @@ impl Trace {
         let now = unix_ms();
         let mut text = held_text(now, paths, now.saturating_add(release_in));
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends that the group with interface `paths`, held back before, was opened; write
@@ -121,7 +194,7 @@ impl Trace {
     pub(crate) fn released(&mut self, paths: &BTreeSet<String>) {
         let mut text = released_text(unix_ms(), paths);
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends that none of the HID++ collections of the group with interface `paths`
@@ -129,7 +202,7 @@ impl Trace {
     pub(crate) fn open_failed(&mut self, paths: &BTreeSet<String>) {
         let mut text = open_failed_text(unix_ms(), paths);
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
     }
 
     /// Appends that `group`'s discovery registered nothing and is retried `retry_in` ms
@@ -139,35 +212,46 @@ impl Trace {
         let retry_at = retry_in.map(|retry_in| now.saturating_add(retry_in));
         let mut text = discovery_text(now, group, retry_at);
         text.push('\n');
-        let _ = self.0.write_all(text.as_bytes());
+        self.append(text.as_bytes());
+    }
+
+    #[cfg(test)]
+    fn open_with_limits(dir: &Path, cap: u64, recheck_bytes: u64) -> Option<Trace> {
+        let mut trace = Self::open_in_with_cap(dir, cap)?;
+        trace.recheck_bytes = recheck_bytes;
+        Some(trace)
     }
 
     /// A trace appending to `file`.
     #[cfg(test)]
     pub(crate) fn to_file(file: File) -> Trace {
-        Trace(file)
+        Trace {
+            file,
+            dir: PathBuf::new(),
+            written: 0,
+            cap: CAP_BYTES,
+            recheck_bytes: RECHECK_BYTES,
+        }
     }
 }
 
-/// Appends `"<unix ms> ui <text>"` to the trace file when `BATTERYSIGHT_TRACE=1`; does
-/// nothing otherwise, and ignores errors. It opens, appends to and closes the file on the
-/// calling thread, the UI thread included: tracing is a debug switch, so that small append
-/// is accepted there.
+/// Appends `"<unix ms> ui <text>"` to the trace file, ignoring errors. Only rare UI events
+/// use this small append, which runs on the calling thread.
 pub fn ui_line(text: &str) {
-    if let Some(mut trace) = Trace::from_env() {
+    if let Some(mut trace) = Trace::open() {
         let mut text = ui_text(unix_ms(), text);
         text.push('\n');
-        let _ = trace.0.write_all(text.as_bytes());
+        trace.append(text.as_bytes());
     }
 }
 
 /// Appends `"<unix ms> store <text>"` like [`ui_line`]; called from the store's writer
 /// thread, and at startup before any window exists.
 pub(crate) fn store_line(text: &str) {
-    if let Some(mut trace) = Trace::from_env() {
+    if let Some(mut trace) = Trace::open() {
         let mut text = store_text(unix_ms(), text);
         text.push('\n');
-        let _ = trace.0.write_all(text.as_bytes());
+        trace.append(text.as_bytes());
     }
 }
 
@@ -262,6 +346,121 @@ fn joined(paths: &BTreeSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("bs-trace-{}-{name}", std::process::id()));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn disabled_by_default_writes_nothing() {
+        // No test calls enable(), so the default is independent of test order.
+        assert!(!enabled());
+        assert!(Trace::open().is_none());
+    }
+
+    #[test]
+    fn rotate_if_needed_renames_only_over_cap() {
+        let dir = TempDir::new("cap");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        fs::write(&current, b"1234").unwrap();
+        rotate_if_needed(&dir.0, 4);
+        assert_eq!(fs::read(&current).unwrap(), b"1234");
+        assert!(!old.exists());
+
+        fs::write(&current, b"12345").unwrap();
+        rotate_if_needed(&dir.0, 4);
+        assert!(!current.exists());
+        assert_eq!(fs::read(&old).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn rotation_replaces_existing_old_file() {
+        let dir = TempDir::new("replace");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        fs::write(&old, b"old").unwrap();
+        fs::write(&current, b"newer").unwrap();
+        rotate_if_needed(&dir.0, 4);
+        assert!(!current.exists());
+        assert_eq!(fs::read(&old).unwrap(), b"newer");
+    }
+
+    #[test]
+    fn long_lived_trace_moves_to_new_file_after_external_rotation() {
+        const EARLY: &[u8] = b"early line..............\n"; // 25 bytes
+        const LATER: &[u8] = b"later line..............\n";
+        let dir = TempDir::new("long-lived");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        let external = dir.0.join("external.log");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+
+        for _ in 0..4 {
+            trace.append(EARLY);
+        }
+        assert_eq!(fs::read(&current).unwrap(), EARLY.repeat(4));
+        assert!(!old.exists());
+        for _ in 0..2 {
+            trace.append(EARLY);
+        }
+        trace.append(LATER);
+        assert_eq!(fs::read(&old).unwrap(), EARLY.repeat(6));
+        assert_eq!(fs::read(&current).unwrap(), LATER);
+
+        fs::rename(&current, &external).unwrap();
+        trace.append(LATER);
+        trace.append(b"after external rotation\n");
+        assert_eq!(fs::read(&external).unwrap(), LATER.repeat(2));
+        assert_eq!(fs::read(&current).unwrap(), b"after external rotation\n");
+    }
+
+    #[test]
+    fn open_in_missing_dir_returns_none() {
+        let dir = TempDir::new("not-a-directory");
+        let file = dir.0.join("file");
+        fs::write(&file, b"file").unwrap();
+        assert!(Trace::open_in(&file.join("child")).is_none());
+    }
+
+    #[test]
+    fn failed_rotation_and_reopen_leave_trace_writable() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new("locked");
+        let current = dir.0.join("sends.log");
+        let external = dir.0.join("external.log");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        fs::rename(&current, &external).unwrap();
+        fs::write(&current, [b'x'; 101]).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&current)
+            .unwrap();
+
+        let line = b"still writing...........\n"; // 25 bytes
+        trace.append(line);
+        trace.append(line);
+        trace.append(line);
+        assert_eq!(fs::read(&external).unwrap(), line.repeat(3));
+
+        drop(lock);
+        assert_eq!(fs::read(&current).unwrap(), [b'x'; 101]);
+        assert!(!dir.0.join("sends.old.log").exists());
+    }
 
     #[test]
     fn out_line_has_time_direction_collection_and_hex() {
