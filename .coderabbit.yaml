@@ -28,8 +28,8 @@ reviews:
         anywhere in the file.
     - path: "crates/core/src/engines/**"
       instructions: >-
-        Engines may query a device only on the events listed in README "When BatterySight
-        asks a device", and only the scheduler decides when anything is sent; flag new
+        Engines may query a device only on the events listed in README "How it reads
+        batteries", and only the scheduler decides when anything is sent; flag new
         periodic queries or anything that could keep a device awake. Behaviour changes need
         a replay test (hidpp_replay.rs or vendor_replay.rs).
     - path: "crates/{win,app}/src/**"
