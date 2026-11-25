@@ -17,7 +17,7 @@ reviews:
         Engines may query a device only on the events listed in README "When BatterySight
         asks a device", and only the scheduler decides when anything is sent; flag new
         periodic queries or anything that could keep a device awake. Behaviour changes need
-        a replay fixture.
+        a replay test (hidpp_replay.rs or vendor_replay.rs).
     - path: "crates/{win,app}/src/**"
       instructions: >-
         Check handle and COM lifetimes and unsafe blocks; no blocking work on the UI thread;

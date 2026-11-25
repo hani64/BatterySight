@@ -12,7 +12,7 @@
 
 - [ ] One change; unrelated fixes go in their own PR.
 - [ ] The checks in CONTRIBUTING.md pass locally.
-- [ ] Tests cover what could regress; an engine change comes with a replay fixture.
+- [ ] Tests cover what could regress; an engine change comes with a replay test.
 - [ ] README updated for anything a user sees.
 - [ ] No personal data: no user names or local paths.
 - [ ] Catalog entries carry a `status` and a `source` with the evidence that status needs.
