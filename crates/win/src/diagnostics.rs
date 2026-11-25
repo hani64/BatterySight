@@ -452,8 +452,6 @@ fn render(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use batterysight_core::hid::{Collection, CollectionId};
     use windows::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, PIPE_ACCESS_OUTBOUND};
 
@@ -676,9 +674,11 @@ mod tests {
         let console = text(console);
         assert_eq!(console, "batterysight: capturing 1234:5678 for 1 min.\n");
         server.send(&[0x10, 0x01, 0x42]);
-        let started = Instant::now();
+        // `run` times its deadline on `reactor::clock_ms` (tick count, ~15.6 ms steps), so
+        // measure on the same clock: `run` reads its start no earlier than `started`.
+        let started = reactor::clock_ms();
         let reports = capture.run(300, &mut out).unwrap();
-        let elapsed = started.elapsed().as_millis();
+        let elapsed = reactor::clock_ms() - started;
         assert!((300..2_000).contains(&elapsed), "{elapsed} ms");
         assert_eq!(reports, 1);
 
