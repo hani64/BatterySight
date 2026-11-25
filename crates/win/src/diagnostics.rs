@@ -62,7 +62,10 @@ impl fmt::Display for DumpError {
                 "cannot list HID devices: Windows Configuration Manager failed; try again",
             ),
             DumpError::Bluetooth(error) => {
-                write!(f, "cannot read cached Bluetooth devices: {error}; try again")
+                write!(
+                    f,
+                    "cannot read cached Bluetooth devices: {error}; try again"
+                )
             }
             DumpError::Output(error) => write!(f, "cannot write the dump: {error}"),
         }
@@ -134,7 +137,11 @@ fn write_dump(
     for device in bluetooth {
         let mut line = format!(
             "bluetooth battery-property={} name=",
-            if device.has_battery_property { "yes" } else { "no" }
+            if device.has_battery_property {
+                "yes"
+            } else {
+                "no"
+            }
         );
         push_quoted(&mut line, &device.name);
         writeln!(out, "{line}")?;
@@ -153,7 +160,10 @@ fn push_quoted(line: &mut String, text: &str) {
                 line.push('\\');
                 line.push(c);
             }
-            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}'
+            '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
             | '\u{2066}'..='\u{2069}' => {
                 let _ = write!(line, "\\u{{{:x}}}", u32::from(c));
             }
@@ -170,8 +180,14 @@ fn push_quoted(line: &mut String, text: &str) {
 #[derive(Debug)]
 pub enum CaptureError {
     Enumerate,
-    Absent { vid: u16, pid: u16 },
-    NoVendorCollection { vid: u16, pid: u16 },
+    Absent {
+        vid: u16,
+        pid: u16,
+    },
+    NoVendorCollection {
+        vid: u16,
+        pid: u16,
+    },
     Port(windows::core::Error),
     Open {
         vid: u16,
@@ -179,7 +195,9 @@ pub enum CaptureError {
         error: windows::core::Error,
     },
     /// Every opened collection stopped reading before the deadline.
-    Lost { reports: usize },
+    Lost {
+        reports: usize,
+    },
     Output(io::Error),
 }
 
@@ -323,9 +341,9 @@ impl Capture {
             return Err(CaptureError::Open {
                 vid,
                 pid,
-                error: first_error.unwrap_or_else(|| windows::core::Error::from_hresult(
-                    windows::Win32::Foundation::E_ACCESSDENIED,
-                )),
+                error: first_error.unwrap_or_else(|| {
+                    windows::core::Error::from_hresult(windows::Win32::Foundation::E_ACCESSDENIED)
+                }),
             });
         }
         Ok(Capture {
@@ -357,7 +375,10 @@ impl Capture {
              read-only; nothing was sent to the device",
             self.vid, self.pid
         )?;
-        writeln!(out, "# columns: ms since start, collection, report bytes in hex")?;
+        writeln!(
+            out,
+            "# columns: ms since start, collection, report bytes in hex"
+        )?;
         for line in &self.collections {
             writeln!(out, "# {line}")?;
         }
@@ -392,13 +413,21 @@ impl Capture {
                     }
                     None if opened.reading => {
                         opened.reading = false;
-                        writeln!(out, "# {ms}\tc{}\tread failed; no more reports", opened.label)?;
+                        writeln!(
+                            out,
+                            "# {ms}\tc{}\tread failed; no more reports",
+                            opened.label
+                        )?;
                     }
                     None => {}
                 }
             }
             if self.opened.iter().all(|o| !o.reading) {
-                writeln!(out, "# end: {reports} {}; every collection stopped", plural(reports))?;
+                writeln!(
+                    out,
+                    "# end: {reports} {}; every collection stopped",
+                    plural(reports)
+                )?;
                 out.flush()?;
                 return Err(CaptureError::Lost { reports });
             }
@@ -438,7 +467,9 @@ mod tests {
     /// A synthetic interface with a path, container and node that must never be printed.
     fn interface(vid: u16, pid: u16, usage_page: u16, usage: u16) -> HidInterface {
         HidInterface {
-            path: wide(r"\\?\hid#vid_1234&pid_5678&mi_02#7&1a2b3c4d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"),
+            path: wide(
+                r"\\?\hid#vid_1234&pid_5678&mi_02#7&1a2b3c4d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+            ),
             collection: Collection {
                 id: CollectionId(1),
                 vid,
@@ -475,7 +506,13 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
-        write_dump(&mut out, &hid, |_| Some("Synthetic Receiver".into()), &bluetooth).unwrap();
+        write_dump(
+            &mut out,
+            &hid,
+            |_| Some("Synthetic Receiver".into()),
+            &bluetooth,
+        )
+        .unwrap();
         let out = text(out);
         assert!(out.starts_with("batterysight-dump-v1\n"), "{out}");
         assert!(!out.contains("review"), "{out}");
@@ -521,7 +558,10 @@ mod tests {
         write_dump(&mut out, &hid, |_| None, &bluetooth).unwrap();
         let out = text(out);
         assert!(out.contains("usage=0001:0002 input=20 output=20 feature=0 name=-\n"));
-        assert!(out.contains(r#"name="Pad\u{1b}[31m\u{a}\u{202e}x\"\\""#), "{out}");
+        assert!(
+            out.contains(r#"name="Pad\u{1b}[31m\u{a}\u{202e}x\"\\""#),
+            "{out}"
+        );
         assert!(!out.contains('\u{1b}') && !out.contains('\u{202E}'));
     }
 
@@ -529,12 +569,31 @@ mod tests {
     fn vid_pid_and_minutes_parse_strictly() {
         assert_eq!(parse_vid_pid("046D:C547"), Some((0x046D, 0xC547)));
         assert_eq!(parse_vid_pid("046d:c547"), Some((0x046D, 0xC547)));
-        for bad in ["", "046D", "46D:C547", "046D:C5470", "0x6D:C547", "046D-C547", "046D:C54G", "+46D:C547"] {
+        for bad in [
+            "",
+            "046D",
+            "46D:C547",
+            "046D:C5470",
+            "0x6D:C547",
+            "046D-C547",
+            "046D:C54G",
+            "+46D:C547",
+        ] {
             assert_eq!(parse_vid_pid(bad), None, "{bad}");
         }
         assert_eq!(parse_minutes("1"), Some(1));
         assert_eq!(parse_minutes("60"), Some(60));
-        for bad in ["0", "61", "1.5", "+5", " 5", "-1", "", "100000000000000000000", "1m"] {
+        for bad in [
+            "0",
+            "61",
+            "1.5",
+            "+5",
+            " 5",
+            "-1",
+            "",
+            "100000000000000000000",
+            "1m",
+        ] {
             assert_eq!(parse_minutes(bad), None, "{bad}");
         }
     }
@@ -567,7 +626,10 @@ mod tests {
             interface(0x1234, 0x5678, 0x000C, 0x0001),
         ];
         let none = Capture::open(0x1234, 0x5678, system).err().unwrap();
-        assert!(matches!(none, CaptureError::NoVendorCollection { .. }), "{none}");
+        assert!(
+            matches!(none, CaptureError::NoVendorCollection { .. }),
+            "{none}"
+        );
     }
 
     #[test]
@@ -634,7 +696,10 @@ mod tests {
             lines.next(),
             Some("# columns: ms since start, collection, report bytes in hex")
         );
-        assert!(out.contains("# c1 device 1 usage=FF00:0001 input=7\n"), "{out}");
+        assert!(
+            out.contains("# c1 device 1 usage=FF00:0001 input=7\n"),
+            "{out}"
+        );
         let line = out
             .lines()
             .find(|line| !line.starts_with('#') && line.contains("\tc1\t"))
@@ -657,7 +722,10 @@ mod tests {
         drop(server);
         let mut out = Vec::new();
         let error = capture.run(5_000, &mut out).err().unwrap();
-        assert!(matches!(error, CaptureError::Lost { reports: 0 }), "{error}");
+        assert!(
+            matches!(error, CaptureError::Lost { reports: 0 }),
+            "{error}"
+        );
         assert!(text(out).contains("\tc1\tread failed"));
     }
 }

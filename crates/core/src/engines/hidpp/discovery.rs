@@ -361,12 +361,14 @@ fn enable_flag(mut read: [u8; 3], byte: usize, mask: u8) -> [u8; 3] {
 pub(super) fn request(step: Step, f: &Found) -> Option<Request> {
     Some(match step {
         Step::GetNotifications | Step::GetReg00 => Request::get(REG_NOTIFICATIONS),
-        Step::SetNotifications(read) => {
-            Request::set(REG_NOTIFICATIONS, enable_flag(read, 1, WIRELESS_NOTIFICATIONS))
-        }
-        Step::SetReg00(read) => {
-            Request::set(REG_NOTIFICATIONS, enable_flag(read, 0, BATTERY_NOTIFICATIONS))
-        }
+        Step::SetNotifications(read) => Request::set(
+            REG_NOTIFICATIONS,
+            enable_flag(read, 1, WIRELESS_NOTIFICATIONS),
+        ),
+        Step::SetReg00(read) => Request::set(
+            REG_NOTIFICATIONS,
+            enable_flag(read, 0, BATTERY_NOTIFICATIONS),
+        ),
         Step::NotifyDevices => Request::set(REG_RECEIVER_CONNECTION, [NOTIFY_DEVICES, 0, 0]),
         Step::Ping => Request::feature(0, 1, [0, 0, PING_MARK]),
         Step::Feature(i) => {

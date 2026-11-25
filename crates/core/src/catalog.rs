@@ -101,7 +101,9 @@ impl CollectionSelector {
     pub(crate) fn matches_descriptor(&self, collection: &Collection) -> bool {
         self.usage_page.is_none_or(|v| v == collection.usage_page)
             && self.usage.is_none_or(|v| v == collection.usage)
-            && self.interface.is_none_or(|v| Some(v) == collection.interface)
+            && self
+                .interface
+                .is_none_or(|v| Some(v) == collection.interface)
             && self.input_len.is_none_or(|v| v == collection.input_len)
             && self.output_len.is_none_or(|v| v == collection.output_len)
             && self.feature_len.is_none_or(|v| v == collection.feature_len)

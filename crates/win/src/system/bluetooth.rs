@@ -675,7 +675,11 @@ mod tests {
         ));
         assert_eq!(source.deadline(), Some(64_020));
         assert!(source.take_due(64_020));
-        source.reconcile(Err(windows::core::Error::from_hresult(E_FAIL)), 64_020, &hub);
+        source.reconcile(
+            Err(windows::core::Error::from_hresult(E_FAIL)),
+            64_020,
+            &hub,
+        );
         assert_eq!(source.deadline(), Some(124_020));
         source.request(65_000, false);
         assert!(source.take_due(65_000));

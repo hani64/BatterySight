@@ -409,7 +409,11 @@ mod tests {
             "Asleep · 12 min ago · about 9 h left"
         );
         assert_eq!(
-            card_text(&reporting(Presence::Offline, Charge::Charging, NOW - 7 * MIN), None, NOW)[1],
+            card_text(
+                &reporting(Presence::Offline, Charge::Charging, NOW - 7 * MIN),
+                None,
+                NOW
+            )[1],
             "Disconnected · 7 min ago"
         );
     }

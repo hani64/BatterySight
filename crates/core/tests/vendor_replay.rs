@@ -153,7 +153,13 @@ fn rapoo_vt1_se_ch584_08_receiver_and_cable() {
     );
     let mut wired = CH584;
     wired[1] = 0x22;
-    replay(collection(0x4A11, 0x0F, 19), &wired, "Rapoo VT1 SE", 42, Via::Usb);
+    replay(
+        collection(0x4A11, 0x0F, 19),
+        &wired,
+        "Rapoo VT1 SE",
+        42,
+        Via::Usb,
+    );
 }
 
 #[test]
@@ -168,7 +174,13 @@ fn rapoo_vt7_se_ch584_08_receiver_and_cable() {
         Via::Receiver,
     );
     status[1] = 0x22;
-    replay(collection(0x4A00, 0x0F, 19), &status, "Rapoo VT7 SE", 42, Via::Usb);
+    replay(
+        collection(0x4A00, 0x0F, 19),
+        &status,
+        "Rapoo VT7 SE",
+        42,
+        Via::Usb,
+    );
 }
 
 #[test]
@@ -200,7 +212,11 @@ fn rapoo_vt9_pro_185a_legacy_bb_b0() {
 fn rapoo_vt3_pro_legacy_unknown_level_does_not_replace_last_percent() {
     // PyFlat RapooProtocol.cs documents 0x7F only with state 2.
     let mut hub = hub();
-    feed(&mut hub, HubInput::GroupArrived(group(collection(0x1215, 2, 7))), 0);
+    feed(
+        &mut hub,
+        HubInput::GroupArrived(group(collection(0x1215, 2, 7))),
+        0,
+    );
     let unavailable = [0xBB, 0xB0, 0x51, 0x20, 3, 2, 0x7F];
     assert_eq!(report(&mut hub, &LEGACY, 1), [HubOutput::StateChanged]);
     assert!(report(&mut hub, &[0xBB, 0xB0, 0x51, 0x20, 3, 1, 0x7F], 2).is_empty());
@@ -230,8 +246,15 @@ fn rapoo_vt3_pro_legacy_unknown_level_does_not_replace_last_percent() {
     assert_eq!(hub.next_deadline(), Some(120_004));
 
     let mut unread = Hub::new(Catalog::builtin(), Policy::default());
-    feed(&mut unread, HubInput::GroupArrived(group(collection(0x1215, 2, 7))), 0);
-    assert_eq!(report(&mut unread, &unavailable, 1), [HubOutput::StateChanged]);
+    feed(
+        &mut unread,
+        HubInput::GroupArrived(group(collection(0x1215, 2, 7))),
+        0,
+    );
+    assert_eq!(
+        report(&mut unread, &unavailable, 1),
+        [HubOutput::StateChanged]
+    );
     let initial = unread.snapshot();
     assert_eq!(initial[0].presence, Presence::Online);
     assert_eq!(initial[0].level, None);
@@ -250,7 +273,13 @@ fn rapoo_vt3_pro_legacy_bb_b0_receiver_and_cable() {
         98,
         Via::Receiver,
     );
-    replay(collection(0x4415, 2, 7), &status, "Rapoo VT3 Pro", 98, Via::Usb);
+    replay(
+        collection(0x4415, 2, 7),
+        &status,
+        "Rapoo VT3 Pro",
+        98,
+        Via::Usb,
+    );
 }
 
 #[test]
@@ -313,7 +342,9 @@ fn rapoo_passive_selection_requires_only_the_preselected_receive_path() {
     });
     assert!(RapooEngine::new(&g, entry).is_some());
     let mut hub = Hub::new(catalog, Policy::default());
-    let selection = hub.select_group(&g, |_, _| None).expect("select passive RX");
+    let selection = hub
+        .select_group(&g, |_, _| None)
+        .expect("select passive RX");
     assert_eq!(selection.command_report_id(), None);
     assert!(selection.opens(RX));
     assert!(selection.reads(RX));
@@ -330,7 +361,10 @@ fn rapoo_passive_selection_requires_only_the_preselected_receive_path() {
     }));
 
     feed(&mut hub, HubInput::MatchedGroupArrived(g, selection), 0);
-    for (collection, origin) in [(OTHER, ReportOrigin::Input), (RX, ReportOrigin::FeatureReply)] {
+    for (collection, origin) in [
+        (OTHER, ReportOrigin::Input),
+        (RX, ReportOrigin::FeatureReply),
+    ] {
         assert!(
             feed(
                 &mut hub,
@@ -375,12 +409,18 @@ fn rapoo_rejects_cross_model_malformed_and_cybercafe_frames() {
             &bad_status,
             &[],
         ] {
-            assert!(report(&mut hub, invalid, 5_099).is_empty(), "{invalid:02X?}");
+            assert!(
+                report(&mut hub, invalid, 5_099).is_empty(),
+                "{invalid:02X?}"
+            );
         }
         for event in [0xB1, 0xB2, 0xB3] {
             let mut invalid = frame.to_vec();
             invalid[1] = event;
-            assert!(report(&mut hub, &invalid, 5_099).is_empty(), "{invalid:02X?}");
+            assert!(
+                report(&mut hub, &invalid, 5_099).is_empty(),
+                "{invalid:02X?}"
+            );
         }
         if offset == 8 {
             let mut foreign = frame.to_vec();
@@ -401,7 +441,11 @@ fn rapoo_rejects_cross_model_malformed_and_cybercafe_frames() {
 #[test]
 fn rapoo_refresh_preserves_last_reading_and_natural_reports_wake_after_idle() {
     let mut hub = hub();
-    feed(&mut hub, HubInput::GroupArrived(group(collection(0x1413, 2, 19))), 0);
+    feed(
+        &mut hub,
+        HubInput::GroupArrived(group(collection(0x1413, 2, 19))),
+        0,
+    );
     assert!(feed(&mut hub, HubInput::RefreshNow, 1).is_empty());
     assert!(feed(&mut hub, HubInput::Resume, 5_001).is_empty());
     assert!(hub.snapshot().is_empty());
@@ -413,9 +457,7 @@ fn rapoo_refresh_preserves_last_reading_and_natural_reports_wake_after_idle() {
     assert_eq!(hub.next_deadline(), Some(70_000));
     assert!(feed(&mut hub, HubInput::RefreshNow, 10_001).is_empty());
     assert!(feed(&mut hub, HubInput::Tick, 15_001).is_empty());
-    assert!(
-        feed(&mut hub, HubInput::Activity(online[0].key.clone()), 69_998).is_empty()
-    );
+    assert!(feed(&mut hub, HubInput::Activity(online[0].key.clone()), 69_998).is_empty());
     assert!(feed(&mut hub, HubInput::Tick, 69_999).is_empty());
     assert_eq!(hub.snapshot(), online);
     assert_eq!(hub.next_deadline(), Some(70_000));
@@ -974,7 +1016,10 @@ fn steelseries_dongle_replays_charge_before_level_but_not_across_disconnect() {
         steelseries_sent(hub.handle(HubInput::Tick, 1_500), Some((0, 65)));
         // ASM #348/#364: BB and B7 are independent notifications.
         assert!(steelseries_input(&mut hub, OTHER, &[0, 0xBB, 1, 2], 1_501).is_empty());
-        assert!(hub.snapshot().is_empty(), "charging alone must not register");
+        assert!(
+            hub.snapshot().is_empty(),
+            "charging alone must not register"
+        );
         if disconnect {
             assert!(steelseries_input(&mut hub, OTHER, &[0, 0xB9, 2, 2], 1_502).is_empty());
             steelseries_sent(
@@ -1076,7 +1121,11 @@ fn hyperx_hx66_replays_only_one_shots_and_passive_changes() {
             .unwrap();
         assert_eq!(selected.command_report_id(), Some(0x66));
         assert!(selected.reads(RX) && selected.sends(RX) && !selected.opens(OTHER));
-        hyperx_sent(hub.handle(HubInput::GroupArrived(group), 0), 62, &[0x66, 0x82]);
+        hyperx_sent(
+            hub.handle(HubInput::GroupArrived(group), 0),
+            62,
+            &[0x66, 0x82],
+        );
 
         // A power-on burst and foreign query replies cannot advance our link request.
         hyperx_input(&mut hub, 1, 62, &[0x66, 0x0D, 0x0F, 0x51, 73], &[]);
@@ -1822,13 +1871,19 @@ fn sonix_send(out: Vec<HubOutput>, expected: Option<(ReportKind, Ms)>) -> Option
     else {
         panic!("expected one {kind:?}, got {sent:?}");
     };
-    assert_eq!((*collection, *sent_kind, sent_bytes, *deadline), (OTHER, kind, &bytes, Some(at)));
+    assert_eq!(
+        (*collection, *sent_kind, sent_bytes, *deadline),
+        (OTHER, kind, &bytes, Some(at))
+    );
     assert_eq!(set_id.is_some(), kind == ReportKind::SetFeature);
     *set_id
 }
 
 fn sonix_complete_set(hub: &mut Hub, at: Ms, collection: CollectionId, id: FeatureSetId) {
-    sonix_send(hub.handle(HubInput::FeatureSetComplete { collection, id }, at), None);
+    sonix_send(
+        hub.handle(HubInput::FeatureSetComplete { collection, id }, at),
+        None,
+    );
 }
 
 fn sonix_ready_mailbox(hub: &mut Hub, at: Ms, response: &[u8], deadline: Ms) -> FeatureSetId {
@@ -1901,7 +1956,14 @@ fn sonix_awake_uses_shared_interval_and_requires_a_fresh_linked_pulse() {
     sonix_send(hub.handle(HubInput::Tick, 62_100), None);
     sonix_send(hub.handle(HubInput::Activity(key.clone()), 62_100), None);
     sonix_send(
-        sonix_report(&mut hub, 62_100, RX, ReportOrigin::FeatureReply, 8, SONIX_PULSE),
+        sonix_report(
+            &mut hub,
+            62_100,
+            RX,
+            ReportOrigin::FeatureReply,
+            8,
+            SONIX_PULSE,
+        ),
         None,
     );
     sonix_send(
@@ -1970,7 +2032,15 @@ fn sonix_resends_once_only_after_matching_pending_and_a_stable_reset() {
     for at in (180..1_000).step_by(20) {
         sonix_send(hub.handle(HubInput::Tick, at), get);
         sonix_send(
-            sonix_mailbox(&mut hub, at, if at == 180 { SONIX_PENDING } else { SONIX_FOREIGN }),
+            sonix_mailbox(
+                &mut hub,
+                at,
+                if at == 180 {
+                    SONIX_PENDING
+                } else {
+                    SONIX_FOREIGN
+                },
+            ),
             None,
         );
     }
@@ -1993,7 +2063,10 @@ fn sonix_rejects_wrong_echo_width_role_and_level_then_05_is_final() {
         (60, &[0, 1, 0x08, 0x81, 1, 0, 0, 101][..]),
         (80, &[0, 5, 0x08, 0x85, 1][..]),
     ] {
-        sonix_send(hub.handle(HubInput::Tick, at), Some((ReportKind::GetFeature, 1_000)));
+        sonix_send(
+            hub.handle(HubInput::Tick, at),
+            Some((ReportKind::GetFeature, 1_000)),
+        );
         sonix_send(sonix_mailbox(&mut hub, at, reply), None);
         sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
     }
@@ -2006,7 +2079,10 @@ fn sonix_rejects_wrong_echo_width_role_and_level_then_05_is_final() {
         (OTHER, ReportOrigin::Input, 65, SONIX_OK),
         (OTHER, ReportOrigin::FeatureReply, 64, SONIX_OK),
     ] {
-        sonix_send(sonix_report(&mut hub, 100, collection, origin, width, bytes), None);
+        sonix_send(
+            sonix_report(&mut hub, 100, collection, origin, width, bytes),
+            None,
+        );
     }
     sonix_send(sonix_mailbox(&mut hub, 120, SONIX_ASLEEP), None);
     sonix_snapshot(&hub, 81, Charge::Charging, Source::Push);
@@ -2061,10 +2137,16 @@ fn sonix_validates_read_and_write_roles_per_pid_without_substitution() {
         assert!(select(&g).is_none());
     }
     let mut g = sonix_group(0x5402);
-    g.collections.push(Collection { id: CollectionId(3), ..g.collections[1].clone() });
+    g.collections.push(Collection {
+        id: CollectionId(3),
+        ..g.collections[1].clone()
+    });
     assert!(select(&g).is_none());
     let mut g = sonix_group(0x5402);
-    g.collections.push(Collection { id: CollectionId(3), ..g.collections[0].clone() });
+    g.collections.push(Collection {
+        id: CollectionId(3),
+        ..g.collections[0].clone()
+    });
     assert!(select(&g).is_none());
     for (page, width, has_report_05) in [
         (0xFF01, 8, None),
@@ -2089,7 +2171,9 @@ fn sonix_validates_read_and_write_roles_per_pid_without_substitution() {
     let selected = select(&g).unwrap();
     assert!(!selected.ready(&group(g.collections[0].clone())));
     assert!(!selected.ready(&group(g.collections[1].clone())));
-    for pid in [0x5405, 0x5406, 0x5504, 0x3401, 0x3402, 0x3406, 0x3409, 0x3410] {
+    for pid in [
+        0x5405, 0x5406, 0x5504, 0x3401, 0x3402, 0x3406, 0x3409, 0x3410,
+    ] {
         assert!(select(&sonix_group(pid)).is_none());
     }
 }
@@ -2099,14 +2183,20 @@ fn sonix_feinmann_has_only_battery_one_shots_not_a_poll_interval() {
     let mut hub = hub();
     sonix_arrival(&mut hub, 0x5404, 1_000);
     sonix_ready_mailbox(&mut hub, 0, &[], 1_000);
-    sonix_send(hub.handle(HubInput::Tick, 20), Some((ReportKind::GetFeature, 1_000)));
+    sonix_send(
+        hub.handle(HubInput::Tick, 20),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
     sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
     sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
     assert_eq!(hub.snapshot()[0].poll_min_ms, None);
     sonix_send(sonix_input(&mut hub, 3_000, SONIX_UP), None);
     sonix_send(hub.handle(HubInput::Tick, 5_000), None);
     sonix_send(sonix_input(&mut hub, 70_000, SONIX_PULSE), None);
-    sonix_send(hub.handle(HubInput::Resume, 70_000), Some((ReportKind::GetFeature, 71_000)));
+    sonix_send(
+        hub.handle(HubInput::Resume, 70_000),
+        Some((ReportKind::GetFeature, 71_000)),
+    );
 }
 
 #[test]
@@ -2127,7 +2217,10 @@ fn sonix_slow_or_missing_set_completion_does_not_start_a_get() {
     );
     sonix_send(sonix_mailbox(&mut hub, 520, SONIX_OK), None);
     sonix_snapshot(&hub, 24, Charge::Unknown, Source::Query);
-    sonix_send(hub.handle(HubInput::RefreshNow, 600), Some((ReportKind::GetFeature, 1_600)));
+    sonix_send(
+        hub.handle(HubInput::RefreshNow, 600),
+        Some((ReportKind::GetFeature, 1_600)),
+    );
     let out = sonix_mailbox(&mut hub, 600, &[]);
     let new = sonix_send(out, Some((ReportKind::SetFeature, 1_600))).unwrap();
     sonix_complete_set(&mut hub, 601, OTHER, id);
@@ -2164,7 +2257,10 @@ fn sonix_ignores_a_retained_05_but_ends_on_a_new_05() {
         (40, SONIX_PENDING, Presence::Online),
         (60, SONIX_ASLEEP, Presence::Asleep),
     ] {
-        sonix_send(hub.handle(HubInput::Tick, at), Some((ReportKind::GetFeature, 1_000)));
+        sonix_send(
+            hub.handle(HubInput::Tick, at),
+            Some((ReportKind::GetFeature, 1_000)),
+        );
         sonix_send(sonix_mailbox(&mut hub, at, reply), None);
         assert_eq!(hub.snapshot()[0].presence, want);
     }
@@ -2177,7 +2273,10 @@ fn sonix_successful_arrival_reply_validates_link_without_an_edge() {
     let mut hub = hub();
     sonix_arrival(&mut hub, 0x5402, 1_000);
     sonix_ready_mailbox(&mut hub, 0, &[], 1_000);
-    sonix_send(hub.handle(HubInput::Tick, 20), Some((ReportKind::GetFeature, 1_000)));
+    sonix_send(
+        hub.handle(HubInput::Tick, 20),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
     sonix_send(sonix_mailbox(&mut hub, 20, SONIX_OK), None);
     sonix_send(hub.handle(HubInput::Tick, 2_020), None);
     sonix_send(sonix_input(&mut hub, 60_019, SONIX_PULSE), None);
@@ -2202,10 +2301,16 @@ fn sonix_resend_requires_the_same_preflight_answer_not_just_a_foreign_echo() {
         (100, SONIX_FOREIGN),
         (120, SONIX_FOREIGN),
     ] {
-        sonix_send(hub.handle(HubInput::Tick, at), Some((ReportKind::GetFeature, 1_000)));
+        sonix_send(
+            hub.handle(HubInput::Tick, at),
+            Some((ReportKind::GetFeature, 1_000)),
+        );
         sonix_send(sonix_mailbox(&mut hub, at, reply), None);
     }
-    sonix_send(hub.handle(HubInput::Tick, 140), Some((ReportKind::GetFeature, 1_000)));
+    sonix_send(
+        hub.handle(HubInput::Tick, 140),
+        Some((ReportKind::GetFeature, 1_000)),
+    );
     sonix_ready_mailbox(&mut hub, 140, SONIX_FOREIGN, 1_000);
 }
 

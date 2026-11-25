@@ -87,7 +87,12 @@ mod tests {
 
     #[test]
     fn other_arguments_are_not_diagnostics() {
-        for list in [&[][..], &["--list"], &["--tray-only"], &["--takeover", "--dump"]] {
+        for list in [
+            &[][..],
+            &["--list"],
+            &["--tray-only"],
+            &["--takeover", "--dump"],
+        ] {
             assert!(command(&args(list)).is_none(), "{list:?}");
         }
     }

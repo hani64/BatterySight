@@ -125,7 +125,8 @@ impl Selection {
                 }
                 Roles::Sonix { command, events } => {
                     group.collections.iter().any(|c| c.id == *command)
-                        && events.is_none_or(|events| group.collections.iter().any(|c| c.id == events))
+                        && events
+                            .is_none_or(|events| group.collections.iter().any(|c| c.id == events))
                 }
             }
     }
@@ -506,7 +507,10 @@ source = "Linux hid-logitech-hidpp"
         g.collections[1].product = "The fixture USB device".into();
         assert!(wants(&g, &catalog));
         assert!(reads(&g, &g.collections[0], &catalog));
-        assert!(!reads(&g, &g.collections[1], &catalog), "send-only collection");
+        assert!(
+            !reads(&g, &g.collections[1], &catalog),
+            "send-only collection"
+        );
         for (description, alter) in [
             (
                 "usage page",
@@ -548,7 +552,10 @@ source = "Linux hid-logitech-hidpp"
         let mut g = gated_group();
         g.collections[0].interface = None;
         assert!(
-            select_with(&g, &catalog, |_, _| panic!("no eligible receive collection")).is_none()
+            select_with(&g, &catalog, |_, _| panic!(
+                "no eligible receive collection"
+            ))
+            .is_none()
         );
         g.collections[0].interface = Some(3);
         let selection = select_with(&g, &catalog, |index, selector| {
@@ -570,7 +577,10 @@ source = "Linux hid-logitech-hidpp"
             .unwrap();
         g.collections[1].product = "Legacy USB Receiver".into();
         let command = g.collections[1].id;
-        let out = hub.handle(HubInput::MatchedGroupArrived(g.clone(), selection.clone()), 0);
+        let out = hub.handle(
+            HubInput::MatchedGroupArrived(g.clone(), selection.clone()),
+            0,
+        );
         assert_eq!(
             out,
             [HubOutput::Send {
@@ -758,7 +768,12 @@ source = "Linux hid-logitech-hidpp"
                 bytes[index] ^= 1;
             }
         }
-        for (cat, reg, sub, checksum) in [(8, 1, 1, 10), (1, 0x84, 4, 0x89), (8, 0x85, 3, 0x90), (8, 0x83, 1, 0x8C)] {
+        for (cat, reg, sub, checksum) in [
+            (8, 1, 1, 10),
+            (1, 0x84, 4, 0x89),
+            (8, 0x85, 3, 0x90),
+            (8, 0x83, 1, 0x8C),
+        ] {
             let mut bytes = [0; 65];
             bytes[2..5].copy_from_slice(&[cat, reg, sub]);
             bytes[63] = checksum;

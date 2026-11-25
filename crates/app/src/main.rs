@@ -121,9 +121,9 @@ fn run_cli(args: &[OsString]) -> Option<i32> {
 fn attach_parent_console() {
     let redirected = |kind| {
         // SAFETY: no pointers involved; `GetFileType` of an invalid handle is FILE_TYPE_UNKNOWN.
-        unsafe { GetStdHandle(kind) }.ok().filter(|&h| {
-            matches!(unsafe { GetFileType(h) }, FILE_TYPE_DISK | FILE_TYPE_PIPE)
-        })
+        unsafe { GetStdHandle(kind) }
+            .ok()
+            .filter(|&h| matches!(unsafe { GetFileType(h) }, FILE_TYPE_DISK | FILE_TYPE_PIPE))
     };
     let (out, err) = (redirected(STD_OUTPUT_HANDLE), redirected(STD_ERROR_HANDLE));
     if out.is_some() && err.is_some() {

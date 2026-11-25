@@ -23,16 +23,15 @@ const MAX_WAIT: Duration = Duration::from_secs(10);
 /// While a Nova base station is present, the list is not printed before this: the station
 /// is first asked once it has settled after it is found, and its reply is expected within
 /// the reply window; the last second covers opening the devices.
-const STATION_FIRST_READING: Duration =
-    Duration::from_millis(STATION_SETTLE_MS + REPLY_MS + 1_000);
+const STATION_FIRST_READING: Duration = Duration::from_millis(STATION_SETTLE_MS + REPLY_MS + 1_000);
 
 /// Starts the runtime, waits for the readings to settle and prints one line per device.
 /// Returns the process exit code.
 pub fn run() -> i32 {
     let catalog = Catalog::builtin();
     // From the device paths' text alone; nothing is opened.
-    let station = system::present_products()
-        .is_some_and(|products| station_present(&catalog, products));
+    let station =
+        system::present_products().is_some_and(|products| station_present(&catalog, products));
     let floor = if station {
         STATION_FIRST_READING
     } else {
@@ -248,7 +247,8 @@ mod tests {
 
     #[test]
     fn format_line_new_sources() {
-        let line = |name, via, level, charge, key| format_line(&state(name, via, level, charge, key));
+        let line =
+            |name, via, level, charge, key| format_line(&state(name, via, level, charge, key));
         let rows = [
             (
                 line(
@@ -416,7 +416,10 @@ mod tests {
     fn silent_station_and_busy_sources_stop_within_the_hard_cap() {
         assert!(STATION_FIRST_READING <= MAX_WAIT);
         // A station whose headset never answers: its window, not longer.
-        assert_eq!(simulate(STATION_FIRST_READING, &[]), (vec![], STATION_FIRST_READING));
+        assert_eq!(
+            simulate(STATION_FIRST_READING, &[]),
+            (vec![], STATION_FIRST_READING)
+        );
         // Changes that never go quiet end at the hard cap, station or not.
         let busy: Vec<u64> = (1..=30).map(|s| s * 1_000).collect();
         for floor in [Duration::ZERO, STATION_FIRST_READING] {

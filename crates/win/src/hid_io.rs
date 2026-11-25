@@ -14,8 +14,8 @@ use std::slice;
 use batterysight_core::hid::CollectionId;
 use windows::Wdk::System::IO::NtDeviceIoControlFile;
 use windows::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    RtlNtStatusToDosError, STATUS_PENDING, WIN32_ERROR,
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, RtlNtStatusToDosError, STATUS_PENDING, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
@@ -223,8 +223,14 @@ impl Op {
         let overlapped = op.cast::<OVERLAPPED>();
         // SAFETY: the allocation is stable. No one else accesses it before submission;
         // afterward the kernel owns it while a completion packet is expected.
-        let result =
-            unsafe { issue((*op).kind, (*op).buffer.as_mut_ptr(), (*op).buffer.len(), overlapped) };
+        let result = unsafe {
+            issue(
+                (*op).kind,
+                (*op).buffer.as_mut_ptr(),
+                (*op).buffer.len(),
+                overlapped,
+            )
+        };
         match result {
             Ok(()) => Ok(NonNull::new(overlapped).expect("Box yields a non-null pointer")),
             Err(error) => {

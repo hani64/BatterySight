@@ -47,10 +47,7 @@ pub enum Action {
     /// New reading or presence for a registered device.
     Update(DeviceUpdate),
     /// Presence without a new battery sample or a grant. Offline clears charge.
-    Presence {
-        key: DeviceKey,
-        presence: Presence,
-    },
+    Presence { key: DeviceKey, presence: Presence },
     /// The device sleeps or lost its link: stop asking it.
     Asleep(DeviceKey),
     /// A link to `key` (a device or this engine's group key) was established: the hub
@@ -196,11 +193,13 @@ pub(crate) fn write_allowed<'a>(
         if candidate_role != role {
             continue;
         }
-        let Some((index, command, address, actual, destination)) = *hidpp.get_or_insert_with(|| {
-            let (index, command, address, actual) = hidpp_fields(kind, bytes)?;
-            let destination = engine.hidpp_destination(index)?;
-            Some((index, command, address, actual, destination))
-        }) else {
+        let Some((index, command, address, actual, destination)) =
+            *hidpp.get_or_insert_with(|| {
+                let (index, command, address, actual) = hidpp_fields(kind, bytes)?;
+                let destination = engine.hidpp_destination(index)?;
+                Some((index, command, address, actual, destination))
+            })
+        else {
             continue;
         };
         let matched = match *rule {
@@ -213,7 +212,8 @@ pub(crate) fn write_allowed<'a>(
                 && command < FIRST_REGISTER_SUB_ID
                 && address & 0x0F == SW_ID
                 && address >> 4 == function
-                && *feature_id.get_or_insert_with(|| engine.feature_id_for_index(index, command))
+                && *feature_id
+                    .get_or_insert_with(|| engine.feature_id_for_index(index, command))
                     == Some(feature) =>
             {
                 match params {

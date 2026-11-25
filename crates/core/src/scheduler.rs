@@ -136,7 +136,10 @@ impl DeviceSlot {
         } else {
             min.max(user_gap().unwrap_or(DEFAULT_INTERVAL_MS))
         };
-        Some(self.last_grant_ms.map_or(0, |last| last.saturating_add(gap)))
+        Some(
+            self.last_grant_ms
+                .map_or(0, |last| last.saturating_add(gap)),
+        )
     }
 }
 
@@ -264,7 +267,14 @@ impl Scheduler {
         now: Ms,
         budget: u16,
     ) -> Option<Grant> {
-        self.request_with_source(key, owner, trigger, ActivitySource::Audio, now, Some(budget))
+        self.request_with_source(
+            key,
+            owner,
+            trigger,
+            ActivitySource::Audio,
+            now,
+            Some(budget),
+        )
     }
 
     /// Charging retains the existing Activity grant for the engine, but does not
@@ -494,7 +504,8 @@ mod tests {
         assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
         for now in 1..=3 {
             assert!(
-                s.request(&key(), OWNER, Trigger::Rediscovery, now).is_some(),
+                s.request(&key(), OWNER, Trigger::Rediscovery, now)
+                    .is_some(),
                 "{now}"
             );
         }
@@ -513,7 +524,11 @@ mod tests {
         // A gap of its own, so only the pushing rule refuses.
         let mut s = scheduler_with(caps(true, false, 300_000));
         for t in [0, 1, 300_000, 86_400_000, Ms::MAX] {
-            assert_eq!(s.request(&key(), OWNER, Trigger::Activity, t), None, "t = {t}");
+            assert_eq!(
+                s.request(&key(), OWNER, Trigger::Activity, t),
+                None,
+                "t = {t}"
+            );
         }
         // Only activity is pointless for a pushing device; arrival still reads once.
         assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
@@ -557,11 +572,16 @@ mod tests {
         // The arrival grant ends the registration's wake: the default gap applies.
         assert!(s.request(&key(), OWNER, Trigger::Arrival, 0).is_some());
         assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 599_999), None);
-        let grant = s.request(&key(), OWNER, Trigger::Activity, 600_000).unwrap();
+        let grant = s
+            .request(&key(), OWNER, Trigger::Activity, 600_000)
+            .unwrap();
         assert_eq!(grant.trigger, Trigger::Activity);
         // The gap restarts from the latest grant.
         assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 1_199_999), None);
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 1_200_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 1_200_000)
+                .is_some()
+        );
     }
 
     #[test]
@@ -597,7 +617,10 @@ mod tests {
     fn activity_gap_does_not_block_refresh() {
         let mut s = scheduler_with(caps(false, false, 300_000));
         assert!(s.request(&key(), OWNER, Trigger::Activity, 0).is_some());
-        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 1_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::RefreshNow, 1_000)
+                .is_some()
+        );
     }
 
     #[test]
@@ -606,7 +629,10 @@ mod tests {
         // The first grant after registration; the default gap follows it.
         assert!(s.request(&key(), OWNER, Trigger::Activity, 0).is_some());
         assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 599_999), None);
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 600_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 600_000)
+                .is_some()
+        );
     }
 
     #[test]
@@ -634,10 +660,16 @@ mod tests {
     fn activity_ready_at_mirrors_the_activity_rules() {
         let mut s = scheduler_with(caps(false, false, 300_000));
         assert_eq!(s.activity_ready_at(&key()), Some(0));
-        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 1_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::RefreshNow, 1_000)
+                .is_some()
+        );
         assert_eq!(s.activity_ready_at(&key()), Some(601_000));
         assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 600_999), None);
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 601_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 601_000)
+                .is_some()
+        );
         assert_eq!(s.activity_ready_at(&key()), Some(1_201_000));
 
         s.mark_asleep(&key());
@@ -654,7 +686,10 @@ mod tests {
         // Registered (a wake) and read: the minimum.
         s.note_read(&key(), 1_000);
         assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 300_999), None);
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 301_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 301_000)
+                .is_some()
+        );
         // An older read does not move the clock back.
         s.note_read(&key(), 5);
         assert_eq!(s.activity_ready_at(&key()), Some(901_000));
@@ -667,7 +702,11 @@ mod tests {
         let mut s = scheduler_with(caps(false, false, 0));
         assert_eq!(s.activity_ready_at(&key()), None);
         for t in [0, 1, 300_000] {
-            assert_eq!(s.request(&key(), OWNER, Trigger::Activity, t), None, "t = {t}");
+            assert_eq!(
+                s.request(&key(), OWNER, Trigger::Activity, t),
+                None,
+                "t = {t}"
+            );
         }
         assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 0).is_some());
     }
@@ -742,7 +781,9 @@ mod tests {
         assert!(s.pending_send(fresh.id, OWNER, 3_001).is_none());
 
         let last_moment = s.request(&key(), OWNER, Trigger::RefreshNow, 0).unwrap();
-        s.pending_send(last_moment.id, OWNER, 3_000).unwrap().spend();
+        s.pending_send(last_moment.id, OWNER, 3_000)
+            .unwrap()
+            .spend();
     }
 
     #[test]
@@ -789,7 +830,10 @@ mod tests {
         s.set_user_gaps(gaps(Some(1_800_000)));
         assert_eq!(s.activity_ready_at(&key()), Some(2_100_000));
         assert_eq!(s.request(&key(), OWNER, Trigger::Activity, 2_099_999), None);
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 2_100_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 2_100_000)
+                .is_some()
+        );
     }
 
     #[test]
@@ -808,7 +852,10 @@ mod tests {
         // The wake push.
         s.note_read(&key(), 1_000_000);
         assert_eq!(s.activity_ready_at(&key()), Some(1_300_000));
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 1_300_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 1_300_000)
+                .is_some()
+        );
         assert_eq!(s.activity_ready_at(&key()), Some(3_100_000));
     }
 
@@ -882,7 +929,10 @@ mod tests {
         // A minimum above the default stays the gap.
         let mut s = scheduler_with(caps(false, false, 900_000));
         s.note_read(&key(), 0);
-        assert!(s.request(&key(), OWNER, Trigger::Activity, 900_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::Activity, 900_000)
+                .is_some()
+        );
         assert_eq!(s.activity_ready_at(&key()), Some(1_800_000));
     }
 
@@ -890,7 +940,10 @@ mod tests {
     fn other_grants_end_the_wake() {
         let mut s = scheduler_with(caps(false, false, MIN));
         s.set_user_gaps(gaps(Some(1_800_000)));
-        assert!(s.request(&key(), OWNER, Trigger::RefreshNow, 1_000).is_some());
+        assert!(
+            s.request(&key(), OWNER, Trigger::RefreshNow, 1_000)
+                .is_some()
+        );
         assert_eq!(s.activity_ready_at(&key()), Some(1_801_000));
     }
 
@@ -906,14 +959,20 @@ mod tests {
             if awake_first {
                 s.mark_awake(&key());
             }
-            assert!(s.request(&key(), OWNER, Trigger::Connected, 1_000_000).is_some());
+            assert!(
+                s.request(&key(), OWNER, Trigger::Connected, 1_000_000)
+                    .is_some()
+            );
             s.note_read(&key(), 1_000_000);
             assert_eq!(
                 s.activity_ready_at(&key()),
                 Some(1_300_000),
                 "awake_first = {awake_first}"
             );
-            assert!(s.request(&key(), OWNER, Trigger::Activity, 1_300_000).is_some());
+            assert!(
+                s.request(&key(), OWNER, Trigger::Activity, 1_300_000)
+                    .is_some()
+            );
             assert_eq!(s.activity_ready_at(&key()), Some(3_100_000));
         }
     }

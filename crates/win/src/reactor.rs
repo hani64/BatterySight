@@ -266,7 +266,13 @@ impl Reactor {
         deadline: Ms,
         id: FeatureSetId,
     ) -> bool {
-        self.submit_feature(collection, ReportKind::SetFeature, bytes, deadline, Some(id))
+        self.submit_feature(
+            collection,
+            ReportKind::SetFeature,
+            bytes,
+            deadline,
+            Some(id),
+        )
     }
 
     fn submit_feature(
@@ -389,8 +395,12 @@ impl Reactor {
             // SAFETY: the handle is open and this allocation stays alive until dequeue.
             // ERROR_NOT_FOUND is a normal race with completion; even a successful packet
             // for this operation is no longer a reply.
-            let _ =
-                unsafe { cancel(self.opens[&collection].handle.0, Some(feature.overlapped.as_ptr())) };
+            let _ = unsafe {
+                cancel(
+                    self.opens[&collection].handle.0,
+                    Some(feature.overlapped.as_ptr()),
+                )
+            };
             out.push(OsEvent::FeatureFailed {
                 collection,
                 kind: feature.kind,
@@ -640,17 +650,18 @@ pub(crate) mod tests {
     use batterysight_core::engines::hidpp::frame::fap;
     use batterysight_core::hid::Collection;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
-        ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_LISTENING, HANDLE, NTSTATUS,
-        STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_DEVICE_BUSY, STATUS_PENDING,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_INVALID_HANDLE,
+        ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_LISTENING,
+        HANDLE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_DEVICE_BUSY,
+        STATUS_PENDING,
     };
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
     };
     use windows::Win32::System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE};
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
-        PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_NOWAIT,
+        PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState,
     };
     use windows::core::PCWSTR;
 
@@ -855,7 +866,11 @@ pub(crate) mod tests {
             Self {
                 port: reactor.port,
                 key: reactor.opens[&id].key,
-                call: Some(FEATURE_CALL.take().expect("no overlapped feature submission")),
+                call: Some(
+                    FEATURE_CALL
+                        .take()
+                        .expect("no overlapped feature submission"),
+                ),
             }
         }
 
@@ -961,7 +976,10 @@ pub(crate) mod tests {
             assert!(reactor.feature(id, ReportKind::SetFeature, request, 50));
             let mut pending = PendingCall::take(&reactor, id);
             let call = pending.call();
-            assert_eq!((call.code, call.input_len, call.output_len), (0xb0191, 4, 0));
+            assert_eq!(
+                (call.code, call.input_len, call.output_len),
+                (0xb0191, 4, 0)
+            );
             assert!(call.input.is_some() && call.output.is_none());
             assert_eq!(pending.buffer(), expected);
             pending.complete(0, 0); // A successful SET transfers no output.
@@ -975,14 +993,14 @@ pub(crate) mod tests {
             assert!(reactor.feature(id, ReportKind::GetFeature, &[report_id], 50));
             let pending = PendingCall::take(&reactor, id);
             let call = pending.call();
-            assert_eq!((call.code, call.input_len, call.output_len), (0xb0192, 0, 4));
+            assert_eq!(
+                (call.code, call.input_len, call.output_len),
+                (0xb0192, 0, 4)
+            );
             assert!(call.input.is_none() && call.output.is_some());
             assert_eq!(pending.buffer(), [report_id, 0, 0, 0]);
             pending.reply(&[report_id, 0xAB, 0xCD, 0xEF], 3);
-            assert_eq!(
-                reactor.wait(Some(0), 0),
-                [feature_reply(id, expected, 50)]
-            );
+            assert_eq!(reactor.wait(Some(0), 0), [feature_reply(id, expected, 50)]);
         }
     }
 
@@ -1032,7 +1050,11 @@ pub(crate) mod tests {
         FEATURE_NOW.set(Some(1_000));
         assert_eq!(
             reactor.wait(Some(0), 1_000),
-            [feature_failed(id, ReportKind::SetFeature, FeatureFailure::TimedOut)]
+            [feature_failed(
+                id,
+                ReportKind::SetFeature,
+                FeatureFailure::TimedOut
+            )]
         );
         timed_out.complete(0, 0);
         assert!(reactor.wait(Some(0), 1_000).is_empty());
@@ -1090,7 +1112,11 @@ pub(crate) mod tests {
             PendingCall::take(&reactor, id).reply(&[reply_id], transferred);
             assert_eq!(
                 reactor.wait(Some(0), 0),
-                [feature_failed(id, ReportKind::GetFeature, FeatureFailure::InvalidReply)]
+                [feature_failed(
+                    id,
+                    ReportKind::GetFeature,
+                    FeatureFailure::InvalidReply
+                )]
             );
         }
 
@@ -1155,7 +1181,11 @@ pub(crate) mod tests {
         FEATURE_NOW.set(Some(50));
         assert_eq!(
             reactor.wait(Some(0), 0),
-            [feature_failed(id, ReportKind::GetFeature, FeatureFailure::TimedOut)]
+            [feature_failed(
+                id,
+                ReportKind::GetFeature,
+                FeatureFailure::TimedOut
+            )]
         );
         let handle = reactor.opens[&id].handle.0;
         FEATURE_CANCELS.with_borrow(|calls| {
@@ -1169,7 +1199,11 @@ pub(crate) mod tests {
         assert!(FEATURE_CALL.get().is_none());
         assert_eq!(
             reactor.wait(Some(0), 0),
-            [feature_failed(id, ReportKind::GetFeature, FeatureFailure::Rejected)]
+            [feature_failed(
+                id,
+                ReportKind::GetFeature,
+                FeatureFailure::Rejected
+            )]
         );
 
         server.send(&[0x11, 7]);
@@ -1206,7 +1240,11 @@ pub(crate) mod tests {
         assert!(start.elapsed() < Duration::from_millis(750));
         assert_eq!(
             events,
-            [feature_failed(id, ReportKind::GetFeature, FeatureFailure::TimedOut)]
+            [feature_failed(
+                id,
+                ReportKind::GetFeature,
+                FeatureFailure::TimedOut
+            )]
         );
     }
 
@@ -1233,10 +1271,17 @@ pub(crate) mod tests {
         assert!(!reactor.feature(id, ReportKind::GetFeature, &[3], 50));
         assert_eq!(
             reactor.wait(Some(0), 0),
-            [feature_failed(id, ReportKind::GetFeature, FeatureFailure::Rejected)]
+            [feature_failed(
+                id,
+                ReportKind::GetFeature,
+                FeatureFailure::Rejected
+            )]
         );
         new.reply(&[3, 0xBB], 2);
-        assert_eq!(reactor.wait(Some(0), 0), [feature_reply(id, &[3, 0xBB], 50)]);
+        assert_eq!(
+            reactor.wait(Some(0), 0),
+            [feature_reply(id, &[3, 0xBB], 50)]
+        );
     }
 
     #[test]

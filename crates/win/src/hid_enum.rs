@@ -215,20 +215,26 @@ fn interface_number(instance: &[u16]) -> Option<u8> {
     {
         return None;
     }
-    let mut parts = hardware.split(|&unit| unit == u16::from(b'&')).filter(|part| {
-        part.get(..3).is_some_and(|prefix| {
-            prefix.iter().zip(b"mi_").all(|(&unit, expected)| {
-                u8::try_from(unit).is_ok_and(|byte| byte.eq_ignore_ascii_case(expected))
+    let mut parts = hardware
+        .split(|&unit| unit == u16::from(b'&'))
+        .filter(|part| {
+            part.get(..3).is_some_and(|prefix| {
+                prefix.iter().zip(b"mi_").all(|(&unit, expected)| {
+                    u8::try_from(unit).is_ok_and(|byte| byte.eq_ignore_ascii_case(expected))
+                })
             })
-        })
-    });
+        });
     let [_, _, _, hi, lo] = *parts.next()? else {
         return None;
     };
     if parts.next().is_some() {
         return None;
     }
-    let digit = |unit| char::from_u32(u32::from(unit))?.to_digit(16).map(|n| n as u8);
+    let digit = |unit| {
+        char::from_u32(u32::from(unit))?
+            .to_digit(16)
+            .map(|n| n as u8)
+    };
     Some(digit(hi)? * 16 + digit(lo)?)
 }
 

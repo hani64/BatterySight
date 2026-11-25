@@ -854,9 +854,7 @@ impl Device {
                         ),
                         (_, None, _) => unreachable!("admitted feature requests have a deadline"),
                     };
-                    if started
-                        && let Some(trace) = &mut self.trace
-                    {
+                    if started && let Some(trace) = &mut self.trace {
                         trace.record(direction, collection, &bytes);
                     }
                 }
@@ -1806,7 +1804,11 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Gaming Headset" }
         let id = rx.collection.id;
         let mut device = device();
         device.apply_scan(Some(vec![sibling, rx]), now_ms());
-        assert_eq!(device.groups.len(), 1, "the RX path permits only a read open");
+        assert_eq!(
+            device.groups.len(),
+            1,
+            "the RX path permits only a read open"
+        );
         assert_eq!(device.groups[0].collections, [id]);
 
         // OpenMouse VT9 Pro 1st-gen 7-byte heartbeat, over a local pipe, not HID.
@@ -1922,7 +1924,10 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
         let old_collection = hidpp.collection.id;
         hidpp.collection.id = CollectionId(u32::MAX);
         product_scan(&mut device, &hidpp, Some("Cached Alpha"), base + 1);
-        assert_eq!(device.groups[0].id, old, "fresh IDs must not reopen handles");
+        assert_eq!(
+            device.groups[0].id, old,
+            "fresh IDs must not reopen handles"
+        );
 
         // A single-instance named pipe needs the server end reset to allow a new client.
         // Do not deliver a disconnect event to runtime: the physical scan is unchanged.
@@ -1956,7 +1961,11 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
         hidpp.collection.id = CollectionId(u32::MAX);
         product_scan(&mut device, &hidpp, Some("Alpha"), base + 7_003);
 
-        assert_eq!(device.groups.len(), 1, "the I/O cap blocked metadata restoration");
+        assert_eq!(
+            device.groups.len(),
+            1,
+            "the I/O cap blocked metadata restoration"
+        );
         assert_ne!(device.groups[0].id, old);
         assert_eq!(device.groups[0].collections, [hidpp.collection.id]);
         assert_eq!(device.guard.groups[&paths].reopens, reopens);
@@ -1983,7 +1992,10 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
             device.guard.on_arrival(base + 7_002);
             product_scan(&mut device, &hidpp, Some("Alpha"), base + 7_003);
 
-            assert!(device.groups.is_empty(), "a returning device bypassed the I/O cap");
+            assert!(
+                device.groups.is_empty(),
+                "a returning device bypassed the I/O cap"
+            );
             assert_eq!(device.release_at, Some(base + 1_000 + REOPEN_WINDOW));
         }
     }
@@ -2283,7 +2295,9 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
             },
         ));
         for (id, container) in [(1, HEADSET), (2, MOUSE)] {
-            device.groups.push(opened_fixture(id, &id.to_string(), Some(container)));
+            device
+                .groups
+                .push(opened_fixture(id, &id.to_string(), Some(container)));
             let group = HidGroup {
                 id: GroupId(id),
                 collections: Vec::new(),

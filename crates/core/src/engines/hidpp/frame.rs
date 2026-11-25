@@ -125,9 +125,7 @@ pub fn match_register(frame: &[u8], from: ReplyAddress, sub_id: u8, address: u8)
     }
     match *frame {
         [_, _, s, a, ..] if s == sub_id && a == address => Reply::Ok(&frame[HEADER_LEN..]),
-        [_, _, HIDPP10_ERROR, s, a, code, ..] if s == sub_id && a == address => {
-            Reply::Err10(code)
-        }
+        [_, _, HIDPP10_ERROR, s, a, code, ..] if s == sub_id && a == address => Reply::Err10(code),
         _ => Reply::NotMine,
     }
 }
@@ -139,8 +137,8 @@ fn function_byte(function: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::ReplyAddress::{Direct, Exact};
+    use super::*;
 
     fn long(head: &[u8]) -> Vec<u8> {
         let mut f = head.to_vec();
@@ -277,14 +275,23 @@ mod tests {
             if len < 4 {
                 assert_eq!(match_fap(&ok[..len], Exact(0x01), 0x05, 1), Reply::NotMine);
             }
-            assert_eq!(match_fap(&err20[..len], Exact(0x01), 0x05, 1), Reply::NotMine);
-            assert_eq!(match_fap(&err10[..len], Exact(0x01), 0x05, 1), Reply::NotMine);
+            assert_eq!(
+                match_fap(&err20[..len], Exact(0x01), 0x05, 1),
+                Reply::NotMine
+            );
+            assert_eq!(
+                match_fap(&err10[..len], Exact(0x01), 0x05, 1),
+                Reply::NotMine
+            );
             assert_eq!(
                 match_register(&err10[..len], Exact(0x01), 0x05, 0x1B),
                 Reply::NotMine
             );
             if len < 4 {
-                assert_eq!(match_register(&ok[..len], Exact(0x01), 0x05, 0x1B), Reply::NotMine);
+                assert_eq!(
+                    match_register(&ok[..len], Exact(0x01), 0x05, 0x1B),
+                    Reply::NotMine
+                );
             }
         }
     }
@@ -297,7 +304,10 @@ mod tests {
             Reply::Ok(&[0x00, 0x01, 0x00])
         );
         let err = [0x10, 0xFF, 0x8F, 0x81, 0x00, 0x02, 0x00];
-        assert_eq!(match_register(&err, Exact(0xFF), 0x81, 0x00), Reply::Err10(0x02));
+        assert_eq!(
+            match_register(&err, Exact(0xFF), 0x81, 0x00),
+            Reply::Err10(0x02)
+        );
     }
 
     #[test]
@@ -306,6 +316,9 @@ mod tests {
         assert_eq!(match_register(&ok, Exact(0x01), 0x81, 0x00), Reply::NotMine);
         assert_eq!(match_register(&ok, Exact(0xFF), 0x81, 0x02), Reply::NotMine);
         let err = [0x10, 0xFF, 0x8F, 0x81, 0x02, 0x02, 0x00];
-        assert_eq!(match_register(&err, Exact(0xFF), 0x81, 0x00), Reply::NotMine);
+        assert_eq!(
+            match_register(&err, Exact(0xFF), 0x81, 0x00),
+            Reply::NotMine
+        );
     }
 }

@@ -8,7 +8,9 @@
 //! between two inputs are exactly the writes the first one causes.
 
 use batterysight_core::catalog::Catalog;
-use batterysight_core::hid::{Collection, CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin};
+use batterysight_core::hid::{
+    Collection, CollectionId, GroupId, HidGroup, ReportKind, ReportOrigin,
+};
 use batterysight_core::hub::{Hub, HubInput, HubOutput};
 use batterysight_core::model::{
     Charge, CoarseLevel, DeviceKind, Level, Presence, Verification, Via,

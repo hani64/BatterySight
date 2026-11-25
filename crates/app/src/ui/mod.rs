@@ -1796,7 +1796,9 @@ mod tests {
         .collect();
         assert_eq!(
             glyphs,
-            ['\u{E962}', '\u{E765}', '\u{E7F6}', '\u{E7F5}', '\u{E7FC}', '\u{E83F}']
+            [
+                '\u{E962}', '\u{E765}', '\u{E7F6}', '\u{E7F5}', '\u{E7FC}', '\u{E83F}'
+            ]
         );
     }
 }

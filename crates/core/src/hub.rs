@@ -156,8 +156,9 @@ struct Registrant {
 }
 
 fn apply_polling_caps(state: &mut DeviceState, caps: Capabilities) -> bool {
-    let min = ((caps.audio || caps.awake_signal) && !caps.pushes_battery && caps.min_query_gap_ms > 0)
-        .then_some(caps.min_query_gap_ms);
+    let min =
+        ((caps.audio || caps.awake_signal) && !caps.pushes_battery && caps.min_query_gap_ms > 0)
+            .then_some(caps.min_query_gap_ms);
     let changed = state.poll_min_ms != min || state.reports_changes != caps.pushes_battery;
     state.poll_min_ms = min;
     state.reports_changes = caps.pushes_battery;
@@ -244,8 +245,7 @@ impl Hub {
                 if let Some(route) = self.routes.get(&collection).filter(|route| match origin {
                     ReportOrigin::Input => route.reads,
                     ReportOrigin::FeatureReply => route.role.is_some(),
-                })
-                    && let Some(slot) = self.engines.get_mut(&route.group)
+                }) && let Some(slot) = self.engines.get_mut(&route.group)
                 {
                     let gid = route.group;
                     let actions = slot.engine.on_report(collection, origin, &bytes, now);
@@ -253,7 +253,10 @@ impl Hub {
                 }
             }
             HubInput::FeatureSetComplete { collection, id } => {
-                if let Some(route) = self.routes.get(&collection).filter(|route| route.role.is_some())
+                if let Some(route) = self
+                    .routes
+                    .get(&collection)
+                    .filter(|route| route.role.is_some())
                     && let Some(slot) = self.engines.get_mut(&route.group)
                 {
                     let gid = route.group;
@@ -425,13 +428,7 @@ impl Hub {
         self.scheduler.activity_ready_at(key)
     }
 
-    fn arrive(
-        &mut self,
-        group: &HidGroup,
-        prepared: Option<&Selection>,
-        now: Ms,
-        pass: &mut Pass,
-    ) {
+    fn arrive(&mut self, group: &HidGroup, prepared: Option<&Selection>, now: Ms, pass: &mut Pass) {
         // The same id again means the old handles are gone.
         self.remove_group(group.id, now, pass);
         let resolved;
@@ -667,16 +664,25 @@ impl Hub {
         if pass.depth > MAX_NESTED_GRANTS || self.owner(key) != Some(gid) {
             return;
         }
-        let sonix = self.engines.get(&gid).is_some_and(|slot| slot.kind == EngineKind::Sonix);
+        let sonix = self
+            .engines
+            .get(&gid)
+            .is_some_and(|slot| slot.kind == EngineKind::Sonix);
         let grant = if sonix
             && matches!(
                 trigger,
-                Trigger::Arrival | Trigger::Connected | Trigger::Resume
-                    | Trigger::RefreshNow | Trigger::Awake
-            )
-        {
+                Trigger::Arrival
+                    | Trigger::Connected
+                    | Trigger::Resume
+                    | Trigger::RefreshNow
+                    | Trigger::Awake
+            ) {
             self.scheduler.request_feature_transaction(
-                key, gid, trigger, now, engines::SONIX_OPERATION_BUDGET,
+                key,
+                gid,
+                trigger,
+                now,
+                engines::SONIX_OPERATION_BUDGET,
             )
         } else {
             self.scheduler.request(key, gid, trigger, now)
@@ -1113,7 +1119,8 @@ impl Hub {
         let entry = if behind_receiver && slot.kind == EngineKind::Hidpp {
             wpid.and_then(|wpid| self.catalog.device_by_wpid(vid, wpid))
         } else {
-            slot.direct.and_then(|index| self.catalog.devices().get(index))
+            slot.direct
+                .and_then(|index| self.catalog.devices().get(index))
         };
         if let Some(device) = entry {
             return (device.status, Some(device.name.clone()));
@@ -1246,7 +1253,8 @@ mod tests {
             _now: Ms,
         ) -> Vec<Action> {
             let mut s = self.script.borrow_mut();
-            s.calls.push(Call::Report(collection, origin, bytes.to_vec()));
+            s.calls
+                .push(Call::Report(collection, origin, bytes.to_vec()));
             s.on_report.pop_front().unwrap_or_default()
         }
 
@@ -1592,7 +1600,11 @@ quirks = { query_wakes = true }
         assert_eq!(
             out,
             [
-                refused(ReportKind::Output, CollectionId(99), WriteRefusal::Collection),
+                refused(
+                    ReportKind::Output,
+                    CollectionId(99),
+                    WriteRefusal::Collection
+                ),
                 refused(ReportKind::Output, coll(1), WriteRefusal::Width),
                 refused(ReportKind::SetFeature, coll(1), WriteRefusal::Rule),
                 refused(ReportKind::GetFeature, coll(1), WriteRefusal::Rule),
@@ -1770,7 +1782,9 @@ quirks = { query_wakes = true }
     fn ownership_changes_revoke_a_delayed_device_grant_for_both_engines() {
         let (a, b) = (fake(), fake());
         let key = dev("shared-unit");
-        a.borrow_mut().on_grant.push_back(vec![register(&key, None)]);
+        a.borrow_mut()
+            .on_grant
+            .push_back(vec![register(&key, None)]);
         let mut hub = hub(&[(1, &a), (2, &b)]);
         hub.handle(logi(1), 0);
         hub.handle(logi(2), 0);
@@ -1779,7 +1793,9 @@ quirks = { query_wakes = true }
             panic!("expected device refresh grant");
         };
         assert_eq!(grant.subject, key);
-        b.borrow_mut().on_report.push_back(vec![register(&key, None)]);
+        b.borrow_mut()
+            .on_report
+            .push_back(vec![register(&key, None)]);
         hub.handle(report(2), 2);
         assert_eq!(hub.keys_of(GroupId(2)), vec![key.clone()]);
         for (id, engine) in [(1, &a), (2, &b)] {
@@ -1837,12 +1853,7 @@ quirks = { query_wakes = true }
         hidpp_group_send(hub, 1, GrantId(1), head)
     }
 
-    fn hidpp_group_send(
-        hub: &mut Hub,
-        group: u32,
-        grant: GrantId,
-        head: &[u8],
-    ) -> Vec<HubOutput> {
+    fn hidpp_group_send(hub: &mut Hub, group: u32, grant: GrantId, head: &[u8]) -> Vec<HubOutput> {
         let mut pass = Pass::default();
         hub.apply(
             GroupId(group),
@@ -1898,7 +1909,10 @@ quirks = { query_wakes = true }
             hidpp_reply(&mut hub, reply);
         }
         let read = [0x11, 1, 8, 0x1B];
-        assert_eq!(sends(&hidpp_try_send(&mut hub, &read)), [hidpp_frame(&read)]);
+        assert_eq!(
+            sends(&hidpp_try_send(&mut hub, &read)),
+            [hidpp_frame(&read)]
+        );
         for frame in [
             [0x11, 1, 9, 0x1B, 0, 0], // Unknown feature index
             [0x11, 1, 3, 0x1B, 0, 0], // Known feature, forbidden function
@@ -1932,7 +1946,10 @@ quirks = { query_wakes = true }
         assert!(sends(&feature_reply).is_empty(), "{feature_reply:?}");
         let unbacked = hidpp_try_send(&mut hub, &set);
         assert_eq!(
-            sends(&hidpp_reply(&mut hub, &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44])),
+            sends(&hidpp_reply(
+                &mut hub,
+                &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44]
+            )),
             [hidpp_frame(&set)]
         );
         for frame in [
@@ -2020,7 +2037,10 @@ quirks = { query_wakes = true }
             let out = hidpp_reply(&mut hub, foreign);
             assert!(out.is_empty(), "{foreign:02X?}: {out:?}");
             assert_eq!(
-                sends(&hidpp_reply(&mut hub, &[0x11, 1, 0x81, 0, 0xA4, 0x20, 0x44])),
+                sends(&hidpp_reply(
+                    &mut hub,
+                    &[0x11, 1, 0x81, 0, 0xA4, 0x20, 0x44]
+                )),
                 [hidpp_frame(&[0x11, 1, 0x80, 0, 0xB4, 0x20, 0x44])]
             );
         }
@@ -2033,7 +2053,10 @@ quirks = { query_wakes = true }
         let out = hidpp_reply(&mut hub, &[0x11, 0, 0x81, 0, 0xA4, 0x20, 0x44]);
         assert!(out.is_empty(), "{out:?}");
         assert_eq!(
-            sends(&hidpp_reply(&mut hub, &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44])),
+            sends(&hidpp_reply(
+                &mut hub,
+                &[0x11, 0xFF, 0x81, 0, 0xA4, 0x20, 0x44]
+            )),
             [hidpp_frame(&[0x11, 0xFF, 0x80, 0, 0xA4, 0x21, 0x44])]
         );
     }
@@ -2064,7 +2087,10 @@ quirks = { query_wakes = true }
         hidpp_discover_unified(&mut hub, 1, 1, 1, unit);
         assert_eq!(hub.keys_of(GroupId(1)), [key.clone()]);
         let read = [0x11, 1, 8, 0x1B];
-        assert_eq!(sends(&hidpp_try_send(&mut hub, &read)), [hidpp_frame(&read)]);
+        assert_eq!(
+            sends(&hidpp_try_send(&mut hub, &read)),
+            [hidpp_frame(&read)]
+        );
 
         hub.handle(HubInput::GroupArrived(hidpp_group(2, false)), 1);
         // Direct devices can answer an FF request with address 00.
@@ -2808,7 +2834,10 @@ quirks = { query_wakes = true }
 
         assert!(hub.handle(report(1), 99_999).is_empty());
         assert!(hub.handle(HubInput::Tick, 100_000).is_empty());
-        assert!(hub.handle(HubInput::Activity(key.clone()), 100_000).is_empty());
+        assert!(
+            hub.handle(HubInput::Activity(key.clone()), 100_000)
+                .is_empty()
+        );
         assert_eq!(grants(&f), [(group_key(1), Trigger::Arrival)]);
         assert_eq!(sends(&hub.handle(report(1), 100_000)), [vec![1]]);
         assert!(hub.handle(report(1), 199_999).is_empty());

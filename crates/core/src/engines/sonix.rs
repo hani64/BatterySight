@@ -163,7 +163,12 @@ impl SonixEngine {
         key.0.starts_with("sonix:")
     }
 
-    fn send(command: CollectionId, transaction: &Transaction, kind: ReportKind, bytes: &[u8]) -> Action {
+    fn send(
+        command: CollectionId,
+        transaction: &Transaction,
+        kind: ReportKind,
+        bytes: &[u8],
+    ) -> Action {
         Action::Send {
             grant: transaction.grant,
             collection: command,
@@ -183,7 +188,12 @@ impl SonixEngine {
             io: MailboxIo::Reading,
             query: None,
         };
-        let get = Self::send(self.command, &transaction, ReportKind::GetFeature, &GET_MAILBOX);
+        let get = Self::send(
+            self.command,
+            &transaction,
+            ReportKind::GetFeature,
+            &GET_MAILBOX,
+        );
         self.transaction = Some(transaction);
         vec![get]
     }
@@ -267,12 +277,7 @@ impl SonixEngine {
                 } else {
                     Charge::NotCharging
                 };
-                vec![self.observe(
-                    Presence::Online,
-                    Some(*level),
-                    Some(charge),
-                    Source::Push,
-                )]
+                vec![self.observe(Presence::Online, Some(*level), Some(charge), Source::Push)]
             }
             [0x05, 0x08, 1, 1, ..] if !self.linked => {
                 self.linked = true;
@@ -386,7 +391,12 @@ impl SonixEngine {
                 grant: transaction.grant,
                 issued_ms: now,
             });
-            Self::send(self.command, &transaction, ReportKind::SetFeature, &READ_BATTERY)
+            Self::send(
+                self.command,
+                &transaction,
+                ReportKind::SetFeature,
+                &READ_BATTERY,
+            )
         });
         self.transaction = Some(transaction);
         action.into_iter().collect()
@@ -514,9 +524,10 @@ impl Engine for SonixEngine {
 
     fn on_tick(&mut self, now: Ms) -> Vec<Action> {
         self.expire(now);
-        if let Some(WakeGrace { at, grant }) = self.grace.take_if(|g| {
-            now >= g.at || g.grant.is_some_and(|(_, until)| now >= until)
-        }) && now >= at
+        if let Some(WakeGrace { at, grant }) = self
+            .grace
+            .take_if(|g| now >= g.at || g.grant.is_some_and(|(_, until)| now >= until))
+            && now >= at
             && self.linked
             && self.transaction.is_none()
             && let Some((grant, expires)) = grant
