@@ -434,6 +434,12 @@ fn locate_node(instance: &[u16; INSTANCE_ID_LEN]) -> Option<u32> {
     (status == CR_SUCCESS).then_some(node)
 }
 
+/// The present device node behind a NUL-terminated interface path, from cached
+/// Configuration Manager data only.
+pub(crate) fn interface_node(path: &[u16]) -> Option<u32> {
+    locate_node(&instance_id(path)?)
+}
+
 /// Reads a cached physical identity without opening the device.
 pub(crate) fn node_container(node: u32) -> windows::core::Result<Option<ContainerId>> {
     let mut kind = DEVPROPTYPE::default();

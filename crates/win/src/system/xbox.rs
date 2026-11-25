@@ -17,6 +17,12 @@ use batterysight_core::time::Ms;
 use windows::Foundation::{EventHandler, IReference};
 use windows::Gaming::Input::{Gamepad, IGameController, RawGameController};
 use windows::System::Power::BatteryStatus;
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_DevNode_PropertyW, CR_BUFFER_SMALL, CR_SUCCESS,
+};
+use windows::Win32::Devices::Properties::{
+    DEVPKEY_Device_CompatibleIds, DEVPROP_TYPE_STRING_LIST, DEVPROPTYPE,
+};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::UI::Input::XboxController::{
     BATTERY_DEVTYPE_GAMEPAD, BATTERY_LEVEL, BATTERY_LEVEL_EMPTY, BATTERY_LEVEL_FULL,
@@ -26,6 +32,7 @@ use windows::Win32::UI::Input::XboxController::{
 };
 use windows::core::Interface;
 
+use crate::hid_enum::interface_node;
 use crate::reactor::{OsEvent, Poster};
 use crate::system::{HidBus, hid_bus};
 
@@ -158,31 +165,49 @@ fn hex_after<'a>(segment: &'a str, tag: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// VID/PID from a lowercase HID path hardware segment: `vid_045e&pid_0b12` (USB),
-/// `vid&0002045e_pid&02e0` (Classic) or `vid&02045e_pid&0b13` (LE). A Bluetooth VID must
-/// carry the USB-IF source (`0002`/`02`); any other source is not parsed.
-fn path_product(hardware: &str) -> Option<(u16, u16)> {
-    let vid = hex_after(hardware, "vid")?;
-    let pid = hex_after(hardware, "pid")?;
-    let vid = match vid.len() {
-        4 => vid,
-        6 => vid.strip_prefix("02")?,
-        8 => vid.strip_prefix("0002")?,
-        _ => return None,
-    };
-    if pid.len() != 4 {
-        return None;
-    }
-    Some((
-        u16::from_str_radix(vid, 16).ok()?,
-        u16::from_str_radix(pid, 16).ok()?,
-    ))
+/// Microsoft's Bluetooth SIG company identifier, used with VID source `0001`/`01`.
+const MICROSOFT_SIG: u16 = 0x0006;
+
+/// What a HID path's hardware segment says about its vendor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathVendor {
+    /// A USB-IF VID and PID: `vid_045e&pid_0b12` (USB), `vid&0002045e_pid&02e0`
+    /// (Classic) or `vid&02045e_pid&0b13` (LE).
+    Product(u16, u16),
+    /// A Bluetooth SIG company identifier (source `0001`/`01`).
+    SigCompany(u16),
+    /// No VID token, a zero or unknown source, or no readable PID.
+    Unknown,
 }
 
-/// What the Configuration Manager list text alone says (nothing is opened). An unparsable
-/// Bluetooth path, or any unparsable path whose hardware segment mentions Microsoft's VID,
-/// identifies no Microsoft pad. Instance segments are never inspected.
-pub(crate) fn non_usb_products(list: &[u16]) -> HidProducts {
+fn path_vendor(hardware: &str) -> PathVendor {
+    let Some(vid) = hex_after(hardware, "vid") else {
+        return PathVendor::Unknown;
+    };
+    let (source, id) = match vid.len() {
+        4 => ("0002", vid),
+        6 => vid.split_at(2),
+        8 => vid.split_at(4),
+        _ => return PathVendor::Unknown,
+    };
+    let Ok(id) = u16::from_str_radix(id, 16) else {
+        return PathVendor::Unknown;
+    };
+    let pid = hex_after(hardware, "pid")
+        .filter(|pid| pid.len() == 4)
+        .and_then(|pid| u16::from_str_radix(pid, 16).ok());
+    match (source, pid) {
+        ("0002" | "02", Some(pid)) => PathVendor::Product(id, pid),
+        ("0001" | "01", _) => PathVendor::SigCompany(id),
+        _ => PathVendor::Unknown,
+    }
+}
+
+/// What the Configuration Manager list text says; nothing is opened. Instance segments
+/// are never inspected. No Microsoft pad is identified while a present path carries
+/// Microsoft's SIG company ID, or cannot be parsed and either mentions Microsoft's VID in
+/// its hardware segment or, per `game_class`, is a game controller by its cached IDs.
+pub(crate) fn non_usb_products(list: &[u16], game_class: impl Fn(&[u16]) -> bool) -> HidProducts {
     let mut products = HidProducts::default();
     for path in list
         .split(|&unit| unit == 0)
@@ -190,18 +215,53 @@ pub(crate) fn non_usb_products(list: &[u16]) -> HidProducts {
     {
         let text = String::from_utf16_lossy(path).to_ascii_lowercase();
         let hardware = text.split('#').nth(1).unwrap_or_default();
-        let bus = hid_bus(path);
-        match (bus, path_product(hardware)) {
-            (HidBus::Usb, Some(_)) => {}
-            (_, Some(product)) => {
-                products.non_usb.insert(product);
+        match (hid_bus(path), path_vendor(hardware)) {
+            (HidBus::Usb, PathVendor::Product(..)) => {}
+            (_, PathVendor::Product(vid, pid)) => {
+                products.non_usb.insert((vid, pid));
             }
-            (_, None) => {
-                products.microsoft_unknown |= bus == HidBus::Bluetooth || hardware.contains("045e");
+            (_, PathVendor::SigCompany(company)) => {
+                products.microsoft_unknown |= company == MICROSOFT_SIG;
+            }
+            (_, PathVendor::Unknown) => {
+                products.microsoft_unknown |= hardware.contains("045e") || game_class(path);
             }
         }
     }
     products
+}
+
+/// Whether the devnode behind `path` lists the `HID_DEVICE_SYSTEM_GAME` compatible ID,
+/// read from Configuration Manager's cached properties without opening the device.
+fn game_class(path: &[u16]) -> bool {
+    let path: Vec<u16> = path.iter().copied().chain([0]).collect();
+    let Some(node) = interface_node(&path) else {
+        return false;
+    };
+    let mut ids = [0u16; 2048];
+    let mut kind = DEVPROPTYPE::default();
+    // The last unit stays NUL whatever is written, so the list stays terminated.
+    let mut size = (size_of_val(&ids) - size_of::<u16>()) as u32;
+    // SAFETY: `ids` is writable for the `size` bytes passed.
+    let status = unsafe {
+        CM_Get_DevNode_PropertyW(
+            node,
+            &DEVPKEY_Device_CompatibleIds,
+            &mut kind,
+            Some(ids.as_mut_ptr().cast()),
+            &mut size,
+            0,
+        )
+    };
+    if status == CR_BUFFER_SMALL {
+        // Cannot tell; fail closed.
+        return true;
+    }
+    status == CR_SUCCESS
+        && kind == DEVPROP_TYPE_STRING_LIST
+        && ids
+            .split(|&unit| unit == 0)
+            .any(|id| String::from_utf16_lossy(id).eq_ignore_ascii_case("HID_DEVICE_SYSTEM_GAME"))
 }
 
 fn observation(
@@ -276,7 +336,7 @@ impl Source {
         list: impl FnOnce() -> Option<Vec<u16>>,
     ) -> Option<HidProducts> {
         if self.products.is_none() {
-            self.products = list().map(|list| non_usb_products(&list));
+            self.products = list().map(|list| non_usb_products(&list, game_class));
         }
         self.products.clone()
     }
@@ -1109,29 +1169,53 @@ mod tests {
         microsoft_unknown: true,
     };
 
+    fn no_game_class(_: &[u16]) -> bool {
+        false
+    }
+
     #[test]
     fn non_usb_products_come_from_path_text_and_fail_closed() {
-        let products = non_usb_products(&list(&[
-            r"\\?\HID#VID_045E&PID_0B12&IG_00#1&2&0&0000#{4d1e55b2}",
-            CLASSIC,
-            LE,
-            r"\\?\HID#ConvertedDevice&Col01#1&2&0&0000#{4d1e55b2}",
-            // The instance segment is never read, even when it looks like a VID.
-            r"\\?\HID#ConvertedDevice&Col02#5&2d8b045e&0&0000#{4d1e55b2}",
-        ]));
+        let products = non_usb_products(
+            &list(&[
+                r"\\?\HID#VID_045E&PID_0B12&IG_00#1&2&0&0000#{4d1e55b2}",
+                CLASSIC,
+                LE,
+                r"\\?\HID#ConvertedDevice&Col01#1&2&0&0000#{4d1e55b2}",
+                // The instance segment is never read, even when it looks like a VID.
+                r"\\?\HID#ConvertedDevice&Col02#5&2d8b045e&0&0000#{4d1e55b2}",
+            ]),
+            no_game_class,
+        );
         assert_eq!(products, known(&[(MICROSOFT, 0x02E0), (MICROSOFT, 0x0B13)]));
-        // An unparsable Microsoft hardware segment, or a Bluetooth VID with a source other
-        // than USB-IF (0002/02), rules out every Microsoft pad without treating it as USB.
+        // Microsoft's Bluetooth SIG company ID (0x0006), or a path that cannot be parsed
+        // but mentions Microsoft's USB VID, rules out every Microsoft pad.
         for unparsable in [
             r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002045e#1&2&0&0000#{4d1e55b2}",
             r"\\?\HID#VID_045E&PID_XYZ#1&2&0&0000#{4d1e55b2}",
-            r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0001045e_pid&02e0#1&2&0&0000#{4d1e55b2}",
             r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&00010006_pid&02e0#1&2&0&0000#{4d1e55b2}",
             r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&010006_PID&0b13_REV&0509#1&2&0&0000#{4d1e55b2}",
         ] {
-            let products = non_usb_products(&list(&[CLASSIC, unparsable]));
+            let products = non_usb_products(&list(&[CLASSIC, unparsable]), no_game_class);
             assert!(products.microsoft_unknown, "{unparsable}");
         }
+    }
+
+    #[test]
+    fn other_bluetooth_vendors_do_not_hide_xbox_pads() {
+        const APPLE: &str = r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0001004c_pid&0267&col01#1&2&0&0000#{4d1e55b2}";
+        const ZERO: &str = r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&000000_PID&0000_REV&0000_000000000000#1&2&0&0000#{4d1e55b2}";
+        // Another SIG company, and a zero source without a game-class compatible ID.
+        for path in [APPLE, ZERO] {
+            let products = non_usb_products(&list(&[path]), no_game_class);
+            assert!(!products.microsoft_unknown, "{path}");
+            assert!(products.non_usb.is_empty());
+        }
+        // A game-class device whose VID cannot be read still fails closed.
+        let game = |path: &[u16]| String::from_utf16_lossy(path) == ZERO;
+        assert!(non_usb_products(&list(&[APPLE, ZERO]), game).microsoft_unknown);
+        // A parsed product or a SIG company never needs the devnode lookup.
+        let unread = |_: &[u16]| -> bool { unreachable!("parsed paths need no lookup") };
+        assert!(!non_usb_products(&list(&[APPLE, CLASSIC, LE]), unread).microsoft_unknown);
     }
 
     #[test]
