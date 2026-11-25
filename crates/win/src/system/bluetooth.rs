@@ -22,7 +22,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CR_BUFFER_SMALL, CR_NO_SUCH_DEVNODE, CR_NO_SUCH_VALUE, CR_SUCCESS,
 };
 use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_FriendlyName, DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_BYTE, DEVPROP_TYPE_STRING,
+    DEVPKEY_Device_FriendlyName, DEVPKEY_Device_HardwareIds, DEVPKEY_Device_MatchingDeviceId,
+    DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_BYTE, DEVPROP_TYPE_STRING, DEVPROP_TYPE_STRING_LIST,
     DEVPROP_TYPE_UINT32, DEVPROPTYPE,
 };
 use windows::Win32::Foundation::{DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER};
@@ -108,6 +109,32 @@ struct Node {
     has_property: bool,
 }
 
+/// Top-level collections found on HID devnodes of one container, from cached PnP ids.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct HidUsages {
+    game: bool,
+    mouse: bool,
+    keyboard: bool,
+}
+
+impl HidUsages {
+    fn merge(&mut self, other: Self) {
+        self.game |= other.game;
+        self.mouse |= other.mouse;
+        self.keyboard |= other.keyboard;
+    }
+
+    /// A game collection wins; a mouse plus a keyboard is ambiguous and gives nothing.
+    fn kind(self) -> Option<DeviceKind> {
+        match (self.game, self.mouse, self.keyboard) {
+            (true, _, _) => Some(DeviceKind::Controller),
+            (false, true, false) => Some(DeviceKind::Mouse),
+            (false, false, true) => Some(DeviceKind::Keyboard),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Group {
     name: Option<(bool, String)>,
@@ -119,6 +146,7 @@ struct Group {
     le_level: Option<u8>,
     other_level: Option<u8>,
     has_property: bool,
+    hid: HidUsages,
 }
 
 impl Group {
@@ -172,11 +200,15 @@ impl Group {
             container,
             connected: self.classic || le_connected,
             level: level.or(self.other_level),
-            kind: self.class.unwrap_or(if self.hands_free {
-                DeviceKind::Headset
-            } else {
-                DeviceKind::Other
-            }),
+            // Class of Device first (Classic), then the HID collections BLE peers lack it for.
+            kind: self
+                .class
+                .or(self.hid.kind())
+                .unwrap_or(if self.hands_free {
+                    DeviceKind::Headset
+                } else {
+                    DeviceKind::Other
+                }),
             name: self.name(),
         }
     }
@@ -184,6 +216,56 @@ impl Group {
 
 fn add_node(groups: &mut BTreeMap<ContainerId, Group>, node: Node) {
     groups.entry(node.container).or_default().add(node);
+}
+
+/// Adds a HID devnode's usages to the Bluetooth group of its container, if there is one.
+fn add_hid(groups: &mut BTreeMap<ContainerId, Group>, container: ContainerId, usages: HidUsages) {
+    if let Some(group) = groups.get_mut(&container) {
+        group.hid.merge(usages);
+    }
+}
+
+/// Reads `UP:xxxx_U:yyyy` tokens from `HardwareIds` (a UTF-16 multi-string) and the
+/// system class from `MatchingDeviceId`. Generic Desktop (page 1) usages 4/5 are game
+/// controllers, 2 a mouse and 6 a keyboard.
+fn hid_usages(hardware_ids: &[u16], matching_id: &[u16]) -> HidUsages {
+    let mut usages = HidUsages::default();
+    for id in hardware_ids.split(|&unit| unit == 0) {
+        let id = String::from_utf16_lossy(id).to_ascii_uppercase();
+        let Some((_, rest)) = id.split_once("UP:") else {
+            continue;
+        };
+        let (Some(page), Some(usage)) = (
+            rest.get(..4)
+                .and_then(|hex| u16::from_str_radix(hex, 16).ok()),
+            rest.get(4..)
+                .and_then(|tail| tail.strip_prefix("_U:"))
+                .and_then(|tail| tail.get(..4))
+                .and_then(|hex| u16::from_str_radix(hex, 16).ok()),
+        ) else {
+            continue;
+        };
+        match (page, usage) {
+            (1, 4 | 5) => usages.game = true,
+            (1, 2) => usages.mouse = true,
+            (1, 6) => usages.keyboard = true,
+            _ => {}
+        }
+    }
+    let end = matching_id
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(matching_id.len());
+    match String::from_utf16_lossy(&matching_id[..end])
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "HID_DEVICE_SYSTEM_GAME" => usages.game = true,
+        "HID_DEVICE_SYSTEM_MOUSE" => usages.mouse = true,
+        "HID_DEVICE_SYSTEM_KEYBOARD" => usages.keyboard = true,
+        _ => {}
+    }
+    usages
 }
 
 fn observations(groups: BTreeMap<ContainerId, Group>) -> Vec<Observation> {
@@ -280,7 +362,50 @@ fn read_groups(metadata_only: bool) -> Result<BTreeMap<ContainerId, Group>> {
         }
         add_node(&mut groups, entry);
     }
+    if !metadata_only {
+        // BLE peers carry no Class of Device; take their kind from HID devnodes in the same
+        // container. Cached properties only, never an open; a failed read only loses the kind.
+        for id in ids
+            .split_inclusive(|&unit| unit == 0)
+            .filter(|id| starts_with(id, br"HID\"))
+        {
+            if let Some((container, usages)) = hid_node_usages(id, &groups) {
+                add_hid(&mut groups, container, usages);
+            }
+        }
+    }
     Ok(groups)
+}
+
+fn hid_node_usages(
+    id: &[u16],
+    groups: &BTreeMap<ContainerId, Group>,
+) -> Option<(ContainerId, HidUsages)> {
+    let node = locate(id, CM_LOCATE_DEVNODE_PHANTOM).ok()??;
+    let container = node_container(node).ok()??;
+    if !groups.contains_key(&container) {
+        return None;
+    }
+    let hardware_ids = wide_property(node, &DEVPKEY_Device_HardwareIds, DEVPROP_TYPE_STRING_LIST);
+    let matching_id = wide_property(node, &DEVPKEY_Device_MatchingDeviceId, DEVPROP_TYPE_STRING);
+    Some((container, hid_usages(&hardware_ids, &matching_id)))
+}
+
+/// A string or string-list property as UTF-16 units, read into a bounded buffer; empty
+/// when absent, of another type, too long or unreadable.
+fn wide_property(node: u32, key: &DEVPROPKEY, expected: DEVPROPTYPE) -> Vec<u16> {
+    let mut data = [0u8; 2048];
+    match property(node, key, &mut data) {
+        Ok(Some((kind, size))) if kind == expected => data
+            .get(..size as usize)
+            .unwrap_or_default()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&unit| u16::from_le_bytes(unit))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn locate(id: &[u16], flags: CM_LOCATE_DEVNODE_FLAGS) -> Result<Option<u32>> {
@@ -553,6 +678,92 @@ mod tests {
                 ..Node::default()
             },
         ])
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    /// A BLE peer (no Class of Device unless `cod` is given) plus HID devnodes in its
+    /// container, each as (`HardwareIds` multi-string, `MatchingDeviceId`).
+    fn le_kind(cod: Option<DeviceKind>, hids: &[(&str, &str)]) -> DeviceKind {
+        let mut groups = BTreeMap::new();
+        add_node(
+            &mut groups,
+            Node {
+                container: ID,
+                role: NodeRole::LePeer,
+                kind: cod,
+                connected: true,
+                level: Some(68),
+                ..Node::default()
+            },
+        );
+        for (hardware, matching) in hids {
+            add_hid(
+                &mut groups,
+                ID,
+                hid_usages(&wide(hardware), &wide(matching)),
+            );
+        }
+        // A HID node in another container never reaches this group.
+        add_hid(
+            &mut groups,
+            [0x34; 16],
+            hid_usages(&wide("HID\\VID_045E&UP:0001_U:0005\0\0"), &[]),
+        );
+        let observed = observations(groups);
+        assert_eq!(observed.len(), 1);
+        observed[0].kind
+    }
+
+    const PAD: (&str, &str) = (
+        "HID\\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02045e_PID&0b13\0HID\\VID_045E&UP:0001_U:0005\0\0",
+        "",
+    );
+    const MOUSE_HID: (&str, &str) = (
+        "HID\\VID_046D&UP:0001_U:0002\0\0",
+        "HID_DEVICE_SYSTEM_MOUSE",
+    );
+    const KEYS_HID: (&str, &str) = (
+        "HID\\VID_046D&UP:0001_U:0006\0\0",
+        "HID_DEVICE_SYSTEM_KEYBOARD",
+    );
+
+    #[test]
+    fn ble_hid_usage_gives_the_device_kind() {
+        assert_eq!(le_kind(None, &[PAD]), DeviceKind::Controller);
+        assert_eq!(
+            le_kind(None, &[("HID\\VID_045E\0\0", "HID_DEVICE_SYSTEM_GAME")]),
+            DeviceKind::Controller
+        );
+        assert_eq!(le_kind(None, &[MOUSE_HID]), DeviceKind::Mouse);
+        assert_eq!(le_kind(None, &[KEYS_HID]), DeviceKind::Keyboard);
+        // Ambiguous without a game collection: fail closed.
+        assert_eq!(le_kind(None, &[MOUSE_HID, KEYS_HID]), DeviceKind::Other);
+        // Any game collection wins.
+        assert_eq!(
+            le_kind(None, &[MOUSE_HID, KEYS_HID, PAD]),
+            DeviceKind::Controller
+        );
+        // Other usages (consumer control) give nothing.
+        assert_eq!(
+            le_kind(None, &[("HID\\VID_046D&UP:000C_U:0001\0\0", "")]),
+            DeviceKind::Other
+        );
+        assert_eq!(le_kind(None, &[]), DeviceKind::Other);
+    }
+
+    #[test]
+    fn class_of_device_keeps_priority_over_hid_usage() {
+        assert_eq!(
+            le_kind(Some(DeviceKind::Headset), &[PAD]),
+            DeviceKind::Headset
+        );
+        assert_eq!(
+            le_kind(Some(DeviceKind::Mouse), &[KEYS_HID]),
+            DeviceKind::Mouse
+        );
     }
 
     #[test]
