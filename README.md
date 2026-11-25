@@ -16,6 +16,13 @@ Hardware-tested; the levels shown matched G HUB's within 1 point (BatterySight r
 - Logitech PRO X Wireless Gaming Headset (USB dongle 046D:0ABA)
 - Logitech PRO X Superlight on its LIGHTSPEED receiver (046D:C547)
 
+Also hardware-tested, from the battery level Windows itself keeps (nothing is sent to the device):
+
+| Devices | Connection | How the level is kept up to date |
+|---|---|---|
+| Bluetooth headsets, speakers, controllers and other devices for which Windows shows a battery level (tested with Classic earbuds and an Xbox Wireless Controller over LE; speakers untested) | Bluetooth (Classic and LE) | Windows' own cached value, read on the PC: at start, when a device connects (and again 4 s and 15 s later, as an LE device's value settles a few seconds after it connects), on resume, "Refresh now" and every 60 s while one is connected. Its icon follows its Bluetooth device class or, failing that, its HID type (controller, mouse or keyboard) |
+| Xbox controllers (Microsoft; tested with 045E:0B12) | USB cable | Windows' game-controller battery report (four levels, shown as Full, Good, Low and Critical), read on the PC when a controller is added, on resume, "Refresh now" and every 60 s while one is present. Over Bluetooth it appears as a Bluetooth device instead; a controller moved between Bluetooth and the cable shows as one row |
+
 Source-verified (the VID:PID is that of the USB device BatterySight opens: the dongle, base station or receiver, or the device itself on a cable):
 
 | Devices | Connection, VID:PID | How the level is kept up to date |
@@ -37,8 +44,7 @@ Source-verified (the VID:PID is that of the USB device BatterySight opens: the d
 | Pulsar Fusion2 1K and 8K dongles | Receiver, 3710: 5402, 5403 | The mouse reports when it links up; asked when the receiver is found, on resume, "Refresh now", once when the mouse links up without reporting within 2 s, and while the receiver reports the mouse linked at the "Check battery while in use" interval (default 10 minutes, at most every minute) |
 | Pulsar Feinmann 8K dongle | Receiver, 3710: 5404 | Asked only when the receiver is found, on resume and "Refresh now" |
 | Rapoo VT7, VT2 Pro Max, VT9 Pro V2, VT1 SE, VT7 SE, VT9 Pro (1st gen and 185A), VT3 Pro | Receiver or cable, 24AE: 1413/4613, 1423, 14A9/46A9, 1A11/4A11, 1A00/4A00, 1205, 185A, 1215/4415 (receiver/cable) | Never asked: it only listens to the status the mouse sends every few seconds while it is used. Shown asleep after 60 s without one. Charging is not shown (the sources disagree on its meaning) |
-| Bluetooth headsets, speakers, controllers and other devices for which Windows shows a battery level | Bluetooth (Classic and LE) | Windows' own cached value, read on the PC: at start, when a device connects (and again 4 s later), on resume, "Refresh now" and every 60 s while one is connected. Nothing is sent to the device |
-| Xbox controllers (Microsoft) | USB cable or Xbox Wireless Adapter | Windows' game-controller battery report (four levels, shown as Full, Good, Low and Critical), read on the PC when a controller is added, on resume, "Refresh now" and every 60 s while one is present. Nothing is sent to the controller; over Bluetooth it appears as a Bluetooth device instead |
+| Xbox controllers (Microsoft) | Xbox Wireless Adapter | As on a USB cable (above); untested on hardware |
 
 Not supported: other models of these vendors, even with the same name on the box (a different PID often means a different protocol), other HyperX, Pulsar and SteelSeries protocols, and controllers of other makes.
 
@@ -52,7 +58,7 @@ Apart from turning on a Logitech receiver's device notifications, it never sends
 - you click "Refresh now" (this also asks again a plugged-in device that stopped answering before it was recognised, and a receiver none of whose devices was recognised),
 - audio is playing to a headset that does not report its battery while in use (the PRO X Wireless): every 10 minutes by default (adjustable under "Check battery while in use", never more often than every 5 minutes; the first check after the headset wakes or is first found comes after 5), only while sound is actually playing, and never while the headset is known to be off or asleep. While such a headset is switched on and charging, it is also checked at that interval without any sound (these checks may delay its automatic power-off on the charger).
 
-The table above lists the exceptions: Rapoo mice, Bluetooth devices and Xbox controllers are never asked; SteelSeries headsets, the HyperX Cloud III and Cloud II Core and the Pulsar Feinmann are not asked during use; the HyperX Cloud Alpha 2 and Pulsefire Haste 2 are asked only as they link up; the Cloud Alpha Wireless is asked during use only while sound is audible on it (never while it charges silently), and a Pulsar Fusion2 mouse only while its receiver reports it linked. According to the sources, reading a Pulsar mouse neither wakes it nor keeps it awake.
+The tables above list the exceptions: Rapoo mice, Bluetooth devices and Xbox controllers are never asked; SteelSeries headsets, the HyperX Cloud III and Cloud II Core and the Pulsar Feinmann are not asked during use; the HyperX Cloud Alpha 2 and Pulsefire Haste 2 are asked only as they link up; the Cloud Alpha Wireless is asked during use only while sound is audible on it (never while it charges silently), and a Pulsar Fusion2 mouse only while its receiver reports it linked. According to the sources, reading a Pulsar mouse neither wakes it nor keeps it awake.
 
 Otherwise it only listens. Opening the menu never queries; it shows the last known values. A device known to be asleep is not asked until it reports again. Audio is matched to a device through the container id Windows gives both a headset's audio endpoint and its HID interfaces; BatterySight only watches which audio sessions are active and reads the endpoint's peak meter, it never records or plays audio.
 
