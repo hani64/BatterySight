@@ -65,9 +65,37 @@ pub(crate) struct Pad {
     pub(crate) wireless: bool,
     /// WGI also exposes it as a `Gamepad` (a local cast); wheels and joysticks are not.
     pub(crate) gamepad: bool,
+    /// A hash of WGI's `NonRoamableId`, which this app sees unchanged for the same pad
+    /// across reconnects and restarts. The id itself is never kept.
+    pub(crate) stable: Option<u64>,
     pub(crate) name: String,
     /// Read only for identified pads.
     pub(crate) report: Option<Report>,
+}
+
+impl Pad {
+    /// `pad:wgi:<16 hex>` from the stable id, else the per-session `pad:wgi:<counter>`.
+    pub(crate) fn key(&self) -> DeviceKey {
+        DeviceKey(match self.stable {
+            Some(stable) => format!("{WGI_PREFIX}{stable:016x}"),
+            None => self.session_key(),
+        })
+    }
+
+    fn session_key(&self) -> String {
+        format!("{WGI_PREFIX}{}", self.id)
+    }
+}
+
+/// A fixed 64-bit FNV-1a hash of a non-empty `NonRoamableId`, so that keys stay the same
+/// across app versions and the opaque id never appears in a key, history or trace.
+pub(crate) fn stable_id(non_roamable: &str) -> Option<u64> {
+    let id = non_roamable.trim();
+    (!id.is_empty()).then(|| {
+        id.bytes().fold(0xcbf2_9ce4_8422_2325, |hash: u64, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    })
 }
 
 /// An active XInput slot's gamepad battery.
@@ -369,6 +397,10 @@ impl Source {
                     .cast::<IGameController>()
                     .and_then(|controller| Gamepad::FromGameController(&controller))
                     .is_ok(),
+                stable: controller
+                    .NonRoamableId()
+                    .ok()
+                    .and_then(|id| stable_id(&id.to_string_lossy())),
                 name: String::new(),
                 report: None,
             });
@@ -448,7 +480,14 @@ impl Source {
                 ));
             }
         } else {
+            let mut keys = BTreeSet::new();
             for pad in pads {
+                // Two objects reporting one id would share a key: the later one keeps its
+                // session key instead.
+                let mut key = pad.key();
+                if !keys.insert(key.clone()) {
+                    key = DeviceKey(pad.session_key());
+                }
                 let name = if pad.name.trim().is_empty() {
                     "Xbox controller".into()
                 } else {
@@ -460,7 +499,7 @@ impl Source {
                     Via::Usb
                 };
                 inputs.push(observation(
-                    format!("{WGI_PREFIX}{}", pad.id),
+                    key.0,
                     name,
                     via,
                     pad.report.as_ref().and_then(bucket),
@@ -634,6 +673,7 @@ mod tests {
             pid,
             wireless: true,
             gamepad: true,
+            stable: None,
             name: "Example Controller".into(),
             report,
         }
@@ -1443,5 +1483,89 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["pad:wgi:1", "pad:wgi:3"]
         );
+    }
+
+    // Synthetic; real ids are opaque per-app strings.
+    const NRID: &str = "{wgi/nrid/Example-Controller-0001}";
+    const NRID_2: &str = "{wgi/nrid/Example-Controller-0002}";
+
+    fn stable_pad(id: u32, non_roamable: &str) -> Pad {
+        Pad {
+            stable: stable_id(non_roamable),
+            ..pad(id, USB, Some(report(100, 100)))
+        }
+    }
+
+    #[test]
+    fn stable_wgi_keys_come_from_a_hash_of_the_non_roamable_id() {
+        assert_eq!(stable_id(NRID), stable_id(NRID));
+        assert_ne!(stable_id(NRID), stable_id(NRID_2));
+        let key = stable_pad(7, NRID).key();
+        assert!(is_pad_key(&key));
+        let hex = key.0.strip_prefix(WGI_PREFIX).unwrap();
+        assert_eq!(hex.len(), 16);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Only the prefix and 16 hex digits: no part of the raw id.
+        for raw in [NRID, "nrid", "Example", "Controller"] {
+            assert!(!key.0.contains(raw), "{raw}");
+        }
+        // The key is fixed across releases: a known value, not a per-process hash.
+        assert_eq!(stable_id("a"), Some(0xaf63_dc4c_8601_ec8c));
+        // No usable id: the per-session counter key.
+        for empty in ["", "   "] {
+            assert_eq!(stable_id(empty), None);
+            assert_eq!(stable_pad(7, empty).key().0, "pad:wgi:7");
+        }
+    }
+
+    #[test]
+    fn a_pad_keeps_its_key_across_wgi_objects_and_identical_pads_differ() {
+        let mut source = Source::default();
+        let mut hub = hub();
+        let first = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![stable_pad(1, NRID)], &[]),
+            no_xinput,
+            0,
+        );
+        // Reconnected (or the app restarted): a new WGI object with the same id.
+        let again = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![stable_pad(2, NRID)], &[]),
+            no_xinput,
+            1_000,
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            again
+                .iter()
+                .map(|state| (state.key.clone(), state.presence))
+                .collect::<Vec<_>>(),
+            [(first[0].key.clone(), Presence::Online)]
+        );
+        // Two identical pads have distinct ids and so distinct keys.
+        let both = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![stable_pad(2, NRID), stable_pad(3, NRID_2)], &[]),
+            no_xinput,
+            2_000,
+        );
+        assert_eq!(both.len(), 2);
+        assert_ne!(both[0].key, both[1].key);
+        // Should two objects ever report one id, the second falls back to its counter.
+        let mut source = Source::default();
+        let mut hub = self::hub();
+        let same = apply(
+            &mut source,
+            &mut hub,
+            poll(vec![stable_pad(4, NRID), stable_pad(5, NRID)], &[]),
+            no_xinput,
+            0,
+        );
+        assert_eq!(same.len(), 2);
+        assert!(same.iter().any(|state| state.key.0 == "pad:wgi:5"));
     }
 }
