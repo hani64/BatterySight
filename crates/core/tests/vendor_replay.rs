@@ -262,6 +262,24 @@ fn rapoo_vt3_pro_legacy_unknown_level_does_not_replace_last_percent() {
 }
 
 #[test]
+fn rapoo_rearrival_heartbeat_keeps_the_cached_sample_age() {
+    let mut hub = hub();
+    let rx = collection(0x1215, 2, 7);
+    feed(&mut hub, HubInput::GroupArrived(group(rx.clone())), 0);
+    assert_eq!(report(&mut hub, &LEGACY, 1), [HubOutput::StateChanged]);
+    feed(&mut hub, HubInput::GroupRemoved(GroupId(1)), 50);
+    let mut returned = group(rx);
+    returned.id = GroupId(2);
+    feed(&mut hub, HubInput::GroupArrived(returned), 60);
+    // The receiver's first frame after re-enumeration is the 7F heartbeat.
+    report(&mut hub, &[0xBB, 0xB0, 0x51, 0x20, 3, 2, 0x7F], 70);
+    let state = hub.snapshot().remove(0);
+    assert_eq!(state.level, Some(Level::Percent(98)));
+    assert_eq!((state.updated_ms, state.source), (1, Source::Push));
+    assert_eq!(state.presence, Presence::Online);
+}
+
+#[test]
 fn rapoo_vt3_pro_legacy_bb_b0_receiver_and_cable() {
     // PyFlat RapooProtocol.cs: exact 7-byte collection and both USB IDs.
     let mut status = LEGACY;
@@ -697,6 +715,33 @@ fn steelseries_dongle_only_sends_once_per_proven_link_edge_and_one_shot() {
 }
 
 #[test]
+fn steelseries_rearrival_link_up_before_b0_keeps_the_cached_sample_age() {
+    let mut hub = hub();
+    steelseries_sent(
+        hub.handle(HubInput::GroupArrived(steelseries_group(0x2232, 3, 65)), 0),
+        None,
+    );
+    let due = hub.next_deadline().expect("initial settle");
+    steelseries_sent(hub.handle(HubInput::Tick, due), Some((0, 65)));
+    steelseries_sent(
+        steelseries_input(&mut hub, RX, &[0, 0xB0, 3, 0, 80, 3], due + 1),
+        None,
+    );
+    steelseries_sent(hub.handle(HubInput::GroupRemoved(GroupId(1)), 10_000), None);
+    let mut returned = steelseries_group(0x2232, 3, 65);
+    returned.id = GroupId(2);
+    steelseries_sent(hub.handle(HubInput::GroupArrived(returned), 10_010), None);
+    // B9 link-up arrives before the B0 reply re-establishes a level.
+    steelseries_sent(
+        steelseries_input(&mut hub, OTHER, &[0, 0xB9, 3, 2], 10_020),
+        None,
+    );
+    steelseries_state(&hub, Presence::Online, Some(80), Charge::Discharging);
+    let state = &hub.snapshot()[0];
+    assert_eq!((state.updated_ms, state.source), (due + 1, Source::Query));
+}
+
+#[test]
 fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
     // Linux-Arctis-Manager base_arctis_gamebuds_dongle.yaml (Windows fields),
     // HeadsetControl steelseries_arctis_gamebuds.hpp (lower active-bud level).
@@ -739,7 +784,11 @@ fn steelseries_gamebuds_link_uses_b5_and_only_active_buds() {
         None,
     );
     steelseries_state(&hub, Presence::Offline, Some(82), Charge::Unknown);
-    assert_eq!(hub.snapshot()[0].updated_ms, 2_008, "a dock-out is not a reading");
+    assert_eq!(
+        hub.snapshot()[0].updated_ms,
+        2_008,
+        "a dock-out is not a reading"
+    );
     let offline = hub.snapshot();
     steelseries_sent(
         steelseries_input(&mut hub, OTHER, &[0, 0xB5, 0, 0, 2, 3], 2_010),

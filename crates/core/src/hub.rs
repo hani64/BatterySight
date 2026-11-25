@@ -1029,7 +1029,9 @@ impl Hub {
         let behind_receiver = initial.via == Some(Via::Receiver);
         let (verification, catalog_name) = self.identity(slot, behind_receiver, wpid);
         let product = slot.product.clone();
-        let preserve_level_less_sample = slot.kind == EngineKind::Sonix
+        // A level-less re-registration (a link or heartbeat frame first) is not a new
+        // reading; HID++ keeps its pre-M3 behaviour.
+        let preserve_level_less_sample = slot.kind != EngineKind::Hidpp
             && initial.level.is_none()
             && initial.millivolts.is_none();
 
