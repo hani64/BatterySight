@@ -1,6 +1,7 @@
 //! Windows platform layer for BatterySight.
 
 pub mod audio;
+pub mod diagnostics;
 pub mod hid_enum;
 mod hid_io;
 pub mod notify;

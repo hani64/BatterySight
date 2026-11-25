@@ -55,6 +55,13 @@ Changes apply at once and are saved to `settings.toml`. Only one instance runs p
 - `batterysight --tray-only` shows one notification-area icon per device instead. Use it if the widget does not appear on your Windows build. The app also switches to tray icons by itself when Windows refuses the widget window or the widget cannot find its place on the taskbar; it then tries the widget again 15 s, 1 min and 5 min later, and whenever Explorer restarts or the displays or settings change. If the widget stops responding (a stalled widget would freeze the taskbar's mouse input), it restarts itself with `--tray-only` (after about 1.5 s while Explorer is responsive, after about 5 s otherwise) and keeps tray icons until the next start. The menu's "Show as" says when tray icons show for one of these reasons; choosing "Taskbar widget" there tries the widget at once.
 - `batterysight --list` prints the devices it finds, one per line, and exits.
 
+### Device reports for contributors
+
+Two read-only tools help add support for a device. Both run next to a running BatterySight, send nothing to any device and write only to the console or to a file you redirect them to; nothing is uploaded.
+
+- `batterysight --dump > dump.txt` lists every HID collection (VID:PID, interface, usage page and usage, report lengths, the name Windows cached) and every Bluetooth device's name and whether Windows has a battery property for it.
+- `batterysight --capture 046D:C547 5 > capture.txt` records, for 1 to 60 whole minutes, the input reports of that VID:PID's vendor-defined collections, opened shared and read-only (keyboard, mouse and gamepad input is never opened). Each line holds the milliseconds since the start, a collection label (`c1`, `c2`, …) and the report bytes exactly as read.
+
 ## Building
 
 ```

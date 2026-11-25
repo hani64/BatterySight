@@ -745,6 +745,19 @@ pub(crate) mod tests {
             unsafe { ReadFile(self.0, Some(&mut buffer), Some(&mut read), None) }.unwrap();
             buffer[..read as usize].to_vec()
         }
+
+        /// Whether a client has the pipe open: a write fails while the server only listens.
+        pub(crate) fn has_client(&self) -> bool {
+            let mut written = 0;
+            // SAFETY: synchronous write from a live buffer on an open handle.
+            match unsafe { WriteFile(self.0, Some(&[0]), Some(&mut written), None) } {
+                Ok(()) => true,
+                Err(error) => {
+                    assert_eq!(error.code(), ERROR_PIPE_LISTENING.to_hresult());
+                    false
+                }
+            }
+        }
     }
 
     impl Drop for Server {

@@ -2,6 +2,7 @@
 
 mod alerts;
 mod autostart;
+mod diagnostics;
 mod list;
 mod ui;
 
@@ -14,7 +15,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
 use windows::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    SetStdHandle,
 };
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::core::w;
@@ -25,9 +27,8 @@ const TAKEOVER_WAIT_MS: u32 = 10_000;
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
-    if args.first().is_some_and(|arg| arg == "--list") {
-        attach_parent_console();
-        std::process::exit(list::run());
+    if let Some(code) = run_cli(&args) {
+        std::process::exit(code);
     }
     // `--takeover` (hidden): started by the widget watchdog just before it ends this
     // instance, so wait for the instance to go instead of leaving.
@@ -90,14 +91,56 @@ impl Drop for SingleInstance {
     }
 }
 
+/// Runs `--list`, `--dump` or `--capture` and returns its exit code, or `None` to start the
+/// app. Comes before the single-instance check and before the store, traces or audio start.
+fn run_cli(args: &[OsString]) -> Option<i32> {
+    if args.first().is_some_and(|arg| arg == "--list") {
+        attach_parent_console();
+        return Some(list::run());
+    }
+    let command = diagnostics::command(args)?;
+    attach_parent_console();
+    Some(diagnostics::run(command))
+}
+
 /// A GUI-subsystem process has no console: prints go to the console it was started from.
-/// Output redirected to a file or pipe keeps its handle, which attaching would replace.
+/// Output redirected to a file or pipe keeps its handle, which attaching would replace, so
+/// a redirected stdout (a capture to a file) still leaves warnings on the console's stderr.
 fn attach_parent_console() {
-    // SAFETY: no pointers involved; `GetFileType` of an invalid handle is FILE_TYPE_UNKNOWN.
-    let redirected = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }
-        .is_ok_and(|h| matches!(unsafe { GetFileType(h) }, FILE_TYPE_DISK | FILE_TYPE_PIPE));
-    if !redirected {
-        // SAFETY: no pointers involved. Failure (no parent console) just leaves no output.
-        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    let redirected = |kind| {
+        // SAFETY: no pointers involved; `GetFileType` of an invalid handle is FILE_TYPE_UNKNOWN.
+        unsafe { GetStdHandle(kind) }.ok().filter(|&h| {
+            matches!(unsafe { GetFileType(h) }, FILE_TYPE_DISK | FILE_TYPE_PIPE)
+        })
+    };
+    let (out, err) = (redirected(STD_OUTPUT_HANDLE), redirected(STD_ERROR_HANDLE));
+    if out.is_some() && err.is_some() {
+        return;
+    }
+    // SAFETY: no pointers involved. Failure (no parent console) just leaves no output.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok() {
+        for (kind, handle) in [(STD_OUTPUT_HANDLE, out), (STD_ERROR_HANDLE, err)] {
+            if let Some(handle) = handle {
+                // SAFETY: restores a handle this process already had open.
+                let _ = unsafe { SetStdHandle(kind, handle) };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_run_while_another_instance_holds_the_mutex() {
+        // Either this test or an already running BatterySight now holds the mutex.
+        let held = SingleInstance::acquire(false);
+        assert!(SingleInstance::acquire(false).is_none());
+        for list in [&["--capture", "046D:C547", "0"][..], &["--dump", "extra"]] {
+            let list: Vec<OsString> = list.iter().map(OsString::from).collect();
+            assert_eq!(run_cli(&list), Some(2), "{list:?}");
+        }
+        drop(held);
     }
 }

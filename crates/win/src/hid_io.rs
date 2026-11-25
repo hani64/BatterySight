@@ -58,6 +58,12 @@ pub(crate) fn is_exclusive(usage_page: u16, usage: u16) -> bool {
     usage_page == 0x01 && matches!(usage, 0x02 | 0x06)
 }
 
+/// Whether the collection is vendor-defined (usage page 0xFF00-0xFFFF), never a system
+/// keyboard, mouse, gamepad or consumer-control collection.
+pub(crate) fn is_vendor(usage_page: u16) -> bool {
+    usage_page >= 0xFF00
+}
+
 /// Opens a collection with the selected access rights, shared read/write, never exclusively.
 /// A path that is not NUL-terminated is refused with `ERROR_INVALID_PARAMETER`.
 pub(crate) fn open(path: &[u16], read: bool, write: bool) -> windows::core::Result<OwnedHandle> {
@@ -274,6 +280,15 @@ mod tests {
         assert!(!is_exclusive(0x01, 0x05));
         assert!(!is_exclusive(0x0C, 0x01));
         assert!(!is_exclusive(0xFF00, 0x02));
+    }
+
+    #[test]
+    fn only_vendor_pages_are_vendor() {
+        assert!(is_vendor(0xFF00));
+        assert!(is_vendor(0xFFC0));
+        assert!(!is_vendor(0x0001));
+        assert!(!is_vendor(0x000C));
+        assert!(!is_vendor(0xFEFF));
     }
 
     #[test]
