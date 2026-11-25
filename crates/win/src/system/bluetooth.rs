@@ -607,7 +607,10 @@ mod tests {
             ])
         };
         assert!(!group(false)[0].connected);
-        assert!(group(true)[0].connected);
+        let on = group(true);
+        assert_eq!(on.len(), 1);
+        assert!(on[0].connected);
+        assert_eq!(on[0].level, Some(59));
 
         let hub = Hub::new(Catalog::builtin(), Policy::default());
         let mut source = Source::default();
