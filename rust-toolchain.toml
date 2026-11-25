@@ -1,3 +1,4 @@
+# Toolchain bumps are deliberate: bump in its own commit and fix any new lints in that same commit.
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]
