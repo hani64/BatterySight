@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use batterysight_core::hub::HubInput;
+use batterysight_core::hub::{Hub, HubInput};
 use batterysight_core::model::{
     DeviceKey, DeviceKind, DeviceUpdate, Level, Presence, Source as SampleSource,
     SystemObservation, Verification, Via,
@@ -11,10 +11,10 @@ use batterysight_core::model::{
 use batterysight_core::time::Ms;
 use windows::Win32::Devices::Bluetooth::{
     COD_AUDIO_MINOR_HANDS_FREE, COD_AUDIO_MINOR_HEADPHONES, COD_AUDIO_MINOR_HEADSET,
-    COD_AUDIO_MINOR_HEADSET_HANDS_FREE, COD_MAJOR_AUDIO, COD_MAJOR_MASK, COD_MAJOR_PERIPHERAL,
-    COD_MINOR_BIT_OFFSET, COD_MINOR_MASK, COD_PERIPHERAL_MINOR_GAMEPAD,
-    COD_PERIPHERAL_MINOR_JOYSTICK, COD_PERIPHERAL_MINOR_KEYBOARD_MASK,
-    COD_PERIPHERAL_MINOR_POINTER_MASK,
+    COD_AUDIO_MINOR_HEADSET_HANDS_FREE, COD_AUDIO_MINOR_LOUDSPEAKER, COD_MAJOR_AUDIO,
+    COD_MAJOR_MASK, COD_MAJOR_PERIPHERAL, COD_MINOR_BIT_OFFSET, COD_MINOR_MASK,
+    COD_PERIPHERAL_MINOR_GAMEPAD, COD_PERIPHERAL_MINOR_JOYSTICK,
+    COD_PERIPHERAL_MINOR_KEYBOARD_MASK, COD_PERIPHERAL_MINOR_POINTER_MASK,
 };
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GETIDLIST_FILTER_NONE, CM_Get_DevNode_PropertyW, CM_Get_Device_ID_List_SizeW,
@@ -360,6 +360,7 @@ fn device_kind(class: u32) -> Option<DeviceKind> {
             | COD_AUDIO_MINOR_HANDS_FREE
             | COD_AUDIO_MINOR_HEADSET_HANDS_FREE
             | COD_AUDIO_MINOR_HEADPHONES => Some(DeviceKind::Headset),
+            COD_AUDIO_MINOR_LOUDSPEAKER => Some(DeviceKind::Speaker),
             _ => Some(DeviceKind::Other),
         },
         COD_MAJOR_PERIPHERAL if minor & COD_PERIPHERAL_MINOR_KEYBOARD_MASK != 0 => {
@@ -396,6 +397,7 @@ pub(crate) struct Source {
     active: BTreeSet<ContainerId>,
     requested: bool,
     delayed: Option<Ms>,
+    trailing: Option<Ms>,
     periodic: Option<Ms>,
 }
 
@@ -403,8 +405,16 @@ impl Source {
     pub(crate) fn request(&mut self, now: Ms, follow_up: bool) {
         self.requested = true;
         if follow_up {
-            self.delayed
-                .get_or_insert(now.saturating_add(CONNECT_FOLLOW_UP_MS));
+            let at = now.saturating_add(CONNECT_FOLLOW_UP_MS);
+            // Keep the first follow-up, then cover every later connection with
+            // at most one trailing scan at the newest connection's deadline.
+            if let Some(first) = self.delayed {
+                if at > first {
+                    self.trailing = Some(at);
+                }
+            } else {
+                self.delayed = Some(at);
+            }
         }
     }
 
@@ -420,7 +430,7 @@ impl Source {
     pub(crate) fn take_due(&mut self, now: Ms) -> bool {
         let mut due = std::mem::take(&mut self.requested);
         if self.delayed.is_some_and(|at| at <= now) {
-            self.delayed = None;
+            self.delayed = self.trailing.take().filter(|&at| at > now);
             due = true;
         }
         if self.periodic.is_some_and(|at| at <= now) {
@@ -431,7 +441,12 @@ impl Source {
         due
     }
 
-    pub(crate) fn reconcile(&mut self, scan: Result<Vec<Observation>>, now: Ms) -> Vec<HubInput> {
+    pub(crate) fn reconcile(
+        &mut self,
+        scan: Result<Vec<Observation>>,
+        now: Ms,
+        hub: &Hub,
+    ) -> Vec<HubInput> {
         let Ok(observed) = scan else {
             return Vec::new();
         };
@@ -444,14 +459,15 @@ impl Source {
         let mut active = BTreeSet::new();
         let mut inputs = Vec::new();
         for observation in observed.into_iter().filter(|node| node.connected) {
-            let known = self.active.remove(&observation.container);
-            if !known && observation.level.is_none() {
+            let key = key_for(&observation.container);
+            if observation.level.is_none() && !hub.retains_system(&key, now) {
                 continue;
             }
+            self.active.remove(&observation.container);
             active.insert(observation.container);
             inputs.push(HubInput::System(SystemObservation {
                 update: DeviceUpdate {
-                    key: key_for(&observation.container),
+                    key,
                     name: Some(observation.name),
                     kind: Some(observation.kind),
                     via: Some(Via::Bluetooth),
@@ -573,7 +589,7 @@ mod tests {
         let mut hub = Hub::new(Catalog::builtin(), Policy::default());
         let mut apply = |scan, now| {
             source
-                .reconcile(scan, now)
+                .reconcile(scan, now, &hub)
                 .into_iter()
                 .flat_map(|input| hub.handle(input, now))
                 .collect::<Vec<_>>()
@@ -604,42 +620,66 @@ mod tests {
     #[test]
     fn a_successfully_empty_scan_marks_the_active_device_gone() {
         let mut source = Source::default();
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
         assert!(matches!(
-            &source.reconcile(Ok(classic(true, Some(75))), 0)[..],
+            &source.reconcile(Ok(classic(true, Some(75))), 0, &hub)[..],
             [HubInput::System(_)]
         ));
         assert!(matches!(
-            &source.reconcile(Ok(vec![]), 1)[..],
+            &source.reconcile(Ok(vec![]), 1, &hub)[..],
             [HubInput::SystemGone(_)]
         ));
     }
 
     #[test]
+    fn bluetooth_loudspeaker_class_is_not_generic_audio() {
+        assert_eq!(device_kind(0x0414), Some(DeviceKind::Speaker));
+        assert_eq!(device_kind(0x0400), Some(DeviceKind::Other));
+    }
+
+    #[test]
+    fn bluetooth_late_connections_keep_one_trailing_scan_while_idle() {
+        let mut source = Source::default();
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
+        for now in [0, 3_800, 3_900] {
+            source.request(now, true);
+            assert!(source.take_due(now));
+            source.reconcile(Ok(classic(false, Some(99))), now, &hub);
+        }
+        assert_eq!(source.deadline(), Some(4_000));
+        assert!(source.take_due(4_000));
+        source.reconcile(Ok(classic(false, Some(99))), 4_000, &hub);
+        assert_eq!(source.deadline(), Some(7_900));
+        assert!(!source.take_due(7_899));
+        assert!(source.take_due(7_900));
+        source.reconcile(Ok(classic(false, Some(99))), 7_900, &hub);
+        assert_eq!(source.deadline(), None);
+    }
+
+    #[test]
     fn idle_connect_event_wakes_discovery_with_one_bounded_follow_up() {
         let mut source = Source::default();
-        source.reconcile(Ok(classic(false, Some(99))), 0);
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
+        source.reconcile(Ok(classic(false, Some(99))), 0, &hub);
         assert_eq!(source.deadline(), None);
         source.request(20, true);
         assert!(source.take_due(20));
         // PnP can still show the old state on the first scan.
-        source.reconcile(Ok(classic(false, Some(99))), 20);
-        assert_eq!(source.deadline(), Some(4_020));
-        source.request(500, true);
-        assert!(source.take_due(500));
+        source.reconcile(Ok(classic(false, Some(99))), 20, &hub);
         assert_eq!(source.deadline(), Some(4_020));
         assert!(!source.take_due(4_019));
         assert!(source.take_due(4_020));
         assert!(matches!(
-            &source.reconcile(Ok(classic(true, Some(75))), 4_020)[..],
+            &source.reconcile(Ok(classic(true, Some(75))), 4_020, &hub)[..],
             [HubInput::System(_)]
         ));
         assert_eq!(source.deadline(), Some(64_020));
         assert!(source.take_due(64_020));
-        source.reconcile(Err(windows::core::Error::from_hresult(E_FAIL)), 64_020);
+        source.reconcile(Err(windows::core::Error::from_hresult(E_FAIL)), 64_020, &hub);
         assert_eq!(source.deadline(), Some(124_020));
         source.request(65_000, false);
         assert!(source.take_due(65_000));
-        source.reconcile(Ok(classic(false, Some(75))), 65_000);
+        source.reconcile(Ok(classic(false, Some(75))), 65_000, &hub);
         assert_eq!(source.deadline(), None);
     }
 }

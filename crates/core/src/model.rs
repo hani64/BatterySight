@@ -14,6 +14,7 @@ pub enum DeviceKind {
     Mouse,
     Keyboard,
     Headset,
+    Speaker,
     Controller,
     Other,
 }

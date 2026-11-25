@@ -294,6 +294,14 @@ impl Hub {
         states
     }
 
+    /// Whether the system provider can still update a known entry without a fresh sample.
+    /// A grace entry is expired at its deadline, even if the next tick has not run yet.
+    pub fn retains_system(&self, key: &DeviceKey, now: Ms) -> bool {
+        self.system
+            .get(key)
+            .is_some_and(|device| device.expires_at.is_none_or(|at| now < at))
+    }
+
     /// When the next `Tick` is due: the earliest engine deadline, grace expiry or charging
     /// device's read ([`Hub::charging_reads`]).
     pub fn next_deadline(&self) -> Option<Ms> {

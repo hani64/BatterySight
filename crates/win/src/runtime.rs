@@ -509,7 +509,7 @@ impl Device {
         now: Ms,
     ) {
         let mut changed = false;
-        for input in self.bluetooth.reconcile(scanned, now) {
+        for input in self.bluetooth.reconcile(scanned, now, &self.hub) {
             changed |= self
                 .hub
                 .handle(input, now)
@@ -854,12 +854,15 @@ impl Device {
 
     fn publish(&mut self) {
         let mut snapshot = self.hub.snapshot();
-        // For each cached container, record whether it also has an Online HID
-        // owner (Some(true)), only an inactive HID entry (Some(false)), or neither.
+        // For each cached container: its own presence, any online (or inactive)
+        // HID owner, and whether Bluetooth was previously the visible source.
         let mut cached: BTreeMap<_, _> = snapshot
             .iter()
             .filter_map(|state| {
-                Some((bluetooth::container_of(&state.key)?, (state.presence, None)))
+                Some((
+                    bluetooth::container_of(&state.key)?,
+                    (state.presence, None, false),
+                ))
             })
             .collect();
         self.hid_containers.retain(|key, _| {
@@ -886,27 +889,35 @@ impl Device {
                 }
             }
             if let Some(container) = self.hid_containers.get(&state.key)
-                && let Some((_, hid)) = cached.get_mut(container)
+                && let Some((_, hid, _)) = cached.get_mut(container)
             {
                 let live = owner.is_some() && state.presence == Presence::Online;
                 *hid = Some(hid.unwrap_or(false) || live);
             }
         }
+        let mut published = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        for state in published.iter() {
+            if let Some(container) = bluetooth::container_of(&state.key)
+                && let Some((_, _, was_visible)) = cached.get_mut(&container)
+            {
+                *was_visible = true;
+            }
+        }
+        // A live source wins; if both are inactive, keep the previous choice
+        // until its own grace ends rather than switching to another stale row.
+        cached.retain(|_, (presence, hid, was_visible)| {
+            *hid != Some(true) && (*presence == Presence::Online || hid.is_none() || *was_visible)
+        });
         snapshot.retain(|state| {
             if let Some(container) = bluetooth::container_of(&state.key) {
-                let (_, hid) = cached[&container];
-                hid != Some(true) && (state.presence == Presence::Online || hid.is_none())
-            } else if let Some((presence, hid)) = self
-                .hid_containers
-                .get(&state.key)
-                .and_then(|container| cached.get(container))
-            {
-                *presence != Presence::Online || *hid == Some(true)
+                cached.contains_key(&container)
             } else {
-                true
+                !self
+                    .hid_containers
+                    .get(&state.key)
+                    .is_some_and(|container| cached.contains_key(container))
             }
         });
-        let mut published = self.states.lock().unwrap_or_else(PoisonError::into_inner);
         if *published != snapshot {
             *published = snapshot;
             drop(published);
@@ -2141,6 +2152,49 @@ receive = { usage_page = 0xFF43, usage = 0x0202, product = "Alpha" }
             ],
         );
         assert_eq!(states[0].updated_ms, 10);
+        drop(states);
+        // Bluetooth was the last visible source. A stale HID grace entry cannot
+        // replace it when the cache now reports a disconnect.
+        device.apply_bluetooth_scan(Ok(vec![observation(empty)]), now_ms());
+        let states = device.states.lock().unwrap();
+        let last = &states[0];
+        assert_eq!(last.key, bluetooth::key_for(&HEADSET));
+        assert_eq!(last.presence, Presence::Offline);
+        assert_eq!(last.level, Some(Level::Percent(72)));
+        assert_eq!(last.updated_ms, 10);
+    }
+
+    #[test]
+    fn bluetooth_level_less_reconnect_uses_only_the_hubs_unexpired_sample() {
+        let mut device = device();
+        let scan = |connected, level| {
+            Ok(vec![bluetooth::Observation {
+                container: HEADSET,
+                name: "Cached Bluetooth".into(),
+                kind: batterysight_core::model::DeviceKind::Headset,
+                connected,
+                level,
+            }])
+        };
+        device.apply_bluetooth_scan(scan(true, None), 1);
+        assert!(device.states.lock().unwrap().is_empty());
+        device.apply_bluetooth_scan(scan(true, Some(72)), 10);
+        device.apply_bluetooth_scan(scan(false, Some(60)), 20);
+        device.apply_bluetooth_scan(scan(true, None), 60_019);
+        {
+            let states = device.states.lock().unwrap();
+            assert_eq!(states[0].presence, Presence::Online);
+            assert_eq!(states[0].level, Some(Level::Percent(72)));
+            assert_eq!((states[0].source, states[0].updated_ms), (Source::Os, 10));
+        }
+        device.feed(HubInput::Tick, 60_020);
+        assert_eq!(device.states.lock().unwrap()[0].presence, Presence::Online);
+        device.apply_bluetooth_scan(scan(false, None), 60_021);
+        // The grace cannot be extended even if the scan runs at expiry before Tick.
+        device.apply_bluetooth_scan(scan(true, None), 120_021);
+        device.feed(HubInput::Tick, 120_021);
+        device.apply_bluetooth_scan(scan(true, None), 120_022);
+        assert!(device.states.lock().unwrap().is_empty());
     }
 
     const HEADSET: ContainerId = [1; 16];
