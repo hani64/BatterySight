@@ -247,6 +247,13 @@ impl Settings {
         changed
     }
 
+    /// Forgets the names of devices for which `keep` is false; whether any was removed.
+    pub fn forget_names(&mut self, keep: impl Fn(&DeviceKey) -> bool) -> bool {
+        let before = self.names.len();
+        self.names.retain(|key, _| keep(key));
+        self.names.len() != before
+    }
+
     /// Every poll interval in milliseconds, as the scheduler takes them.
     pub fn interval_gaps(&self) -> HashMap<DeviceKey, Ms> {
         self.intervals
@@ -419,6 +426,8 @@ mod tests {
             names: [
                 (key("bt:0000000000000000000000000000000A"), "Buds".into()),
                 (key("pad:wgi:1"), "Pad \"one\" \\ ünï".into()),
+                (key("ctl"), "a\nb\t\u{1}\u{7f}\"'''".into()),
+                (key("long"), "x".repeat(10_000)),
             ]
             .into_iter()
             .collect(),
@@ -487,6 +496,22 @@ mod tests {
         assert!(settings.remember_names(&[buds.clone()]));
         assert_eq!(settings.names[&buds.key], "My Buds");
         assert_eq!(settings.names[&pad.key], "pad:wgi:1");
+    }
+
+    #[test]
+    fn names_without_a_device_or_history_are_forgotten() {
+        let mut settings = Settings::default();
+        for k in ["now", "kept", "gone"] {
+            settings.names.insert(key(k), k.to_uppercase());
+        }
+        let keep = |k: &DeviceKey| k.0 == "now" || k.0 == "kept";
+        assert!(settings.forget_names(keep));
+        assert_eq!(
+            settings.names.keys().cloned().collect::<Vec<_>>(),
+            keys(&["kept", "now"])
+        );
+        // Nothing left to remove: nothing to write.
+        assert!(!settings.forget_names(keep));
     }
 
     #[test]

@@ -131,6 +131,13 @@ impl Store {
         Settings::default()
     }
 
+    /// Whether a save would replace only settings that were loaded (or none): false while
+    /// `settings.toml` holds settings that could not be read or set aside, until a save has
+    /// set it aside. Automatic saves wait for this; a user's own change does not.
+    pub fn settings_loaded(&self) -> bool {
+        !self.keep_existing.load(Ordering::Relaxed)
+    }
+
     /// Queues writing `settings` to `settings.toml` (temp file, then rename); when several
     /// saves queue up between two [`Store::run`] jobs, only the latest is written.
     pub fn save_settings(&self, settings: Settings) {
@@ -380,6 +387,7 @@ mod tests {
         let dir = TempDir::new();
         let store = open(&dir);
         assert_eq!(store.load_settings(), Settings::default());
+        assert!(store.settings_loaded());
         store.stop();
         assert!(!dir.path().join("settings.toml.bad").exists());
     }
@@ -397,6 +405,8 @@ mod tests {
             let store = open(&dir);
 
             assert_eq!(store.load_settings(), Settings::default());
+            // Set aside: a save no longer replaces anything unread.
+            assert!(store.settings_loaded());
             store.stop();
             assert!(!file.exists());
             assert_eq!(
@@ -455,6 +465,8 @@ mod tests {
         // Another program holds the file without sharing it: it cannot be read.
         let held = hold(&file, 0);
         assert_eq!(store.load_settings(), Settings::default());
+        // Not loaded: only a user's own change may set the file aside.
+        assert!(!store.settings_loaded());
         drop(held);
         let saved = Settings {
             display: DisplayMode::Tray,
@@ -482,6 +494,7 @@ mod tests {
         // Readable, but not renamable while held without delete sharing.
         let held = hold(&file, FILE_SHARE_READ.0);
         assert_eq!(store.load_settings(), Settings::default());
+        assert!(!store.settings_loaded());
         drop(held);
         assert_eq!(fs::read(&file).unwrap(), garbage);
         store.save_settings(Settings::default());

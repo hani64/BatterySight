@@ -444,7 +444,7 @@ pub struct Options {
 
 /// Runs the UI on this thread until "Exit". Returns the process exit code. `store` has
 /// loaded `settings` and `samples` (the history); it is stopped before this returns.
-pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sample>) -> i32 {
+pub fn run(options: &Options, store: Store, mut settings: Settings, samples: Vec<Sample>) -> i32 {
     *STORE.lock().unwrap_or_else(PoisonError::into_inner) = Some(store);
     DEBUG_STALL_ARMED.store(options.debug_stall, Ordering::Relaxed);
     DEBUG_NO_ANCHOR_ARMED.store(options.debug_no_anchor, Ordering::Relaxed);
@@ -472,6 +472,10 @@ pub fn run(options: &Options, store: Store, settings: Settings, samples: Vec<Sam
     let unix_now = unix_now_ms();
     let mut history = HashMap::new();
     history::add(&mut history, samples, unix_now);
+    if prune_names(&mut settings, &states, &history, settings_loaded()) {
+        let pruned = settings.clone();
+        with_store(|store| store.save_settings(pruned));
+    }
     // Without tooltips: the widget shows none.
     let plain = views(&states, &settings, None);
     let widgets = match options.tray {
@@ -689,7 +693,7 @@ impl Ui {
     /// their low-battery threshold ([`Alerts::check`]).
     fn changed(&mut self) {
         let states = read_snapshot(&self.runtime);
-        if self.settings.remember_names(&states) {
+        if names_need_saving(&mut self.settings, &states, settings_loaded()) {
             self.save();
         }
         self.record(&states);
@@ -1148,6 +1152,32 @@ fn with_store(f: impl FnOnce(&Store)) {
     if let Some(store) = guard.as_ref() {
         f(store);
     }
+}
+
+/// Whether the store loaded `settings.toml` ([`Store::settings_loaded`]); false without one.
+fn settings_loaded() -> bool {
+    let mut loaded = false;
+    with_store(|store| loaded = store.settings_loaded());
+    loaded
+}
+
+/// Remembers the names of `states` ([`Settings::remember_names`]). Whether to save them:
+/// only when one is new or changed and the settings file was `loaded`, so an automatic save
+/// never sets aside a file that could not be read; the names wait for the user's next save.
+fn names_need_saving(settings: &mut Settings, states: &[DeviceState], loaded: bool) -> bool {
+    settings.remember_names(states) && loaded
+}
+
+/// At startup: forgets the names of devices neither in `states` nor in the `history`.
+/// Whether to save: only when one was removed and the settings file was `loaded`.
+fn prune_names(
+    settings: &mut Settings,
+    states: &[DeviceState],
+    history: &HashMap<DeviceKey, Vec<Sample>>,
+    loaded: bool,
+) -> bool {
+    settings.forget_names(|key| history.contains_key(key) || states.iter().any(|s| &s.key == key))
+        && loaded
 }
 
 /// Finishes the queued writes (waiting at most 1 s) and stops the store's writer; later
@@ -1804,5 +1834,69 @@ mod tests {
                 '\u{E962}', '\u{E765}', '\u{E7F6}', '\u{E7F5}', '\u{E7FC}', '\u{E83F}'
             ]
         );
+    }
+
+    #[test]
+    fn names_are_saved_automatically_only_from_a_loaded_file() {
+        let s = percent("M", 80);
+        let mut settings = Settings::default();
+        // An unreadable settings.toml: remembered, but not saved over it.
+        assert!(!names_need_saving(
+            &mut settings,
+            std::slice::from_ref(&s),
+            false
+        ));
+        assert_eq!(settings.names[&s.key], "M");
+        let mut settings = Settings::default();
+        assert!(names_need_saving(
+            &mut settings,
+            std::slice::from_ref(&s),
+            true
+        ));
+        assert!(!names_need_saving(
+            &mut settings,
+            std::slice::from_ref(&s),
+            true
+        ));
+    }
+
+    #[test]
+    fn names_without_a_device_or_history_are_pruned_at_start() {
+        let now = percent("now", 80);
+        let history = HashMap::from([(
+            DeviceKey("old".into()),
+            vec![Sample::session_break(DeviceKey("old".into()), 1)],
+        )]);
+        let named = || {
+            let mut settings = Settings::default();
+            for k in ["now", "old", "gone"] {
+                settings.names.insert(DeviceKey(k.into()), k.into());
+            }
+            settings
+        };
+        let mut settings = named();
+        assert!(prune_names(
+            &mut settings,
+            std::slice::from_ref(&now),
+            &history,
+            true
+        ));
+        let kept: Vec<&str> = settings.names.keys().map(|k| k.0.as_str()).collect();
+        assert_eq!(kept, ["now", "old"]);
+        assert!(!prune_names(
+            &mut settings,
+            std::slice::from_ref(&now),
+            &history,
+            true
+        ));
+        // Pruned in memory, but an unread file is not saved over.
+        let mut settings = named();
+        assert!(!prune_names(
+            &mut settings,
+            std::slice::from_ref(&now),
+            &history,
+            false
+        ));
+        assert_eq!(settings.names.len(), 2);
     }
 }
