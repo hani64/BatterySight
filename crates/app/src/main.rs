@@ -27,15 +27,12 @@ const TAKEOVER_WAIT_MS: u32 = 10_000;
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
-    if let Some(code) = run_cli(&args) {
-        std::process::exit(code);
-    }
-    // `--takeover` (hidden): started by the widget watchdog just before it ends this
-    // instance, so wait for the instance to go instead of leaving.
-    let takeover = has("--takeover");
-    let Some(instance) = SingleInstance::acquire(takeover) else {
-        return;
+    let instance = match dispatch(&args, SingleInstance::acquire) {
+        Ok(code) => std::process::exit(code),
+        Err(None) => return,
+        Err(Some(instance)) => instance,
     };
+    let takeover = has("--takeover");
     // Before any window exists: these block this thread briefly (disk, registry).
     let store = Store::start();
     let mut settings = store.load_settings();
@@ -91,8 +88,23 @@ impl Drop for SingleInstance {
     }
 }
 
+/// The steps before the UI: a command-line tool's exit code (`Ok`), otherwise the
+/// single-instance check's result, which is `None` when another instance runs. Tools come
+/// first, so they work beside a running instance and start no store, trace or audio.
+fn dispatch(
+    args: &[OsString],
+    acquire: impl FnOnce(bool) -> Option<SingleInstance>,
+) -> Result<i32, Option<SingleInstance>> {
+    if let Some(code) = run_cli(args) {
+        return Ok(code);
+    }
+    // `--takeover` (hidden): started by the widget watchdog just before it ends this
+    // instance, so wait for the instance to go instead of leaving.
+    Err(acquire(args.iter().any(|arg| arg == "--takeover")))
+}
+
 /// Runs `--list`, `--dump` or `--capture` and returns its exit code, or `None` to start the
-/// app. Comes before the single-instance check and before the store, traces or audio start.
+/// app.
 fn run_cli(args: &[OsString]) -> Option<i32> {
     if args.first().is_some_and(|arg| arg == "--list") {
         attach_parent_console();
@@ -105,7 +117,7 @@ fn run_cli(args: &[OsString]) -> Option<i32> {
 
 /// A GUI-subsystem process has no console: prints go to the console it was started from.
 /// Output redirected to a file or pipe keeps its handle, which attaching would replace, so
-/// a redirected stdout (a capture to a file) still leaves warnings on the console's stderr.
+/// a redirected stdout (a capture to a file) still leaves messages on the console's stderr.
 fn attach_parent_console() {
     let redirected = |kind| {
         // SAFETY: no pointers involved; `GetFileType` of an invalid handle is FILE_TYPE_UNKNOWN.
@@ -133,14 +145,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diagnostics_run_while_another_instance_holds_the_mutex() {
-        // Either this test or an already running BatterySight now holds the mutex.
-        let held = SingleInstance::acquire(false);
-        assert!(SingleInstance::acquire(false).is_none());
+    fn diagnostics_are_dispatched_before_the_single_instance_check() {
+        let running = |_: bool| -> Option<SingleInstance> {
+            panic!("the single-instance mutex was consulted for a CLI command")
+        };
         for list in [&["--capture", "046D:C547", "0"][..], &["--dump", "extra"]] {
             let list: Vec<OsString> = list.iter().map(OsString::from).collect();
-            assert_eq!(run_cli(&list), Some(2), "{list:?}");
+            assert!(matches!(dispatch(&list, running), Ok(2)), "{list:?}");
         }
-        drop(held);
+    }
+
+    #[test]
+    fn the_app_starts_only_through_the_single_instance_check() {
+        let mut asked = None;
+        let args = [OsString::from("--takeover")];
+        let outcome = dispatch(&args, |takeover| {
+            asked = Some(takeover);
+            None
+        });
+        assert!(matches!(outcome, Err(None)));
+        assert_eq!(asked, Some(true));
     }
 }

@@ -72,9 +72,24 @@ impl fmt::Display for DumpError {
 /// Prints every HID collection and Bluetooth container from cached metadata. Opens
 /// collections only without access rights for their attributes; sends nothing.
 pub fn dump(out: &mut dyn Write) -> Result<(), DumpError> {
-    let hid = hid_enum::enumerate().ok_or(DumpError::Hid)?;
-    let bluetooth = bluetooth::scan_metadata().map_err(DumpError::Bluetooth)?;
-    write_dump(out, &hid, hid_enum::cached_product_name, &bluetooth).map_err(DumpError::Output)
+    dump_from(
+        out,
+        hid_enum::enumerate(),
+        bluetooth::scan_metadata(),
+        hid_enum::cached_product_name,
+    )
+}
+
+/// Writes the dump only once both sources were read, so a failure prints nothing.
+fn dump_from(
+    out: &mut dyn Write,
+    hid: Option<Vec<HidInterface>>,
+    bluetooth: windows::core::Result<Vec<Metadata>>,
+    name: impl Fn(&HidInterface) -> Option<String>,
+) -> Result<(), DumpError> {
+    let hid = hid.ok_or(DumpError::Hid)?;
+    let bluetooth = bluetooth.map_err(DumpError::Bluetooth)?;
+    write_dump(out, &hid, name, &bluetooth).map_err(DumpError::Output)
 }
 
 /// The dump: a header, then one `hid` line per collection (sorted) and one `bluetooth` line
@@ -213,7 +228,7 @@ fn plural(reports: usize) -> &'static str {
 }
 
 /// Captures `vid:pid`'s vendor-collection input reports for `minutes` to `out`, after the
-/// header; the warning also goes to `console`. Returns the number of reports. Nothing is
+/// header; a start line also goes to `console`. Returns the number of reports. Nothing is
 /// printed to `out` when the device is absent or cannot be opened.
 pub fn capture(
     vid: u16,
@@ -224,12 +239,7 @@ pub fn capture(
 ) -> Result<usize, CaptureError> {
     let interfaces = hid_enum::enumerate().ok_or(CaptureError::Enumerate)?;
     let mut capture = Capture::open(vid, pid, interfaces)?;
-    capture.write_header(minutes, out)?;
-    let _ = writeln!(
-        console,
-        "batterysight: capturing {vid:04X}:{pid:04X} for {minutes} min."
-    );
-    let _ = console.flush();
+    capture.start(minutes, out, console)?;
     capture.run(u64::from(minutes) * 60_000, out)
 }
 
@@ -325,6 +335,18 @@ impl Capture {
             opened,
             collections,
         })
+    }
+
+    /// Writes the header to `out` and says what is captured on `console`.
+    fn start(&self, minutes: u8, out: &mut dyn Write, console: &mut dyn Write) -> io::Result<()> {
+        self.write_header(minutes, out)?;
+        let _ = writeln!(
+            console,
+            "batterysight: capturing {:04X}:{:04X} for {minutes} min.",
+            self.vid, self.pid
+        );
+        let _ = console.flush();
+        Ok(())
     }
 
     fn write_header(&self, minutes: u8, out: &mut dyn Write) -> io::Result<()> {
@@ -475,6 +497,20 @@ mod tests {
     }
 
     #[test]
+    fn dump_prints_nothing_when_a_source_fails() {
+        let mut out = Vec::new();
+        let error = dump_from(&mut out, None, Ok(Vec::new()), |_| None).unwrap_err();
+        assert!(matches!(error, DumpError::Hid), "{error}");
+        assert!(out.is_empty());
+
+        let hid = vec![interface(0x1234, 0x5678, 0xFF00, 0x0002)];
+        let failed = Err(windows::Win32::Foundation::E_FAIL.into());
+        let error = dump_from(&mut out, Some(hid), failed, |_| None).unwrap_err();
+        assert!(matches!(error, DumpError::Bluetooth(_)), "{error}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn dump_escapes_control_and_bidi_characters_in_names() {
         let hid = [interface(0x1234, 0x5678, 0x0001, 0x0002)];
         let bluetooth = [Metadata {
@@ -573,7 +609,10 @@ mod tests {
             assert!(!server.has_client(), "an unmatched collection was opened");
         }
         let mut out = Vec::new();
-        capture.write_header(1, &mut out).unwrap();
+        let mut console = Vec::new();
+        capture.start(1, &mut out, &mut console).unwrap();
+        let console = text(console);
+        assert_eq!(console, "batterysight: capturing 1234:5678 for 1 min.\n");
         server.send(&[0x10, 0x01, 0x42]);
         let started = Instant::now();
         let reports = capture.run(300, &mut out).unwrap();
