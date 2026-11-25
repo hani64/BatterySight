@@ -472,7 +472,14 @@ pub fn run(options: &Options, store: Store, mut settings: Settings, samples: Vec
     let unix_now = unix_now_ms();
     let mut history = HashMap::new();
     history::add(&mut history, samples, unix_now);
-    if prune_names(&mut settings, &states, &history, settings_loaded()) {
+    let history_read = ask_store(Store::history_loaded);
+    if prune_names(
+        &mut settings,
+        &states,
+        &history,
+        history_read,
+        settings_loaded(),
+    ) {
         let pruned = settings.clone();
         with_store(|store| store.save_settings(pruned));
     }
@@ -1154,11 +1161,16 @@ fn with_store(f: impl FnOnce(&Store)) {
     }
 }
 
+/// What `question` says of the store; false without one.
+fn ask_store(question: impl FnOnce(&Store) -> bool) -> bool {
+    let mut answer = false;
+    with_store(|store| answer = question(store));
+    answer
+}
+
 /// Whether the store loaded `settings.toml` ([`Store::settings_loaded`]); false without one.
 fn settings_loaded() -> bool {
-    let mut loaded = false;
-    with_store(|store| loaded = store.settings_loaded());
-    loaded
+    ask_store(Store::settings_loaded)
 }
 
 /// Remembers the names of `states` ([`Settings::remember_names`]). Whether to save them:
@@ -1168,15 +1180,19 @@ fn names_need_saving(settings: &mut Settings, states: &[DeviceState], loaded: bo
     settings.remember_names(states) && loaded
 }
 
-/// At startup: forgets the names of devices neither in `states` nor in the `history`.
+/// At startup: forgets the names of devices neither in `states` nor in the `history`, unless
+/// the history file could not be read (`history_read` false: its absence proves nothing).
 /// Whether to save: only when one was removed and the settings file was `loaded`.
 fn prune_names(
     settings: &mut Settings,
     states: &[DeviceState],
     history: &HashMap<DeviceKey, Vec<Sample>>,
+    history_read: bool,
     loaded: bool,
 ) -> bool {
-    settings.forget_names(|key| history.contains_key(key) || states.iter().any(|s| &s.key == key))
+    history_read
+        && settings
+            .forget_names(|key| history.contains_key(key) || states.iter().any(|s| &s.key == key))
         && loaded
 }
 
@@ -1874,29 +1890,25 @@ mod tests {
             }
             settings
         };
+        let now = std::slice::from_ref(&now);
         let mut settings = named();
-        assert!(prune_names(
-            &mut settings,
-            std::slice::from_ref(&now),
-            &history,
-            true
-        ));
+        assert!(prune_names(&mut settings, now, &history, true, true));
         let kept: Vec<&str> = settings.names.keys().map(|k| k.0.as_str()).collect();
         assert_eq!(kept, ["now", "old"]);
-        assert!(!prune_names(
-            &mut settings,
-            std::slice::from_ref(&now),
-            &history,
-            true
-        ));
-        // Pruned in memory, but an unread file is not saved over.
+        assert!(!prune_names(&mut settings, now, &history, true, true));
+        // Pruned in memory, but an unread settings file is not saved over.
+        let mut settings = named();
+        assert!(!prune_names(&mut settings, now, &history, true, false));
+        assert_eq!(settings.names.len(), 2);
+        // The history could not be read: it says nothing about which devices to forget.
         let mut settings = named();
         assert!(!prune_names(
             &mut settings,
-            std::slice::from_ref(&now),
-            &history,
-            false
+            now,
+            &HashMap::new(),
+            false,
+            true
         ));
-        assert_eq!(settings.names.len(), 2);
+        assert_eq!(settings, named());
     }
 }
