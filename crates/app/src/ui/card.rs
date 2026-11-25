@@ -179,19 +179,21 @@ pub unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
 }
 
 /// The card's two lines: "name · level" (a coarse level as its word, an unknown one as
-/// "?"), then the status: "Charging" or "Full" on power; else how long ago the device was
-/// last read ("just now", "N min ago"…), after "Asleep · " or "Disconnected · " when it is,
-/// and then " · about N h left" when there is an estimate. `now`: the monotonic time of
-/// the readings.
+/// "?"), then the status: "Charging" or "Full" on power; else, awake, "Connected" for a
+/// device that reports its battery changes on its own, or how long ago it was last read
+/// ("just now", "N min ago"…); after "Asleep · " or "Disconnected · ", how long ago it was
+/// last read; and then " · about N h left" when there is an estimate. `now`: the monotonic
+/// time of the readings.
 pub fn card_text(state: &DeviceState, time_left: Option<Duration>, now: Ms) -> Vec<String> {
     let level = state.level.map_or_else(|| "?".to_owned(), level_text);
-    let age = age_text(now.saturating_sub(state.updated_ms));
+    let age = || age_text(now.saturating_sub(state.updated_ms));
     let mut status = match (state.presence, state.charge) {
         (Presence::Online, Charge::Charging) => "Charging".to_owned(),
         (Presence::Online, Charge::Full) => "Full".to_owned(),
-        (Presence::Online, _) => age,
-        (Presence::Asleep, _) => format!("Asleep · {age}"),
-        (Presence::Offline, _) => format!("Disconnected · {age}"),
+        (Presence::Online, _) if state.reports_changes => "Connected".to_owned(),
+        (Presence::Online, _) => age(),
+        (Presence::Asleep, _) => format!("Asleep · {}", age()),
+        (Presence::Offline, _) => format!("Disconnected · {}", age()),
     };
     let on_power = state.presence == Presence::Online
         && matches!(
@@ -341,6 +343,75 @@ mod tests {
     fn card_text_disconnected_shows_age() {
         let s = state(Presence::Offline, Charge::Discharging, NOW - 7 * MIN);
         assert_eq!(card_text(&s, None, NOW)[1], "Disconnected · 7 min ago");
+    }
+
+    /// A device that reports its battery changes on its own, such as a Nova headset.
+    fn reporting(presence: Presence, charge: Charge, updated_ms: Ms) -> DeviceState {
+        DeviceState {
+            reports_changes: true,
+            ..state(presence, charge, updated_ms)
+        }
+    }
+
+    #[test]
+    fn card_text_reporting_device_shows_connected_and_time_left() {
+        let s = reporting(Presence::Online, Charge::Discharging, NOW - 3 * 60 * MIN);
+        let left = Some(Duration::from_secs(20 * 3600));
+        assert_eq!(
+            card_text(&s, left, NOW),
+            ["G305 · 80%", "Connected · about 20 h left"]
+        );
+        assert_eq!(
+            card_text(&s, Some(Duration::from_secs(20 * 60)), NOW)[1],
+            "Connected · less than 1 h left"
+        );
+        assert_eq!(card_text(&s, None, NOW)[1], "Connected");
+    }
+
+    #[test]
+    fn card_text_wake_only_mouse_keeps_its_age() {
+        // Read only when it wakes (a HyperX universal mouse): no push, so its age.
+        let s = state(Presence::Online, Charge::Discharging, NOW - 42 * MIN);
+        assert!(!s.reports_changes);
+        assert_eq!(card_text(&s, None, NOW)[1], "42 min ago");
+        let left = Some(Duration::from_secs(5 * 3600));
+        assert_eq!(card_text(&s, left, NOW)[1], "42 min ago · about 5 h left");
+    }
+
+    #[test]
+    fn card_text_os_cached_bluetooth_shows_connected_not_its_age() {
+        // Windows gives no measurement time: `updated_ms` is when the value was first
+        // seen, so an unchanged level looks days old while the device is connected.
+        let s = DeviceState {
+            key: DeviceKey("bt:00000000000000000000000000000001".into()),
+            name: "Buds".into(),
+            kind: DeviceKind::Headset,
+            via: Via::Bluetooth,
+            source: Source::Os,
+            verification: Verification::SourceVerified,
+            ..reporting(Presence::Online, Charge::Unknown, NOW - 49 * 60 * MIN)
+        };
+        assert_eq!(card_text(&s, None, NOW), ["Buds · 80%", "Connected"]);
+    }
+
+    #[test]
+    fn card_text_reporting_device_keeps_other_statuses() {
+        let left = Some(Duration::from_secs(9 * 3600));
+        let line = |presence, charge| {
+            card_text(&reporting(presence, charge, NOW - 12 * MIN), left, NOW)[1].clone()
+        };
+        assert_eq!(line(Presence::Online, Charge::Charging), "Charging");
+        assert_eq!(line(Presence::Online, Charge::Full), "Full");
+        // On power but not charging: connected, still no estimate.
+        assert_eq!(line(Presence::Online, Charge::NotCharging), "Connected");
+        assert_eq!(
+            line(Presence::Asleep, Charge::Discharging),
+            "Asleep · 12 min ago · about 9 h left"
+        );
+        assert_eq!(
+            card_text(&reporting(Presence::Offline, Charge::Charging, NOW - 7 * MIN), None, NOW)[1],
+            "Disconnected · 7 min ago"
+        );
     }
 
     #[test]
