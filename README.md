@@ -79,6 +79,10 @@ Settings and battery history live in `%LOCALAPPDATA%\BatterySight` (`settings.to
 
 For troubleshooting, setting the environment variable `BATTERYSIGHT_TRACE=1` makes it append to `%LOCALAPPDATA%\BatterySight\sends.log`: every report it sends and receives on every device collection it opens, of any vendor, with the report bytes (`out` and `in` lines, and `feature-set`, `feature-get` and `feature-reply` lines for feature reports), a request it refused to send (`refused write` lines) and a feature request that failed (`feature failed` lines; these two carry no report bytes), when audio starts and stops on a device or cannot be watched (`audio` lines), when a device plugged in and out too often is held back for a while and when it is opened again (`held` and `released` lines, with the device's interface paths), when a device could not be opened (`open failed` lines), when a device stopped answering before it was recognised and will be asked again or no longer (`discovery` lines), why it switched to tray icons (`ui fallback` lines), why "Start with Windows" could not be changed (`ui autostart not changed` lines), why it draws text with GDI instead of DirectWrite for the rest of the session (`ui text: DirectWrite off` lines), and when the settings or history file cannot be read or written or is set aside (`store` lines). Tracing is off by default. These lines may contain device ids (unit ids, audio container ids, interface paths and other serial-like values, including in report bytes), so review the file before sharing it.
 
+## Download
+
+Download `batterysight-vX.Y.Z-x64.exe` from [Releases](https://github.com/hani64/BatterySight/releases); there is no installer, so put it anywhere. GitHub Actions builds each release from its tagged commit, and `checksums.txt` next to it holds the file's SHA-256 (`Get-FileHash batterysight-*.exe` in PowerShell shows it). The exe is not code-signed yet, so Windows SmartScreen may warn the first time you start it: choose "More info", then "Run anyway".
+
 ## Usage
 
 Start `batterysight.exe`. It shows each device's battery level on the taskbar, next to the notification area (and next to the clock on other monitors' taskbars), or left of the weather when Windows 10's News and interests or Windows 11's Widgets button sits there; on Windows 10 the task buttons are narrowed to end where it starts. A bolt follows the level while the device charges and a check once it is charged full on power; an asleep device is dimmed, and one that disconnects shows a dimmed × for about a minute before it is removed. When two shown devices are of the same kind (two mice, say), each gets a short caption from its name, such as "SUP" for a PRO X Superlight. Rest the mouse on a device for as long as a tooltip takes (Windows' tooltip delay, the double-click time) to see a small card just above the taskbar: its name and level, then "Charging" or "Full"; otherwise "Connected" for a device that reports its battery changes on its own (such as the PRO X Superlight, a SteelSeries headset or a Bluetooth device), or how long ago a device BatterySight has to ask was last read; how long ago it last reported after "Asleep" or "Disconnected" when it is; and the time left when there is an estimate, as in "PRO X Superlight · 77%" over "Connected · about 20 h left", or "PRO X Wireless Gaming Headset · 60%" over "3 min ago · about 9 h left". Tray icons show the same two lines as their tooltip. Click it for the menu:
@@ -129,6 +133,10 @@ With the MSVC toolchain (Visual Studio Build Tools installed) nothing else is ne
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "dlltool=<path to WinLibs>/mingw64/bin/dlltool.exe"]
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,0 +1,54 @@
+name: Bug report
+description: Something BatterySight does wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search the existing issues first. For a device BatterySight does not show at all, use **Device request** instead.
+  - type: input
+    id: version
+    attributes:
+      label: BatterySight version
+      description: The release you downloaded (such as v0.2.0), or the commit you built.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and build
+      description: Run `winver`.
+      placeholder: Windows 11 24H2, build 26100.4652
+    validations:
+      required: true
+  - type: textarea
+    id: devices
+    attributes:
+      label: Devices involved
+      description: Name, and how each connects (receiver or dongle, Bluetooth, cable).
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: trace
+    attributes:
+      label: Trace
+      description: |
+        Set the environment variable `BATTERYSIGHT_TRACE=1`, start BatterySight, reproduce the problem, exit, and paste the relevant part of `%LOCALAPPDATA%\BatterySight\sends.log`. Device ids can stay; they help debugging.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed my user name and local paths from everything above.
+          required: true

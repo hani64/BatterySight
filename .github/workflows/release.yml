@@ -1,0 +1,93 @@
+name: Release
+
+# A `v*` tag builds batterysight.exe and opens a draft release with it and checksums.txt;
+# the maintainer writes the notes and publishes. Tags containing `-` (v1.2.0-rc.1) are
+# prereleases. Manual runs and PRs that touch the build setup only build the files.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .cargo/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install
+      - name: Tag matches crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $v = ((cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json).packages | Where-Object name -eq 'batterysight').version
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME but Cargo.toml says $v" }
+      # No cache: published binaries never build from restored outputs.
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      - name: Runs without the VC++ runtime, x64
+        run: |
+          $exe = 'target\x86_64-pc-windows-msvc\release\batterysight.exe'
+          $imports = dumpbin /nologo /dependents $exe | Out-String
+          Write-Output $imports
+          if ($imports -match 'VCRUNTIME[0-9_]*\.dll|MSVCP[0-9_]*\.dll') { throw 'batterysight.exe imports the MSVC runtime' }
+          $headers = dumpbin /nologo /headers $exe | Out-String
+          if ($headers -notmatch '8664 machine \(x64\)') { throw 'batterysight.exe is not x64' }
+      - name: Package
+        run: |
+          $name = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          New-Item -ItemType Directory dist | Out-Null
+          $file = "batterysight-$name-x64.exe"
+          Copy-Item 'target\x86_64-pc-windows-msvc\release\batterysight.exe' "dist\$file"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist\$file").Hash.ToLowerInvariant()
+          # sha256sum format with LF endings, so `sha256sum -c checksums.txt` works anywhere.
+          [IO.File]::WriteAllText("$PWD\dist\checksums.txt", "$hash  $file`n")
+          Get-Content dist\checksums.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # Tag pushes only: a manual run started on a tag must not re-upload a published release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+      - name: Checksums match
+        working-directory: dist
+        run: sha256sum -c checksums.txt
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
