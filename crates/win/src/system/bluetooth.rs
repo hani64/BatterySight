@@ -627,7 +627,8 @@ impl Source {
                     presence: Some(Presence::Online),
                     source: SampleSource::Os,
                 },
-                verification: Verification::SourceVerified,
+                // Tested with Classic earbuds and an LE controller.
+                verification: Verification::HardwareTested,
                 reports_changes: true,
             }));
         }

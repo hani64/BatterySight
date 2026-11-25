@@ -236,6 +236,7 @@ fn observation(
     via: Via,
     level: Option<CoarseLevel>,
     charge: Option<Charge>,
+    verification: Verification,
 ) -> HubInput {
     HubInput::System(SystemObservation {
         update: DeviceUpdate {
@@ -249,7 +250,7 @@ fn observation(
             presence: Some(Presence::Online),
             source: SampleSource::Os,
         },
-        verification: Verification::SourceVerified,
+        verification,
         // Windows holds the pad's own pushed status; reading it sends nothing to the pad.
         reports_changes: true,
     })
@@ -442,6 +443,8 @@ impl Source {
                     via,
                     slot.bucket(),
                     None,
+                    // XInput was not exercised on hardware: WGI supplied the bucket.
+                    Verification::SourceVerified,
                 ));
             }
         } else {
@@ -462,6 +465,12 @@ impl Source {
                     via,
                     pad.report.as_ref().and_then(bucket),
                     pad.report.as_ref().and_then(charge),
+                    // Tested on a USB cable; the Xbox Wireless Adapter is not.
+                    if pad.wireless {
+                        Verification::SourceVerified
+                    } else {
+                        Verification::HardwareTested
+                    },
                 ));
             }
         }
@@ -1072,6 +1081,49 @@ mod tests {
         );
         assert_eq!(states[0].key.0, "pad:xinput:0");
         assert!(states[0].reports_changes);
+    }
+
+    #[test]
+    fn only_cabled_wgi_rows_are_hardware_tested() {
+        // `report`: WGI supplies the bucket, so XInput is not consulted.
+        let verification = |wireless, report: Option<Report>, slots: fn() -> [Option<Slot>; 4]| {
+            let mut source = Source::default();
+            let mut hub = hub();
+            let mut pad = pad(1, USB, report);
+            pad.wireless = wireless;
+            let states = apply(&mut source, &mut hub, poll(vec![pad], &[]), slots, 0);
+            (states[0].key.0.clone(), states[0].verification)
+        };
+        let full = || Some(report(100, 100));
+        assert_eq!(
+            verification(false, full(), no_xinput),
+            ("pad:wgi:1".into(), Verification::HardwareTested)
+        );
+        // The Xbox Wireless Adapter is untested.
+        assert_eq!(
+            verification(true, full(), no_xinput),
+            ("pad:wgi:1".into(), Verification::SourceVerified)
+        );
+        // XInput is untested, cabled or not.
+        fn wired() -> [Option<Slot>; 4] {
+            [
+                slot(BATTERY_TYPE_WIRED, BATTERY_LEVEL_FULL),
+                None,
+                None,
+                None,
+            ]
+        }
+        fn nimh() -> [Option<Slot>; 4] {
+            [slot(BATTERY_TYPE_NIMH, BATTERY_LEVEL_LOW), None, None, None]
+        }
+        for slots in [wired as fn() -> [Option<Slot>; 4], nimh] {
+            for wireless in [false, true] {
+                assert_eq!(
+                    verification(wireless, None, slots),
+                    ("pad:xinput:0".into(), Verification::SourceVerified)
+                );
+            }
+        }
     }
 
     #[test]
