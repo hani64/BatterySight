@@ -26,6 +26,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use batterysight_core::hid::{CollectionId, ReportKind};
 use batterysight_core::hub::WriteRefusal;
 use batterysight_core::model::DeviceKey;
+use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::hid_enum::{ContainerId, container_hex};
 use crate::reactor::FeatureFailure;
@@ -80,6 +82,15 @@ fn open_log(dir: &Path) -> Option<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
+        .open(dir.join("sends.log"))
+        .ok()
+}
+
+fn open_log_for_oversized_record(dir: &Path) -> Option<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .open(dir.join("sends.log"))
         .ok()
 }
@@ -136,6 +147,15 @@ impl Trace {
         }
 
         let len = bytes.len() as u64;
+        if len > recheck_bytes {
+            // A record larger than the budget cannot risk a rename between open and write.
+            if let Some(mut file) = open_log_for_oversized_record(&self.dir) {
+                let _ = file.write_all(bytes);
+                drop(file);
+                self.recheck(cap);
+            }
+            return;
+        }
         if self.written + len > recheck_bytes {
             self.recheck(cap);
         }
@@ -503,6 +523,60 @@ mod tests {
 
         assert_eq!(fs::read(&external).unwrap(), first);
         assert_eq!(fs::read(&current).unwrap(), next);
+    }
+
+    #[test]
+    fn oversized_record_goes_to_the_current_log() {
+        let dir = TempDir::new("oversized-current");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        trace.append(b"earlier\n");
+        fs::rename(&current, &old).unwrap();
+        let record = b"this oversized record is longer than the budget...\n";
+
+        trace.append(record);
+
+        assert_eq!(fs::read(&current).unwrap(), record);
+        assert_eq!(fs::read(&old).unwrap(), b"earlier\n");
+    }
+
+    #[test]
+    fn oversized_record_handle_refuses_rename_until_closed() {
+        let dir = TempDir::new("oversized-share-mode");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        let mut file = open_log_for_oversized_record(&dir.0).unwrap();
+        assert!(fs::rename(&current, &old).is_err());
+        file.write_all(b"record\n").unwrap();
+        assert!(!old.exists());
+
+        drop(file);
+        fs::rename(&current, &old).unwrap();
+        assert_eq!(fs::read(&old).unwrap(), b"record\n");
+    }
+
+    #[test]
+    fn oversized_record_is_dropped_when_current_log_cannot_open() {
+        let dir = TempDir::new("oversized-locked");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        trace.append(b"earlier\n");
+        fs::rename(&current, &old).unwrap();
+        fs::write(&current, b"current\n").unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&current)
+            .unwrap();
+        let record = b"this oversized record is longer than the budget...\n";
+
+        trace.append(record);
+
+        assert_eq!(fs::read(&old).unwrap(), b"earlier\n");
+        drop(lock);
+        assert_eq!(fs::read(&current).unwrap(), b"current\n");
     }
 
     #[test]
