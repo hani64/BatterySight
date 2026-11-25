@@ -450,6 +450,11 @@ impl Source {
         hub: &Hub,
     ) -> Vec<HubInput> {
         let Ok(observed) = scan else {
+            // Retry a failed scan unless one is already due; a success while idle ends this.
+            if self.delayed.is_none() {
+                self.periodic
+                    .get_or_insert(now.saturating_add(CONNECTED_REREAD_MS));
+            }
             return Vec::new();
         };
         if observed.iter().any(|node| node.connected) {
@@ -687,5 +692,31 @@ mod tests {
         assert!(source.take_due(65_000));
         source.reconcile(Ok(classic(false, Some(75))), 65_000, &hub);
         assert_eq!(source.deadline(), None);
+    }
+
+    #[test]
+    fn a_failed_scan_retries_while_scans_keep_failing() {
+        let mut source = Source::default();
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
+        let failed = || Err(windows::core::Error::from_hresult(E_FAIL));
+        source.request(0, false);
+        assert!(source.take_due(0));
+        source.reconcile(failed(), 0, &hub);
+        assert_eq!(source.deadline(), Some(60_000));
+        assert!(!source.take_due(59_999));
+        assert!(source.take_due(60_000));
+        source.reconcile(failed(), 60_000, &hub);
+        assert_eq!(source.deadline(), Some(120_000));
+    }
+
+    #[test]
+    fn a_successful_idle_scan_ends_the_failure_retry() {
+        let mut source = Source::default();
+        let hub = Hub::new(Catalog::builtin(), Policy::default());
+        source.reconcile(Err(windows::core::Error::from_hresult(E_FAIL)), 0, &hub);
+        assert_eq!(source.deadline(), Some(60_000));
+        assert!(source.take_due(60_000));
+        source.reconcile(Ok(classic(false, Some(99))), 60_000, &hub);
+        assert_eq!(source.deadline(), None, "idle discovery does not poll");
     }
 }

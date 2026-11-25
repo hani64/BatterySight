@@ -396,6 +396,8 @@ impl Source {
         now: Ms,
     ) -> Vec<HubInput> {
         let Some(Poll { pads, hid }) = poll else {
+            // Retry a failed list even when no pad was known to keep a timer running.
+            self.periodic.get_or_insert(now.saturating_add(REREAD_MS));
             return Vec::new();
         };
         self.periodic = if pads.is_empty() {
@@ -967,6 +969,24 @@ mod tests {
         assert_eq!(source.deadline(), Some(120_005));
         let states = apply(&mut source, &mut hub, poll(vec![], &[]), no_xinput, 70_000);
         assert_eq!(states[0].presence, Presence::Offline);
+        assert_eq!(source.deadline(), None);
+    }
+
+    #[test]
+    fn a_failed_list_without_a_timer_retries_after_the_reread_interval() {
+        let mut source = Source::default();
+        let mut hub = hub();
+        source.request();
+        assert!(source.take_due(5));
+        // The startup list fails before any pad is known: retry rather than wait for events.
+        assert!(source.reconcile(None, no_xinput, 5).is_empty());
+        assert_eq!(source.deadline(), Some(60_005));
+        assert!(source.take_due(60_005));
+        assert!(source.reconcile(None, no_xinput, 60_005).is_empty());
+        assert_eq!(source.deadline(), Some(120_005));
+        assert!(source.take_due(120_005));
+        // A list that succeeds with no pad stops retrying.
+        apply(&mut source, &mut hub, poll(vec![], &[]), no_xinput, 120_005);
         assert_eq!(source.deadline(), None);
     }
 
