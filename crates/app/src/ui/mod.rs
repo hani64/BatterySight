@@ -275,7 +275,7 @@ fn view(
         DeviceKind::Keyboard => '\u{E765}',
         DeviceKind::Headset => '\u{E7F6}',
         DeviceKind::Speaker => '\u{E7F5}',
-        DeviceKind::Controller => '\u{E7FC}',
+        DeviceKind::Controller => render::CONTROLLER,
         DeviceKind::Other => '\u{E83F}',
     };
     let connected = s.presence != Presence::Offline;

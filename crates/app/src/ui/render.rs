@@ -26,6 +26,20 @@ use super::dwrite::{self, Engine, Fill, FontSpec, Run};
 /// Icon fonts, best first: Windows 11 ships Segoe Fluent Icons, Windows 10 Segoe MDL2 Assets
 /// (same code points for the glyphs used here).
 const ICON_FACES: [PCWSTR; 2] = [w!("Segoe Fluent Icons"), w!("Segoe MDL2 Assets")];
+/// The controller's glyph.
+pub(super) const CONTROLLER: char = '\u{E7FC}';
+/// Its fonts, best first: Segoe MDL2 Assets draws it as a classic gamepad (owner's choice).
+const CONTROLLER_FACES: [PCWSTR; 2] = [w!("Segoe MDL2 Assets"), w!("Segoe Fluent Icons")];
+
+/// The fonts to draw a device's `glyph` in, best first.
+fn glyph_faces(glyph: char) -> &'static [PCWSTR] {
+    if glyph == CONTROLLER {
+        &CONTROLLER_FACES
+    } else {
+        &ICON_FACES
+    }
+}
+
 const TEXT_FACE: PCWSTR = w!("Segoe UI");
 /// Shown after the level of a charging device.
 const BOLT: char = '\u{E945}';
@@ -105,6 +119,8 @@ enum Face {
     Text,
     /// The device's glyph.
     Icon,
+    /// The controller's glyph ([`CONTROLLER_FACES`]).
+    Pad,
     /// The bolt or the check after the level.
     Mark,
     /// The caption telling apart devices of a kind.
@@ -144,7 +160,7 @@ pub fn widget_strip(views: &[DeviceView], dpi: u32, height: i32, light: bool) ->
 }
 
 /// The fonts of the strip's faces, in [`face_index`] order: `dpi` scales them.
-fn strip_fonts(dpi: u32) -> [FontSpec; 4] {
+fn strip_fonts(dpi: u32) -> [FontSpec; 5] {
     let px = |v: f32| v * dpi as f32 / 96.0;
     let spec = |faces, size, weight: i32| FontSpec {
         faces,
@@ -156,6 +172,7 @@ fn strip_fonts(dpi: u32) -> [FontSpec; 4] {
         spec(&ICON_FACES, 15.0, FW_NORMAL.0 as i32),
         spec(&ICON_FACES, 11.0, FW_NORMAL.0 as i32),
         spec(&[TEXT_FACE], 9.0, FW_SEMIBOLD.0 as i32),
+        spec(&CONTROLLER_FACES, 15.0, FW_NORMAL.0 as i32),
     ]
 }
 
@@ -165,6 +182,7 @@ fn face_index(face: Face) -> usize {
         Face::Icon => 1,
         Face::Mark => 2,
         Face::Caption => 3,
+        Face::Pad => 4,
     }
 }
 
@@ -227,11 +245,13 @@ fn widget_strip_gdi(views: &[DeviceView], dpi: u32, height: i32, light: bool) ->
     let icon_font = p.font(&ICON_FACES, -px(15), FW_NORMAL.0 as i32)?;
     let mark_font = p.font(&ICON_FACES, -px(11), FW_NORMAL.0 as i32)?;
     let caption_font = p.font(&[TEXT_FACE], -px(9), FW_SEMIBOLD.0 as i32)?;
+    let pad_font = p.font(&CONTROLLER_FACES, -px(15), FW_NORMAL.0 as i32)?;
     let font = |face| match face {
         Face::Text => text_font,
         Face::Icon => icon_font,
         Face::Mark => mark_font,
         Face::Caption => caption_font,
+        Face::Pad => pad_font,
     };
     let height = height.max(1);
     let layout = layout(views, dpi, height, light, |face, text| {
@@ -291,7 +311,12 @@ fn layout(
         let level = if v.low { palette.low } else { palette.text };
         let last = i + 1 == views.len();
         let gap = if last { 0 } else { px(10) };
-        let glyph = part(Face::Icon, &v.glyph.to_string(), palette.text, opacity);
+        let icon = if v.glyph == CONTROLLER {
+            Face::Pad
+        } else {
+            Face::Icon
+        };
+        let glyph = part(icon, &v.glyph.to_string(), palette.text, opacity);
         let caption = v.caption.as_deref();
         let caption = caption.map(|c| part(Face::Caption, c, palette.text, opacity));
         let start = x;
@@ -420,7 +445,7 @@ fn tray_icon_direct(
         None => {
             let glyph = view.map_or(NO_DEVICE, |v| v.glyph);
             let spec = FontSpec {
-                faces: &ICON_FACES,
+                faces: glyph_faces(glyph),
                 size: (size * 7 / 8) as f32,
                 weight: FW_NORMAL.0 as i32,
             };
@@ -474,7 +499,7 @@ fn tray_icon_gdi(view: Option<&DeviceView>, size: i32, light: bool) -> Option<HI
         }
         None => {
             let glyph = view.map_or(NO_DEVICE, |v| v.glyph);
-            let font = p.font(&ICON_FACES, -(size * 7 / 8), FW_NORMAL.0 as i32)?;
+            let font = p.font(glyph_faces(glyph), -(size * 7 / 8), FW_NORMAL.0 as i32)?;
             (font, glyph.to_string().encode_utf16().collect())
         }
     };
@@ -1054,7 +1079,7 @@ mod tests {
         layout(views, 96, height, false, |face, text| SIZE {
             cx: 10 * text.len() as i32,
             cy: match face {
-                Face::Icon => 20,
+                Face::Icon | Face::Pad => 20,
                 Face::Text => 16,
                 _ => 12,
             },
