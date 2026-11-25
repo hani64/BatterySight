@@ -15,7 +15,7 @@ These were decided on purpose. Issues and PRs that reopen them may be closed wit
 
 ### Never keep a device awake
 
-BatterySight listens for the battery reports devices send on their own and asks a device only on the events in the README's [When BatterySight asks a device](README.md#when-batterysight-asks-a-device). No periodic queries to an idle device, no "retry every device" paths, no query when the menu opens. Only the scheduler decides when anything is sent; engines declare what they can do.
+BatterySight listens for the battery reports devices send on their own and asks a device only on the events in the README's [How it reads batteries](README.md#how-it-reads-batteries). No periodic queries to an idle device, no "retry every device" paths, no query when the menu opens. Only the scheduler decides when anything is sent; engines declare what they can do.
 
 ### Devices are data, protocols are engines
 
@@ -35,7 +35,7 @@ The widget sits inside the taskbar; where it cannot, the app uses tray icons. No
 
 ## Adding or fixing a device
 
-Start with `batterysight --list`: a device it lists with a level is already supported. Otherwise run `batterysight --dump > dump.txt` and find the device's VID:PID and its vendor-defined collections (usage pages `FF00` and up); the README's [Device reports for contributors](README.md#device-reports-for-contributors) explains both tools.
+Start with `batterysight --list`: a device it lists with a level is already supported. Otherwise run `batterysight --dump > dump.txt` and find the device's VID:PID and its vendor-defined collections (usage pages `FF00` and up); [Device report tools](#device-report-tools) explains both tools.
 
 ### Path 1: a protocol BatterySight already speaks
 
@@ -120,4 +120,43 @@ cargo test --workspace --locked
 cargo doc --workspace --no-deps --locked
 ```
 
-CI runs `cargo doc` with `RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links"`; in PowerShell set `$env:RUSTDOCFLAGS` to that value first. With [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) installed, `cargo deny check bans sources advisories` runs the dependency checks too. The toolchain is pinned in `rust-toolchain.toml`; see the README's [Building](README.md#building) section for MSVC and GNU setups.
+CI runs `cargo doc` with `RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links"`; in PowerShell set `$env:RUSTDOCFLAGS` to that value first. With [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) installed, `cargo deny check bans sources advisories` runs the dependency checks too. The toolchain is pinned in `rust-toolchain.toml`.
+
+## Building
+
+```
+cargo build --release
+```
+
+The binary is written to `target/release/batterysight.exe`.
+
+With the MSVC toolchain (Visual Studio Build Tools with the C++ workload, which includes the Windows SDK's `rc.exe` for the icon) nothing else is needed. With the `x86_64-pc-windows-gnu` toolchain, the build needs GNU binutils (`dlltool`, `as` and `windres`): install them, for example with `winget install --scope user BrechtSanders.WinLibs.POSIX.UCRT`, put their `bin` folder on `PATH`, and point rustc at that `dlltool.exe` in your user `~/.cargo/config.toml`:
+
+```toml
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "dlltool=<path to WinLibs>/mingw64/bin/dlltool.exe"]
+```
+
+## Device report tools
+
+Two read-only tools help add support for a device. Both run next to a running BatterySight, send nothing to any device and write only to the console or to a file you redirect them to.
+
+- `batterysight --dump > dump.txt` lists every HID collection (VID:PID, interface, usage page and usage, report lengths, the name Windows cached) and every Bluetooth device's name and whether Windows has a battery property for it.
+- `batterysight --capture 046D:C547 5 > capture.txt` records, for 1 to 60 whole minutes, the input reports of that VID:PID's vendor-defined collections, opened shared and read-only (keyboard, mouse and gamepad input is never opened). Each line holds the milliseconds since the start, a collection label (`c1`, `c2`, …) and the report bytes exactly as read.
+
+`batterysight.exe` is a Windows (GUI) program, so a console does not wait for it: in cmd the prompt returns at once and `%ERRORLEVEL%` is not its exit code. To wait for `--list`, `--dump` or `--capture` to finish and get the exit code (0 success, 1 failure, 2 wrong arguments), use `start /b /wait` in cmd (without `/b` the output does not reach a redirected file) or `Start-Process -Wait` in PowerShell:
+
+```
+start /b /wait batterysight.exe --capture 046D:C547 5 > capture.txt
+echo %ERRORLEVEL%
+```
+
+```powershell
+$p = Start-Process batterysight.exe -ArgumentList '--capture', '046D:C547', '5' -NoNewWindow -Wait -PassThru -RedirectStandardOutput capture.txt
+$p.ExitCode
+```
+
+## Icon and screenshots
+
+- The icon is drawn in `assets/icon/*.svg`; `python assets/icon/render.py` rebuilds `batterysight.ico` and `logo.png` (needs [resvg](https://github.com/linebender/resvg/releases) and Pillow).
+- The README's screenshots come from the app's own drawing code: `cargo test -p batterysight screenshots -- --ignored` renders them at 2× into `target/screenshots`, then `python assets/screenshots/compose.py` builds the PNGs (needs Pillow and NumPy).

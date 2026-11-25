@@ -1,0 +1,3 @@
+// The exe's icon, built from assets/icon/*.svg by assets/icon/render.py. Resource id 1 is the
+// icon Explorer shows for the exe; the Battery history window uses it too.
+1 ICON "../../assets/icon/batterysight.ico"
