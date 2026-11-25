@@ -52,7 +52,26 @@ pub(crate) fn enabled() -> bool {
 
 fn rotate_if_needed(dir: &Path, cap: u64) {
     let current = dir.join("sends.log");
-    if fs::metadata(&current).is_ok_and(|meta| meta.len() > cap) {
+    let oversized = || fs::metadata(&current).is_ok_and(|meta| meta.len() > cap);
+    if !oversized() {
+        return;
+    }
+
+    // Never lock the log itself: other processes must remain free to append to it.
+    let Ok(guard) = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("sends.log.lock"))
+    else {
+        return;
+    };
+    if guard.try_lock().is_err() {
+        return;
+    }
+
+    // A different writer may have already rotated and opened a new, small log.
+    if oversized() {
         let _ = fs::rename(&current, dir.join("sends.old.log"));
     }
 }
@@ -106,26 +125,34 @@ impl Trace {
     }
 
     fn append(&mut self, bytes: &[u8]) {
-        let _ = self.file.write_all(bytes);
-
         #[cfg(not(test))]
         let (cap, recheck_bytes) = (CAP_BYTES, RECHECK_BYTES);
         #[cfg(test)]
         let (cap, recheck_bytes) = (self.cap, self.recheck_bytes);
         #[cfg(test)]
         if self.dir.as_os_str().is_empty() {
+            let _ = self.file.write_all(bytes);
             return;
         }
 
+        let len = bytes.len() as u64;
+        if self.written + len > recheck_bytes {
+            self.recheck(cap);
+        }
+        let _ = self.file.write_all(bytes);
         // Count attempted bytes even on error so a stale handle does not prevent a reopen.
-        self.written += bytes.len() as u64;
+        self.written += len;
         if self.written >= recheck_bytes {
-            self.written = 0;
-            rotate_if_needed(&self.dir, cap);
-            // Reopen even if this call didn't rotate: another writer may have done so.
-            if let Some(file) = open_log(&self.dir) {
-                self.file = file;
-            }
+            self.recheck(cap);
+        }
+    }
+
+    fn recheck(&mut self, cap: u64) {
+        self.written = 0;
+        rotate_if_needed(&self.dir, cap);
+        // Reopen even if this call didn't rotate: another writer may have done so.
+        if let Some(file) = open_log(&self.dir) {
+            self.file = file;
         }
     }
 
@@ -399,6 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn second_rotation_preserves_archive_when_current_log_is_small() {
+        let dir = TempDir::new("second-rotation");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        fs::write(&current, b"oversized").unwrap();
+        rotate_if_needed(&dir.0, 4);
+
+        fs::write(&current, b"new").unwrap();
+        rotate_if_needed(&dir.0, 4);
+        assert_eq!(fs::read(&current).unwrap(), b"new");
+        assert_eq!(fs::read(&old).unwrap(), b"oversized");
+    }
+
+    #[test]
+    fn rotation_skips_while_guard_is_held() {
+        let dir = TempDir::new("rotation-contended");
+        let current = dir.0.join("sends.log");
+        let old = dir.0.join("sends.old.log");
+        fs::write(&current, b"oversized").unwrap();
+        fs::write(&old, b"archive").unwrap();
+        let guard = File::create(dir.0.join("sends.log.lock")).unwrap();
+        guard.try_lock().unwrap();
+
+        rotate_if_needed(&dir.0, 4);
+        assert_eq!(fs::read(&current).unwrap(), b"oversized");
+        assert_eq!(fs::read(&old).unwrap(), b"archive");
+
+        drop(guard);
+        rotate_if_needed(&dir.0, 4);
+        assert!(!current.exists());
+        assert_eq!(fs::read(&old).unwrap(), b"oversized");
+    }
+
+    #[test]
     fn long_lived_trace_moves_to_new_file_after_external_rotation() {
         const EARLY: &[u8] = b"early line..............\n"; // 25 bytes
         const LATER: &[u8] = b"later line..............\n";
@@ -425,6 +486,23 @@ mod tests {
         trace.append(b"after external rotation\n");
         assert_eq!(fs::read(&external).unwrap(), LATER.repeat(2));
         assert_eq!(fs::read(&current).unwrap(), b"after external rotation\n");
+    }
+
+    #[test]
+    fn external_rotation_reopens_before_a_record_would_cross_the_budget() {
+        let first: &[u8; 30] = b"first record.................\n";
+        let next: &[u8; 30] = b"next record..................\n";
+        let dir = TempDir::new("non-divisible");
+        let current = dir.0.join("sends.log");
+        let external = dir.0.join("external.log");
+        let mut trace = Trace::open_with_limits(&dir.0, 100, 50).unwrap();
+        fs::rename(&current, &external).unwrap();
+
+        trace.append(first);
+        trace.append(next);
+
+        assert_eq!(fs::read(&external).unwrap(), first);
+        assert_eq!(fs::read(&current).unwrap(), next);
     }
 
     #[test]
