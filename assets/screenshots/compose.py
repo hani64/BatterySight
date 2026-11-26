@@ -1,4 +1,4 @@
-"""Composes the README's screenshots from the app's own 2x renders.
+"""Composes the README's screenshots and GitHub's social preview from the app's own 2x renders.
 
 First render them (the app draws the widget, hover card and history chart itself):
 
@@ -223,12 +223,33 @@ def history() -> Image.Image:
     return floating(img, 8, blur=20, offset=10, opacity=60)
 
 
+def social() -> Image.Image:
+    """GitHub's social preview (1280x640, in pixels rather than units): the logo, the
+    name and the tagline over the dark taskbar screenshot."""
+    W, H = 1280, 640
+    img = wallpaper(W, H, dark=True)
+    d = ImageDraw.Draw(img)
+    logo = Image.open(LOGO).convert("RGBA").resize((120, 120), Image.LANCZOS)
+    title, tagline = ImageFont.truetype(str(FONTS / "seguisb.ttf"), 76), font("segoeui.ttf", 15)
+    name, line = "BatterySight", "Wireless battery levels on the Windows taskbar"
+    tw = 120 + 28 + d.textlength(name, font=title)
+    x = (W - tw) // 2
+    img.alpha_composite(logo, (round(x), 40))
+    d.text((x + 148, 100), name, font=title, fill=(255, 255, 255, 255), anchor="lm")
+    d.text((W // 2, 196), line, font=tagline, fill=(200, 215, 235, 255), anchor="mm")
+    shot = floating(hero(True), 12, blur=24, offset=10, opacity=140)  # wider than the card
+    pad = (shot.height - 380) // 2
+    img.paste(shot, ((W - shot.width) // 2, H - 30 - 380 - pad), shot)
+    return img.convert("RGB")
+
+
 def main() -> None:
     for dark in (False, True):
         theme = "dark" if dark else "light"
         hero(dark).save(OUT / f"hero-{theme}.png", optimize=True)
         menu(dark).save(OUT / f"menu-{theme}.png", optimize=True)
     history().save(OUT / "history.png", optimize=True)
+    social().save(OUT / "social.png", optimize=True)
 
 
 if __name__ == "__main__":
